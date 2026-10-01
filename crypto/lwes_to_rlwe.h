@@ -107,6 +107,21 @@ PreprocessMatrixPack(const RlweParams<CoeffType>& params,
                      const std::vector<Polynomial<CoeffType>>& w_vec_h,
                      const GadgetParams& gadget_params, FftContext& ctx);
 
+// FinalizeMatrixPack adds InnerProduct(t_vec_h, y_vec_h) to b_agg_partial in
+// the FFT domain. TVecHFft and YVecHFft transform the two operands, chunked
+// exactly as InnerProduct chunks them so the sum is unchanged. t_vec_h depends
+// only on preprocessed data, so a server transforms it once; y_vec_h is part
+// of the packing key, transformed once per request and shared by all chunks.
+template <typename CoeffType>
+absl::StatusOr<ChunkedFft> TVecHFft(
+    const std::vector<Polynomial<CoeffType>>& t_vec_h,
+    const GadgetParams& gadget_params, FftContext& ctx);
+
+template <typename CoeffType>
+absl::StatusOr<ChunkedFft> YVecHFft(
+    const RlweParams<CoeffType>& params,
+    const std::vector<Polynomial<CoeffType>>& y_vec_h, FftContext& ctx);
+
 // FinalizeMatrixPack takes the precomputed `b_agg_partial` (result of matrix
 // multiplication) and aggregates it with the remainder parts.
 // This allows performing one large matrix multiplication for multiple
@@ -114,10 +129,8 @@ PreprocessMatrixPack(const RlweParams<CoeffType>& params,
 template <typename CoeffType>
 absl::StatusOr<RlweCiphertext<CoeffType>> FinalizeMatrixPack(
     const RlweParams<CoeffType>& params, const std::vector<CoeffType>& b,
-    const std::vector<CoeffType>& b_agg_partial,
-    const std::vector<Polynomial<CoeffType>>& y_vec_h,
-    const std::vector<Polynomial<CoeffType>>& t_vec_h,
-    const Polynomial<CoeffType>& a_tilde_agg, const GadgetParams& gadget_params,
+    const std::vector<CoeffType>& b_agg_partial, const ChunkedFft& y_vec_h_fft,
+    const ChunkedFft& t_vec_h_fft, const Polynomial<CoeffType>& a_tilde_agg,
     FftContext& ctx);
 
 // MatrixPack uses the `PreprocessMatrixPackOutput` matrix to

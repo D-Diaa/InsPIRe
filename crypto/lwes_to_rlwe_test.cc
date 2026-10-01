@@ -439,12 +439,16 @@ TYPED_TEST(LwestoRlweTest, PackWithMatrixEndToEndWorks) {
         std::vector<TypeParam> b_agg_partial,
         preprocess_output.matrix.template Multiply<TypeParam>(y_vec_g_vec));
 
+    ASSERT_OK_AND_ASSIGN(ChunkedFft y_vec_h_fft,
+                         YVecHFft(params, y_vec_h, *this->fft_ctx_));
+    ASSERT_OK_AND_ASSIGN(ChunkedFft t_vec_h_fft,
+                         TVecHFft(preprocess_output.t_vec_h,
+                                  this->gadget_params_, *this->fft_ctx_));
     ASSERT_OK_AND_ASSIGN(
         auto packed_precomputed,
         FinalizeMatrixPack<TypeParam>(
-            params, b_is, b_agg_partial, y_vec_h, preprocess_output.t_vec_h,
-            preprocess_output.a_tilde_agg, this->gadget_params_,
-            *this->fft_ctx_));
+            params, b_is, b_agg_partial, y_vec_h_fft, t_vec_h_fft,
+            preprocess_output.a_tilde_agg, *this->fft_ctx_));
 
     ASSERT_OK_AND_ASSIGN(
         auto packed_direct,
@@ -594,12 +598,16 @@ TYPED_TEST(LwestoRlweTest,
         std::vector<TypeParam> b_agg_partial,
         preprocess_output.matrix.template Multiply<TypeParam>(y_vec_g_vec));
 
+    ASSERT_OK_AND_ASSIGN(ChunkedFft y_vec_h_fft,
+                         YVecHFft(params, y_vec_h, *this->fft_ctx_));
+    ASSERT_OK_AND_ASSIGN(ChunkedFft t_vec_h_fft,
+                         TVecHFft(preprocess_output.t_vec_h,
+                                  this->gadget_params_, *this->fft_ctx_));
     ASSERT_OK_AND_ASSIGN(
         auto packed_precomputed,
         FinalizeMatrixPack<TypeParam>(
-            params, b_is, b_agg_partial, y_vec_h, preprocess_output.t_vec_h,
-            preprocess_output.a_tilde_agg, this->gadget_params_,
-            *this->fft_ctx_));
+            params, b_is, b_agg_partial, y_vec_h_fft, t_vec_h_fft,
+            preprocess_output.a_tilde_agg, *this->fft_ctx_));
 
     ASSERT_OK_AND_ASSIGN(
         auto packed_direct,

@@ -611,6 +611,85 @@ TEST(PolynomialTest, InnerProductFftTestRandom) {
   }
 }
 
+// Random `num_polys` pairs (u signed `u_bits`-bit digits, v unsigned `v_bits`
+// bits) of degree 2^log_degree: the inner product through ToChunkedFft must
+// equal InnerProductFft on the polynomials coefficient for coefficient, and
+// both must equal the exact NTT product.
+template <typename CoeffType>
+void ExpectChunkedFftMatchesDirect(int log_degree, int num_polys, int u_bits,
+                                   int v_bits, int chunk_bits,
+                                   std::mt19937_64& gen) {
+  const int degree = 1 << log_degree;
+  ASSERT_OK_AND_ASSIGN(auto ctx, Context::Create(log_degree));
+  ASSERT_OK_AND_ASSIGN(auto fft_ctx, FftContext::Create(log_degree));
+
+  std::vector<Polynomial<CoeffType>> u;
+  std::vector<Polynomial<CoeffType>> v;
+  ASSERT_OK_AND_ASSIGN(auto expected,
+                       Polynomial<CoeffType>::CreateZero(degree));
+  for (int i = 0; i < num_polys; ++i) {
+    std::vector<CoeffType> cu(degree), cv(degree);
+    for (int j = 0; j < degree; ++j) {
+      // Signed digit in [-2^(u_bits-1), 2^(u_bits-1)), two's complement.
+      const int64_t digit = static_cast<int64_t>(gen() >> (64 - u_bits)) -
+                            (int64_t{1} << (u_bits - 1));
+      cu[j] = static_cast<CoeffType>(digit);
+      cv[j] = static_cast<CoeffType>(gen() >> (64 - v_bits));
+    }
+    ASSERT_OK_AND_ASSIGN(auto pu, Polynomial<CoeffType>::Create(cu));
+    ASSERT_OK_AND_ASSIGN(auto pv, Polynomial<CoeffType>::Create(cv));
+    ASSERT_OK_AND_ASSIGN(auto prod, pu.Mult(pv, ctx));
+    ASSERT_OK_AND_ASSIGN(expected, expected.Add(prod));
+    u.push_back(std::move(pu));
+    v.push_back(std::move(pv));
+  }
+
+  ASSERT_OK_AND_ASSIGN(auto direct, Polynomial<CoeffType>::InnerProductFft(
+                                        u, v, *fft_ctx, u_bits, v_bits,
+                                        chunk_bits, /*u_is_signed=*/true));
+  ASSERT_OK_AND_ASSIGN(ChunkedFft u_fft, Polynomial<CoeffType>::ToChunkedFft(
+                                             u, *fft_ctx, u_bits, chunk_bits,
+                                             /*u_is_signed=*/true));
+  ASSERT_OK_AND_ASSIGN(ChunkedFft v_fft, Polynomial<CoeffType>::ToChunkedFft(
+                                             v, *fft_ctx, v_bits, chunk_bits,
+                                             /*u_is_signed=*/false));
+  EXPECT_EQ(u_fft.ffts[0].size(), (u_bits + chunk_bits - 1) / chunk_bits);
+  EXPECT_EQ(v_fft.ffts[0].size(), (v_bits + chunk_bits - 1) / chunk_bits);
+  ASSERT_OK_AND_ASSIGN(auto chunked, Polynomial<CoeffType>::InnerProductFft(
+                                         u_fft, v_fft, *fft_ctx));
+  EXPECT_EQ(chunked.Coeffs(), direct.Coeffs());
+  EXPECT_EQ(chunked.Coeffs(), expected.Coeffs());
+}
+
+TEST(PolynomialTest, InnerProductFftOnChunkedFftMatchesDirect) {
+  std::mt19937_64 gen(2026);
+  // The packing shape of the Tiptoe workload: d = 2048, two signed 19-bit
+  // gadget digit polynomials against 52-bit key polynomials, 20-bit chunks.
+  ExpectChunkedFftMatchesDirect<uint64_t>(/*log_degree=*/11, /*num_polys=*/2,
+                                          /*u_bits=*/19, /*v_bits=*/52,
+                                          /*chunk_bits=*/20, gen);
+  ExpectChunkedFftMatchesDirect<uint32_t>(/*log_degree=*/6, /*num_polys=*/14,
+                                          /*u_bits=*/4, /*v_bits=*/27,
+                                          /*chunk_bits=*/20, gen);
+}
+
+TEST(PolynomialTest, InnerProductFftOnChunkedFftRejectsMismatch) {
+  ASSERT_OK_AND_ASSIGN(auto fft_ctx, FftContext::Create(2));
+  ASSERT_OK_AND_ASSIGN(auto p, Polynomial<uint32_t>::Create({1, 2, 3, 4}));
+  ASSERT_OK_AND_ASSIGN(auto fft20, Polynomial<uint32_t>::ToChunkedFft(
+                                       {p}, *fft_ctx, 32, 20, false));
+  ASSERT_OK_AND_ASSIGN(auto fft16, Polynomial<uint32_t>::ToChunkedFft(
+                                       {p}, *fft_ctx, 32, 16, false));
+  EXPECT_THAT(Polynomial<uint32_t>::InnerProductFft(fft20, fft16, *fft_ctx),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("chunk_bits")));
+  ASSERT_OK_AND_ASSIGN(auto two, Polynomial<uint32_t>::ToChunkedFft(
+                                     {p, p}, *fft_ctx, 32, 20, false));
+  EXPECT_THAT(Polynomial<uint32_t>::InnerProductFft(fft20, two, *fft_ctx),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("same size")));
+}
+
 }  // namespace
 }  // namespace v2
 }  // namespace rlwe

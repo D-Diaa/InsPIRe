@@ -32,6 +32,7 @@ namespace rlwe {
 namespace v2 {
 
 struct FftContext;
+struct ChunkedFft;
 
 // Context holds the precomputed NTT parameters and constants needed for
 // polynomial multiplication. It is independent of the coefficient type and
@@ -197,6 +198,20 @@ class Polynomial {
       FftContext& ctx, int u_bits = 8 * sizeof(CoeffType),
       int v_bits = 8 * sizeof(CoeffType), int chunk_bits = 20,
       bool u_is_signed = false);
+
+  // Splits each polynomial of `u` into its base-2^chunk_bits digits (the top
+  // digit sign-extended if `u_is_signed`) and returns their forward FFTs,
+  // exactly as InnerProductFft computes them for its `u` operand.
+  static absl::StatusOr<ChunkedFft> ToChunkedFft(
+      const std::vector<Polynomial>& u, FftContext& ctx, int u_bits,
+      int chunk_bits, bool u_is_signed);
+
+  // InnerProductFft on operands already transformed by ToChunkedFft. The
+  // accumulation and inverse transforms are the same floating point operations
+  // in the same order, so the result is bit-identical to the overload above.
+  static absl::StatusOr<Polynomial> InnerProductFft(const ChunkedFft& u,
+                                                    const ChunkedFft& v,
+                                                    FftContext& ctx);
 
   // Converts the polynomial to NTT form.
   // If `is_ternary` is true, coefficients in {-1, 0, 1} (where -1 is encoded as

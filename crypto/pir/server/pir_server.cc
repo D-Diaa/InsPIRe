@@ -117,10 +117,40 @@ PirServer<DbDataType, CoeffType, MatCoeffType>::Create(
   ASSIGN_OR_RETURN(auto combined_pack_matrix,
                    Matrix<MatCoeffType>::VerticalConcatenate(pack_matrices));
 
+  ASSIGN_OR_RETURN(
+      auto t_vec_h_ffts,
+      PrecomputeTVecHFfts(params, preprocessed_data.preprocessed_outputs));
+
   return absl::WrapUnique(new PirServer<DbDataType, CoeffType, MatCoeffType>(
       params, std::move(combined_db_matrix), std::move(combined_pack_matrix),
       std::move(preprocessed_data.preprocessed_outputs),
-      std::move(preprocessed_data.second_dim_a), std::move(ctx)));
+      std::move(t_vec_h_ffts), std::move(preprocessed_data.second_dim_a),
+      std::move(ctx)));
+}
+
+template <typename DbDataType, typename CoeffType, typename MatCoeffType>
+absl::StatusOr<std::vector<std::vector<ChunkedFft>>>
+PirServer<DbDataType, CoeffType, MatCoeffType>::PrecomputeTVecHFfts(
+    const PirParams<CoeffType>& params,
+    const std::vector<
+        std::vector<PreprocessMatrixPackOutput<CoeffType, MatCoeffType>>>&
+        preprocessed_outputs) {
+  const int d = params.RlweParameters().Degree();
+  ASSIGN_OR_RETURN(
+      auto fft_ctx,
+      FftContext::Create(absl::bit_width(static_cast<uint32_t>(d)) - 1));
+  std::vector<std::vector<ChunkedFft>> t_vec_h_ffts(
+      preprocessed_outputs.size());
+  for (size_t k = 0; k < preprocessed_outputs.size(); ++k) {
+    t_vec_h_ffts[k].reserve(preprocessed_outputs[k].size());
+    for (const auto& output : preprocessed_outputs[k]) {
+      ASSIGN_OR_RETURN(
+          ChunkedFft fft,
+          TVecHFft(output.t_vec_h, params.PackGadgetParams(), *fft_ctx));
+      t_vec_h_ffts[k].push_back(std::move(fft));
+    }
+  }
+  return t_vec_h_ffts;
 }
 
 template <typename DbDataType, typename CoeffType, typename MatCoeffType>
@@ -256,6 +286,14 @@ PirServer<DbDataType, CoeffType, MatCoeffType>::ProcessResponse(
   packing_time_ += matrix_elapsed;
   pack_matrix_time_ += matrix_elapsed;
 
+  // The packing key's y_vec_h is shared by every shard and chunk below.
+  start_pack = absl::Now();
+  ASSIGN_OR_RETURN(ChunkedFft y_vec_h_fft,
+                   YVecHFft(params_.RlweParameters(), y_vec_h, *fft_ctx));
+  const auto y_fft_elapsed = absl::Now() - start_pack;
+  packing_time_ += y_fft_elapsed;
+  finalize_time_ += y_fft_elapsed;
+
   for (int k = 0; k < entry_size_multiple; ++k) {
     start_pack = absl::Now();
     // Stage 2: Packing
@@ -276,9 +314,9 @@ PirServer<DbDataType, CoeffType, MatCoeffType>::ProcessResponse(
       ASSIGN_OR_RETURN(
           RlweCiphertext<CoeffType> pack_result,
           FinalizeMatrixPack(params_.RlweParameters(), chunk, b_agg_partial,
-                             y_vec_h, preprocessed_outputs_[k][i].t_vec_h,
+                             y_vec_h_fft, t_vec_h_ffts_[k][i],
                              preprocessed_outputs_[k][i].a_tilde_agg,
-                             params_.PackGadgetParams(), *fft_ctx));
+                             *fft_ctx));
       packed_ciphertexts.push_back(std::move(pack_result));
     }
     const auto finalize_elapsed=absl::Now()-start_pack;
@@ -792,11 +830,13 @@ PirServer<DbDataType, CoeffType, MatCoeffType>::LoadFromBuffer(
   ASSIGN_OR_RETURN(
       Context ctx,
       Context::Create(absl::bit_width(static_cast<uint32_t>(d)) - 1));
+  ASSIGN_OR_RETURN(auto t_vec_h_ffts,
+                   PrecomputeTVecHFfts(params, preprocessed_outputs));
 
   return absl::WrapUnique(new PirServer<DbDataType, CoeffType, MatCoeffType>(
       params, std::move(combined_db_matrix), std::move(combined_pack_matrix),
-      std::move(preprocessed_outputs), std::move(second_dim_query_a),
-      std::move(ctx)));
+      std::move(preprocessed_outputs), std::move(t_vec_h_ffts),
+      std::move(second_dim_query_a), std::move(ctx)));
 }
 
 template <typename DbDataType, typename CoeffType, typename MatCoeffType>

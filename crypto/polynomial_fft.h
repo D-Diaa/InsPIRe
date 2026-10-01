@@ -40,14 +40,22 @@ struct FftContext {
 
   int d;
   std::vector<std::complex<double>> forward_in;
-  std::vector<std::complex<double>> forward_out;
-  std::vector<std::complex<double>> backward_in;
   std::vector<std::complex<double>> backward_out;
 
   std::unique_ptr<::security::fft::FftPlan<double, 1>> plan;
 
  private:
   FftContext() = default;
+};
+
+// Forward FFTs of a vector of polynomials split into base-2^chunk_bits digits:
+// the form in which Polynomial::InnerProductFft consumes its operands. Produced
+// by Polynomial::ToChunkedFft so that an operand reused across many inner
+// products is transformed only once.
+struct ChunkedFft {
+  int chunk_bits = 0;
+  // ffts[i][c] is the length-2d FFT of digit c of polynomial i, zero-padded.
+  std::vector<std::vector<std::vector<std::complex<double>>>> ffts;
 };
 
 }  // namespace v2

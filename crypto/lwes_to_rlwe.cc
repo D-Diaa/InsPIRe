@@ -57,6 +57,15 @@ absl::StatusOr<Polynomial<CoeffType>> MultiplyByXPower(
   return Polynomial<CoeffType>::Create(result);
 }
 
+// Digit width of the f64 FFT inner products: 20 bits, lowered when the
+// accumulated products of `num_polys` polynomials of length `len` could
+// exceed the 53-bit mantissa.
+int InnerProductChunkBits(int num_polys, int len) {
+  int max_allowed_chunk = static_cast<int>(
+      (53.0 - std::log2(num_polys) - std::log2(len)) / 2.0);
+  return std::min(20, max_allowed_chunk);
+}
+
 template <typename CoeffType>
 absl::StatusOr<Polynomial<CoeffType>> InnerProduct(
     const std::vector<Polynomial<CoeffType>>& a,
@@ -66,11 +75,9 @@ absl::StatusOr<Polynomial<CoeffType>> InnerProduct(
   if (a.size() != b.size() || a.empty()) {
     return absl::InvalidArgumentError("InnerProduct: size mismatch or empty");
   }
-  int max_allowed_chunk = static_cast<int>(
-      (53.0 - std::log2(a.size()) - std::log2(a[0].Len())) / 2.0);
-  int chunk_bits = std::min(20, max_allowed_chunk);
-  return Polynomial<CoeffType>::InnerProductFft(a, b, ctx, a_bits, b_bits,
-                                                chunk_bits, a_is_signed);
+  return Polynomial<CoeffType>::InnerProductFft(
+      a, b, ctx, a_bits, b_bits, InnerProductChunkBits(a.size(), a[0].Len()),
+      a_is_signed);
 }
 
 // Computes 5^k % (2n)
@@ -446,12 +453,36 @@ PreprocessMatrixPack(const RlweParams<CoeffType>& params,
 }
 
 template <typename CoeffType>
+absl::StatusOr<ChunkedFft> TVecHFft(
+    const std::vector<Polynomial<CoeffType>>& t_vec_h,
+    const GadgetParams& gadget_params, FftContext& ctx) {
+  if (t_vec_h.empty()) {
+    return absl::InvalidArgumentError("t_vec_h must not be empty.");
+  }
+  return Polynomial<CoeffType>::ToChunkedFft(
+      t_vec_h, ctx, gadget_params.log_digit,
+      InnerProductChunkBits(t_vec_h.size(), t_vec_h[0].Len()),
+      /*u_is_signed=*/true);
+}
+
+template <typename CoeffType>
+absl::StatusOr<ChunkedFft> YVecHFft(
+    const RlweParams<CoeffType>& params,
+    const std::vector<Polynomial<CoeffType>>& y_vec_h, FftContext& ctx) {
+  if (y_vec_h.empty()) {
+    return absl::InvalidArgumentError("y_vec_h must not be empty.");
+  }
+  return Polynomial<CoeffType>::ToChunkedFft(
+      y_vec_h, ctx, params.LogModulus(),
+      InnerProductChunkBits(y_vec_h.size(), y_vec_h[0].Len()),
+      /*u_is_signed=*/false);
+}
+
+template <typename CoeffType>
 absl::StatusOr<RlweCiphertext<CoeffType>> FinalizeMatrixPack(
     const RlweParams<CoeffType>& params, const std::vector<CoeffType>& b,
-    const std::vector<CoeffType>& b_agg_partial,
-    const std::vector<Polynomial<CoeffType>>& y_vec_h,
-    const std::vector<Polynomial<CoeffType>>& t_vec_h,
-    const Polynomial<CoeffType>& a_tilde_agg, const GadgetParams& gadget_params,
+    const std::vector<CoeffType>& b_agg_partial, const ChunkedFft& y_vec_h_fft,
+    const ChunkedFft& t_vec_h_fft, const Polynomial<CoeffType>& a_tilde_agg,
     FftContext& ctx) {
   int d = b.size();
 
@@ -470,8 +501,8 @@ absl::StatusOr<RlweCiphertext<CoeffType>> FinalizeMatrixPack(
 
   // Add InnerProduct(y_vec_h, t_vec_h)
   ASSIGN_OR_RETURN(Polynomial<CoeffType> inner_h,
-                   InnerProduct(t_vec_h, y_vec_h, ctx, gadget_params.log_digit,
-                                params.LogModulus(), true));
+                   Polynomial<CoeffType>::InnerProductFft(t_vec_h_fft,
+                                                          y_vec_h_fft, ctx));
   ASSIGN_OR_RETURN(b_agg, b_agg.Add(inner_h));
   ASSIGN_OR_RETURN(b_agg, b_agg.LowBits(params.LogModulus()));
 
@@ -502,9 +533,11 @@ absl::StatusOr<RlweCiphertext<CoeffType>> MatrixPack(
       std::vector<CoeffType> b_agg_partial,
       preprocess_output.matrix.template Multiply<CoeffType>(y_vec_g_vec));
 
-  return FinalizeMatrixPack(params, b, b_agg_partial, y_vec_h,
-                            preprocess_output.t_vec_h,
-                            preprocess_output.a_tilde_agg, gadget_params, ctx);
+  ASSIGN_OR_RETURN(ChunkedFft y_vec_h_fft, YVecHFft(params, y_vec_h, ctx));
+  ASSIGN_OR_RETURN(ChunkedFft t_vec_h_fft,
+                   TVecHFft(preprocess_output.t_vec_h, gadget_params, ctx));
+  return FinalizeMatrixPack(params, b, b_agg_partial, y_vec_h_fft,
+                            t_vec_h_fft, preprocess_output.a_tilde_agg, ctx);
 }
 
 template absl::StatusOr<PreprocessPackOutput<uint32_t>> PreprocessPack(
@@ -572,18 +605,30 @@ PreprocessMatrixPack(const RlweParams<uint64_t>&,
                      const std::vector<Polynomial<uint64_t>>&,
                      const GadgetParams&, FftContext&);
 
-// Instantiations for FinalizeMatrixPack
+// Instantiations for TVecHFft, YVecHFft and FinalizeMatrixPack
+template absl::StatusOr<ChunkedFft> TVecHFft(
+    const std::vector<Polynomial<uint32_t>>&, const GadgetParams&, FftContext&);
+
+template absl::StatusOr<ChunkedFft> TVecHFft(
+    const std::vector<Polynomial<uint64_t>>&, const GadgetParams&, FftContext&);
+
+template absl::StatusOr<ChunkedFft> YVecHFft(
+    const RlweParams<uint32_t>&, const std::vector<Polynomial<uint32_t>>&,
+    FftContext&);
+
+template absl::StatusOr<ChunkedFft> YVecHFft(
+    const RlweParams<uint64_t>&, const std::vector<Polynomial<uint64_t>>&,
+    FftContext&);
+
 template absl::StatusOr<RlweCiphertext<uint32_t>> FinalizeMatrixPack(
     const RlweParams<uint32_t>&, const std::vector<uint32_t>&,
-    const std::vector<uint32_t>&, const std::vector<Polynomial<uint32_t>>&,
-    const std::vector<Polynomial<uint32_t>>&, const Polynomial<uint32_t>&,
-    const GadgetParams&, FftContext&);
+    const std::vector<uint32_t>&, const ChunkedFft&, const ChunkedFft&,
+    const Polynomial<uint32_t>&, FftContext&);
 
 template absl::StatusOr<RlweCiphertext<uint64_t>> FinalizeMatrixPack(
     const RlweParams<uint64_t>&, const std::vector<uint64_t>&,
-    const std::vector<uint64_t>&, const std::vector<Polynomial<uint64_t>>&,
-    const std::vector<Polynomial<uint64_t>>&, const Polynomial<uint64_t>&,
-    const GadgetParams&, FftContext&);
+    const std::vector<uint64_t>&, const ChunkedFft&, const ChunkedFft&,
+    const Polynomial<uint64_t>&, FftContext&);
 
 // Instantiations for MatrixPack
 template absl::StatusOr<RlweCiphertext<uint32_t>> MatrixPack(

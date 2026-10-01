@@ -26,6 +26,7 @@
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
+#include "hwy/cache_control.h"
 #include "hwy/highway.h"
 
 namespace private_membership {
@@ -258,62 +259,127 @@ absl::StatusOr<std::vector<uint64_t>> CondensedMultiply(
       "int32_t matrices.");
 }
 
+// z[i] = sum_j m[i][j] * y[j] mod 2^64 for a uint16 matrix and a uint64 vector.
+//
+// Like the int32 kernel below, y is split once per call into unsigned halves,
+// y == y_lo + 2^32 * y_hi, so that for m < 2^16
+//
+//   m * y == m * y_lo + 2^32 * (m * y_hi mod 2^32)  (mod 2^64):
+//
+// one unsigned 32x32->64 MulEven and one 32x32->32 Mul per product instead of
+// an emulated 64x64 multiply. A condensed lane holds m[4j..4j+3] as 16-bit
+// fields; viewed as uint32 lanes, m & 0xFFFF is (m[4j], m[4j+2]) and m >> 16
+// is (m[4j+1], m[4j+3]), so one Mul against the matching pair of y_hi values
+// covers two fields. MulEven only reads the even (low) uint32 lane, so the
+// upper two fields are first moved down by 32 bits. `y_split` holds six planes
+// of `condensed_cols` words: plane f < 4 is y_lo of field f, planes 4 and 5
+// are the (y_hi[4j], y_hi[4j+2]) and (y_hi[4j+1], y_hi[4j+3]) pairs.
+template <int kRows>
+HWY_INLINE void CondensedMultiplyUint16Rows(const uint64_t* const* m_rows,
+                                            int condensed_cols,
+                                            const uint64_t* y_split,
+                                            uint64_t* result) {
+  namespace hn = hwy::HWY_NAMESPACE;
+  const hn::ScalableTag<uint64_t> d64;
+  const hn::Repartition<uint32_t, decltype(d64)> d32;
+  const size_t N = hn::Lanes(d64);
+  const auto fields_02 = hn::Set(d64, 0x0000FFFF0000FFFFULL);
+  const uint64_t* y_lo0 = y_split;
+  const uint64_t* y_lo1 = y_split + condensed_cols;
+  const uint64_t* y_lo2 = y_split + 2 * condensed_cols;
+  const uint64_t* y_lo3 = y_split + 3 * condensed_cols;
+  const uint64_t* y_hi02 = y_split + 4 * condensed_cols;
+  const uint64_t* y_hi13 = y_split + 5 * condensed_cols;
+  // Rows are short (2 KiB at 1024 columns) and the matrix is usually cold, so
+  // the hardware prefetcher restarts on every row; touching the same offset of
+  // the next row block keeps the DRAM reads streaming.
+  const size_t next_block = kRows * condensed_cols;
+
+  hn::Vec<decltype(d64)> lo[kRows];
+  hn::Vec<decltype(d32)> hi[kRows];
+  for (int r = 0; r < kRows; ++r) {
+    lo[r] = hn::Zero(d64);
+    hi[r] = hn::Zero(d32);
+  }
+
+  for (size_t c = 0; c < static_cast<size_t>(condensed_cols); c += N) {
+    const auto yl0 = hn::BitCast(d32, hn::LoadU(d64, y_lo0 + c));
+    const auto yl1 = hn::BitCast(d32, hn::LoadU(d64, y_lo1 + c));
+    const auto yl2 = hn::BitCast(d32, hn::LoadU(d64, y_lo2 + c));
+    const auto yl3 = hn::BitCast(d32, hn::LoadU(d64, y_lo3 + c));
+    const auto yh02 = hn::BitCast(d32, hn::LoadU(d64, y_hi02 + c));
+    const auto yh13 = hn::BitCast(d32, hn::LoadU(d64, y_hi13 + c));
+    HWY_UNROLL(kRows)
+    for (int r = 0; r < kRows; ++r) {
+      hwy::Prefetch(m_rows[r] + c + next_block);
+      const auto m = hn::LoadU(d64, m_rows[r] + c);
+      const auto m02 = hn::BitCast(d32, hn::And(m, fields_02));
+      const auto m13 = hn::ShiftRight<16>(hn::BitCast(d32, m));
+      const auto m2 =
+          hn::BitCast(d32, hn::ShiftRight<32>(hn::BitCast(d64, m02)));
+      const auto m3 =
+          hn::BitCast(d32, hn::ShiftRight<32>(hn::BitCast(d64, m13)));
+      lo[r] = hn::Add(lo[r], hn::MulEven(m02, yl0));
+      lo[r] = hn::Add(lo[r], hn::MulEven(m13, yl1));
+      lo[r] = hn::Add(lo[r], hn::MulEven(m2, yl2));
+      lo[r] = hn::Add(lo[r], hn::MulEven(m3, yl3));
+      hi[r] = hn::Add(hi[r], hn::Mul(m02, yh02));
+      hi[r] = hn::Add(hi[r], hn::Mul(m13, yh13));
+    }
+  }
+
+  for (int r = 0; r < kRows; ++r) {
+    result[r] = hn::ReduceSum(d64, lo[r]) +
+                (static_cast<uint64_t>(hn::ReduceSum(d32, hi[r])) << 32);
+  }
+}
+
 template <>
 absl::StatusOr<std::vector<uint64_t>> CondensedMultiply<uint16_t>(
     const Matrix<uint16_t>& condensed_matrix, absl::Span<const uint64_t> vec,
     int original_cols) {
   namespace hn = hwy::HWY_NAMESPACE;
-  hn::ScalableTag<uint64_t> d;
+  const hn::ScalableTag<uint64_t> d;
   const size_t N = hn::Lanes(d);
 
   if (original_cols % (4 * N) != 0) {
     return absl::InvalidArgumentError(
         "Original columns must be a multiple of 4 * Lanes.");
   }
-  if (vec.size() != original_cols) {
+  if (vec.size() != static_cast<size_t>(original_cols)) {
     return absl::InvalidArgumentError("Vector size mismatch.");
   }
-  int rows = condensed_matrix.Rows();
-  int condensed_cols = original_cols / 4;
-
-  std::vector<uint64_t> result(rows, 0);
+  const int rows = condensed_matrix.Rows();
+  const int condensed_cols = original_cols / 4;
   const std::vector<uint64_t>& data = condensed_matrix.CondensedData();
 
-  int num_blocks = original_cols / (4 * N);
-  std::vector<hn::Vec<decltype(d)>> V_0(num_blocks);
-  std::vector<hn::Vec<decltype(d)>> V_1(num_blocks);
-  std::vector<hn::Vec<decltype(d)>> V_2(num_blocks);
-  std::vector<hn::Vec<decltype(d)>> V_3(num_blocks);
-
-  for (int b = 0; b < num_blocks; ++b) {
-    int base = b * 4 * N;
-    hn::LoadInterleaved4(d, &vec[base], V_0[b], V_1[b], V_2[b], V_3[b]);
-  }
-
-  auto mask = hn::Set(d, 0xFFFF);
-
-  for (int i = 0; i < rows; ++i) {
-    auto accum = hn::Zero(d);
-
-    for (int b = 0; b < num_blocks; ++b) {
-      auto m_packed = hn::LoadU(d, &data[i * condensed_cols + b * N]);
-
-      auto m0 = hn::And(m_packed, mask);
-      accum = hn::MulAdd(m0, V_0[b], accum);
-
-      auto m1 = hn::And(hn::ShiftRight<16>(m_packed), mask);
-      accum = hn::MulAdd(m1, V_1[b], accum);
-
-      auto m2 = hn::And(hn::ShiftRight<32>(m_packed), mask);
-      accum = hn::MulAdd(m2, V_2[b], accum);
-
-      auto m3 = hn::ShiftRight<48>(m_packed);
-      accum = hn::MulAdd(m3, V_3[b], accum);
+  // See CondensedMultiplyUint16Rows for the layout.
+  std::vector<uint64_t> y_split(6 * condensed_cols);
+  for (int c = 0; c < condensed_cols; ++c) {
+    const uint64_t* y = &vec[4 * c];
+    for (int f = 0; f < 4; ++f) {
+      y_split[f * condensed_cols + c] = static_cast<uint32_t>(y[f]);
     }
-
-    result[i] = hn::ReduceSum(d, accum);
+    y_split[4 * condensed_cols + c] = (y[0] >> 32) | (y[2] & ~0xFFFFFFFFULL);
+    y_split[5 * condensed_cols + c] = (y[1] >> 32) | (y[3] & ~0xFFFFFFFFULL);
   }
 
+  constexpr int kRowBlock = 4;
+  std::vector<uint64_t> result(rows, 0);
+  int i = 0;
+  for (; i + kRowBlock <= rows; i += kRowBlock) {
+    const uint64_t* m_rows[kRowBlock];
+    for (int r = 0; r < kRowBlock; ++r) {
+      m_rows[r] = &data[static_cast<size_t>(i + r) * condensed_cols];
+    }
+    CondensedMultiplyUint16Rows<kRowBlock>(m_rows, condensed_cols,
+                                           y_split.data(), &result[i]);
+  }
+  for (; i < rows; ++i) {
+    const uint64_t* m_row = &data[static_cast<size_t>(i) * condensed_cols];
+    CondensedMultiplyUint16Rows<1>(&m_row, condensed_cols, y_split.data(),
+                                   &result[i]);
+  }
   return result;
 }
 

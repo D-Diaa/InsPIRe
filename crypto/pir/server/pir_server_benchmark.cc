@@ -245,14 +245,21 @@ void SetUpBenchmark() {
         benchmark_state_ptr->preprocessed_outputs[0][i]
             .matrix.template Multiply<CoeffType>(y_vec_g_vec_for_pack));
 
+    FftContext& fft_ctx = *benchmark_state_ptr->fft_ctx;
+    ASSERT_OK_AND_ASSIGN(
+        ChunkedFft y_vec_h_fft,
+        YVecHFft(params_ptr->RlweParameters(), y_vec_h_for_pack, fft_ctx));
+    ASSERT_OK_AND_ASSIGN(
+        ChunkedFft t_vec_h_fft,
+        TVecHFft(benchmark_state_ptr->preprocessed_outputs[0][i].t_vec_h,
+                 params_ptr->PackGadgetParams(), fft_ctx));
     ASSERT_OK_AND_ASSIGN(
         (RlweCiphertext<CoeffType> pack_result),
         FinalizeMatrixPack(
-            params_ptr->RlweParameters(), chunk, b_agg_partial,
-            y_vec_h_for_pack,
-            benchmark_state_ptr->preprocessed_outputs[0][i].t_vec_h,
+            params_ptr->RlweParameters(), chunk, b_agg_partial, y_vec_h_fft,
+            t_vec_h_fft,
             benchmark_state_ptr->preprocessed_outputs[0][i].a_tilde_agg,
-            params_ptr->PackGadgetParams(), *benchmark_state_ptr->fft_ctx));
+            fft_ctx));
     benchmark_state_ptr->packed_ciphertexts.push_back(std::move(pack_result));
   }
 }
@@ -332,8 +339,17 @@ void BM_PirServerProcessResponse_Packing(benchmark::State& state) {
   const std::vector<CoeffType>& b_prime = benchmark_state_ptr->b_prime;
   const auto& preprocessed_outputs = benchmark_state_ptr->preprocessed_outputs;
   FftContext* fft_ctx = benchmark_state_ptr->fft_ctx.get();
+  std::vector<ChunkedFft> t_vec_h_ffts;
+  for (int i = 0; i < t; ++i) {
+    ASSERT_OK_AND_ASSIGN(ChunkedFft t_vec_h_fft,
+                         TVecHFft(preprocessed_outputs[0][i].t_vec_h,
+                                  params->PackGadgetParams(), *fft_ctx));
+    t_vec_h_ffts.push_back(std::move(t_vec_h_fft));
+  }
 
   for (auto s : state) {
+    ASSERT_OK_AND_ASSIGN(ChunkedFft y_vec_h_fft,
+                         YVecHFft(params->RlweParameters(), y_vec_h, *fft_ctx));
     std::vector<RlweCiphertext<CoeffType>> packed_ciphertexts;
     packed_ciphertexts.reserve(t);
     for (int i = 0; i < t; ++i) {
@@ -353,10 +369,9 @@ void BM_PirServerProcessResponse_Packing(benchmark::State& state) {
       ASSERT_OK_AND_ASSIGN(
           (RlweCiphertext<CoeffType> pack_result),
           FinalizeMatrixPack(params->RlweParameters(), chunk, b_agg_partial,
-                                 y_vec_h,
-                                 preprocessed_outputs[0][i].t_vec_h,
-                                 preprocessed_outputs[0][i].a_tilde_agg,
-                                 params->PackGadgetParams(), *fft_ctx));
+                             y_vec_h_fft, t_vec_h_ffts[i],
+                             preprocessed_outputs[0][i].a_tilde_agg,
+                             *fft_ctx));
       packed_ciphertexts.push_back(std::move(pack_result));
     }
     benchmark::DoNotOptimize(packed_ciphertexts);
