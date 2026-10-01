@@ -49,13 +49,15 @@ PirClient<CoeffType>::Create(
                    SampleSecretKey(params.RlweParameters(), *prng));
   const int d = params.RlweParameters().Degree();
   ASSIGN_OR_RETURN(
-      auto ctx,
-      Context::CreateForTernary(absl::bit_width(static_cast<uint32_t>(d)) - 1));
-  ASSIGN_OR_RETURN(auto secret_key_ntt,
-                   secret_key.ToNtt(ctx, /*is_ternary=*/true));
+      auto fft_ctx,
+      FftContext::Create(absl::bit_width(static_cast<uint32_t>(d)) - 1));
+  // The ternary key {0, 1, q - 1} is -1, 0, 1 as 2-bit two's complement.
+  ASSIGN_OR_RETURN(auto secret_key_fft,
+                   FftPolynomial::Create(secret_key, *fft_ctx, /*bits=*/2,
+                                         /*is_signed=*/true));
   return absl::WrapUnique(new PirClient<CoeffType>(
       params, std::move(a_component_prng), std::move(prng),
-      std::move(secret_key), std::move(ctx), std::move(secret_key_ntt)));
+      std::move(secret_key), std::move(fft_ctx), std::move(secret_key_fft)));
 }
 
 template <typename CoeffType>
@@ -108,9 +110,9 @@ PirClient<CoeffType>::CreateFirstDimensionQueryForVector(
   const int num_samples = vec.size() / d;
   ASSIGN_OR_RETURN(auto a_first, SampleAComponents(rlwe_params, num_samples,
                                                    *a_component_prng_));
-  ASSIGN_OR_RETURN(
-      auto rlwe_samples,
-      GenerateRlweSamples(rlwe_params, secret_key_ntt_, a_first, *prng_, ctx_));
+  ASSIGN_OR_RETURN(auto rlwe_samples,
+                   GenerateRlweSamples(rlwe_params, secret_key_fft_, a_first,
+                                       *prng_, *fft_ctx_));
 
   std::vector<CoeffType> query;
   query.reserve(vec.size());
@@ -141,9 +143,9 @@ PirClient<CoeffType>::CreateFirstDimensionQuery(const int index, ::rlwe::SecureP
   const int num_samples = params_.NumFirstDimSamples();
   ASSIGN_OR_RETURN(auto a_first, SampleAComponents(rlwe_params, num_samples,
                                                    *(mask_prng == nullptr ? a_component_prng_.get() : mask_prng)));
-  ASSIGN_OR_RETURN(
-      auto rlwe_samples,
-      GenerateRlweSamples(rlwe_params, secret_key_ntt_, a_first, *prng_, ctx_));
+  ASSIGN_OR_RETURN(auto rlwe_samples,
+                   GenerateRlweSamples(rlwe_params, secret_key_fft_, a_first,
+                                       *prng_, *fft_ctx_));
 
   std::vector<CoeffType> query;
   query.reserve(r);
@@ -180,8 +182,8 @@ PirClient<CoeffType>::CreateSecondDimensionQuery(const int index) const {
       std::vector<Polynomial<CoeffType>> a_second,
       SampleAComponents(rlwe_params, num_samples, *a_component_prng_));
   ASSIGN_OR_RETURN(std::vector<RlweSample<CoeffType>> rlwe_samples,
-                   GenerateRlweSamples(rlwe_params, secret_key_ntt_, a_second,
-                                       *prng_, ctx_));
+                   GenerateRlweSamples(rlwe_params, secret_key_fft_, a_second,
+                                       *prng_, *fft_ctx_));
 
   std::vector<CoeffType> message(d, 0);
   const int second_dim_shift = (2 * d / t) * col_index;
@@ -223,9 +225,9 @@ PirClient<CoeffType>::CreatePackingKey(::rlwe::SecurePrng* mask_prng) const {
   ASSIGN_OR_RETURN(
       std::vector<Polynomial<CoeffType>> a_pack,
       SampleAComponents(rlwe_params, num_samples, *(mask_prng == nullptr ? a_component_prng_.get() : mask_prng)));
-  ASSIGN_OR_RETURN(
-      std::vector<RlweSample<CoeffType>> rlwe_samples,
-      GenerateRlweSamples(rlwe_params, secret_key_ntt_, a_pack, *prng_, ctx_));
+  ASSIGN_OR_RETURN(std::vector<RlweSample<CoeffType>> rlwe_samples,
+                   GenerateRlweSamples(rlwe_params, secret_key_fft_, a_pack,
+                                       *prng_, *fft_ctx_));
 
   ASSIGN_OR_RETURN(Polynomial<CoeffType> sk_g, secret_key_.Automorph(5));
   ASSIGN_OR_RETURN(Polynomial<CoeffType> sk_h,
@@ -273,7 +275,7 @@ absl::StatusOr<std::vector<CoeffType>> PirClient<CoeffType>::ProcessResponse(
     ASSIGN_OR_RETURN(std::vector<CoeffType> shard_decrypted,
                      DecryptAfterModulusSwitch(
                          params_.RlweParameters(), params_.PlaintextModulus(),
-                         response.ciphertexts[k], secret_key_ntt_, ctx_));
+                         response.ciphertexts[k], secret_key_fft_, *fft_ctx_));
     decrypted_message.insert(decrypted_message.end(), shard_decrypted.begin(),
                              shard_decrypted.end());
   }

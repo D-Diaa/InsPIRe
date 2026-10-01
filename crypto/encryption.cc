@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "crypto/polynomial.h"
+#include "crypto/polynomial_fft.h"
 #include "absl/numeric/bits.h"
 #include "absl/numeric/int128.h"
 #include "absl/status/status.h"
@@ -148,13 +149,15 @@ absl::StatusOr<std::vector<Polynomial<CoeffType>>> SampleAComponents(
   return a_components;
 }
 
-template <typename CoeffType>
-absl::StatusOr<std::vector<RlweSample<CoeffType>>> GenerateRlweSamples(
+namespace {
+
+// Generates (a, b = e - a * s mod q) for every a in `a_components`, with the
+// product a * s supplied by `multiply_by_secret`.
+template <typename CoeffType, typename MultiplyBySecret>
+absl::StatusOr<std::vector<RlweSample<CoeffType>>> GenerateRlweSamplesImpl(
     const RlweParams<CoeffType>& params,
-    const NttPolynomial& secret_key_ntt,
     const std::vector<Polynomial<CoeffType>>& a_components,
-    ::rlwe::SecurePrng& prng,
-    const Context& ctx) {
+    ::rlwe::SecurePrng& prng, MultiplyBySecret&& multiply_by_secret) {
   const int d = params.Degree();
   const CoeffType q = params.Modulus();
   const int variance = params.Variance();
@@ -172,7 +175,7 @@ absl::StatusOr<std::vector<RlweSample<CoeffType>>> GenerateRlweSamples(
           "a_component length must match degree.");
     }
 
-    ASSIGN_OR_RETURN(auto as, a.Mult(secret_key_ntt, ctx));
+    ASSIGN_OR_RETURN(auto as, multiply_by_secret(a));
 
     ASSIGN_OR_RETURN(std::vector<ModularInt> e_coeffs_large,
                      ::rlwe::SampleFromErrorDistribution<ModularInt>(
@@ -201,6 +204,35 @@ absl::StatusOr<std::vector<RlweSample<CoeffType>>> GenerateRlweSamples(
   }
 
   return samples;
+}
+
+}  // namespace
+
+template <typename CoeffType>
+absl::StatusOr<std::vector<RlweSample<CoeffType>>> GenerateRlweSamples(
+    const RlweParams<CoeffType>& params,
+    const NttPolynomial& secret_key_ntt,
+    const std::vector<Polynomial<CoeffType>>& a_components,
+    ::rlwe::SecurePrng& prng,
+    const Context& ctx) {
+  return GenerateRlweSamplesImpl(
+      params, a_components, prng, [&](const Polynomial<CoeffType>& a) {
+        return a.Mult(secret_key_ntt, ctx);
+      });
+}
+
+template <typename CoeffType>
+absl::StatusOr<std::vector<RlweSample<CoeffType>>> GenerateRlweSamples(
+    const RlweParams<CoeffType>& params,
+    const FftPolynomial& secret_key_fft,
+    const std::vector<Polynomial<CoeffType>>& a_components,
+    ::rlwe::SecurePrng& prng,
+    FftContext& ctx) {
+  // b is reduced mod q, so only the low log2(q) bits of a contribute.
+  return GenerateRlweSamplesImpl(
+      params, a_components, prng, [&](const Polynomial<CoeffType>& a) {
+        return a.MultFft(secret_key_fft, ctx, params.LogModulus());
+      });
 }
 
 template <typename CoeffType>
@@ -327,12 +359,15 @@ absl::StatusOr<std::vector<CoeffType>> Decrypt(
   return Decrypt(params, plaintext_modulus, ciphertext, secret_key_ntt, ctx);
 }
 
-template <typename CoeffType>
-absl::StatusOr<std::vector<CoeffType>> DecryptAfterModulusSwitch(
+namespace {
+
+// Decrypts a ciphertext whose a and b components were switched to q1 and q2
+// respectively, with the product a * s supplied by `multiply_by_secret`.
+template <typename CoeffType, typename MultiplyBySecret>
+absl::StatusOr<std::vector<CoeffType>> DecryptAfterModulusSwitchImpl(
     const RlweParams<CoeffType>& params, const CoeffType plaintext_modulus,
     const RlweCiphertext<CoeffType>& ciphertext,
-    const NttPolynomial& secret_key_ntt,
-    const Context& ctx) {
+    MultiplyBySecret&& multiply_by_secret) {
   const int d = params.Degree();
   if (plaintext_modulus <= 0) {
     return absl::InvalidArgumentError("Plaintext modulus must be positive.");
@@ -341,7 +376,7 @@ absl::StatusOr<std::vector<CoeffType>> DecryptAfterModulusSwitch(
     return absl::InvalidArgumentError("ciphertext lengths must match degree.");
   }
 
-  ASSIGN_OR_RETURN(auto as, ciphertext.a.Mult(secret_key_ntt, ctx));
+  ASSIGN_OR_RETURN(auto as, multiply_by_secret(ciphertext.a));
   // mod by q1
   ASSIGN_OR_RETURN(as, as.LowBits(params.LogModulus1AfterSwitch()));
   // scale as from q1 to q2
@@ -371,6 +406,36 @@ absl::StatusOr<std::vector<CoeffType>> DecryptAfterModulusSwitch(
   }
 
   return m_coeffs;
+}
+
+}  // namespace
+
+template <typename CoeffType>
+absl::StatusOr<std::vector<CoeffType>> DecryptAfterModulusSwitch(
+    const RlweParams<CoeffType>& params, const CoeffType plaintext_modulus,
+    const RlweCiphertext<CoeffType>& ciphertext,
+    const NttPolynomial& secret_key_ntt,
+    const Context& ctx) {
+  return DecryptAfterModulusSwitchImpl(
+      params, plaintext_modulus, ciphertext,
+      [&](const Polynomial<CoeffType>& a) {
+        return a.Mult(secret_key_ntt, ctx);
+      });
+}
+
+template <typename CoeffType>
+absl::StatusOr<std::vector<CoeffType>> DecryptAfterModulusSwitch(
+    const RlweParams<CoeffType>& params, const CoeffType plaintext_modulus,
+    const RlweCiphertext<CoeffType>& ciphertext,
+    const FftPolynomial& secret_key_fft,
+    FftContext& ctx) {
+  // a * s is reduced mod q1, so only the low log2(q1) bits of a contribute.
+  return DecryptAfterModulusSwitchImpl(
+      params, plaintext_modulus, ciphertext,
+      [&](const Polynomial<CoeffType>& a) {
+        return a.MultFft(secret_key_fft, ctx,
+                         params.LogModulus1AfterSwitch());
+      });
 }
 
 template <typename CoeffType>
@@ -557,6 +622,16 @@ GenerateRlweSamples<uint64_t>(const RlweParams<uint64_t>&,
                               const std::vector<Polynomial<uint64_t>>&,
                               ::rlwe::SecurePrng&,
                               const Context&);
+template absl::StatusOr<std::vector<RlweSample<uint32_t>>>
+GenerateRlweSamples<uint32_t>(const RlweParams<uint32_t>&,
+                              const FftPolynomial&,
+                              const std::vector<Polynomial<uint32_t>>&,
+                              ::rlwe::SecurePrng&, FftContext&);
+template absl::StatusOr<std::vector<RlweSample<uint64_t>>>
+GenerateRlweSamples<uint64_t>(const RlweParams<uint64_t>&,
+                              const FftPolynomial&,
+                              const std::vector<Polynomial<uint64_t>>&,
+                              ::rlwe::SecurePrng&, FftContext&);
 
 template absl::StatusOr<RlweCiphertext<uint32_t>>
 EncryptFromRlweSample<uint32_t>(const RlweParams<uint32_t>&, uint32_t,
@@ -603,6 +678,14 @@ template absl::StatusOr<std::vector<uint64_t>>
 DecryptAfterModulusSwitch<uint64_t>(const RlweParams<uint64_t>&, uint64_t,
                                     const RlweCiphertext<uint64_t>&,
                                     const NttPolynomial&, const Context&);
+template absl::StatusOr<std::vector<uint32_t>>
+DecryptAfterModulusSwitch<uint32_t>(const RlweParams<uint32_t>&, uint32_t,
+                                    const RlweCiphertext<uint32_t>&,
+                                    const FftPolynomial&, FftContext&);
+template absl::StatusOr<std::vector<uint64_t>>
+DecryptAfterModulusSwitch<uint64_t>(const RlweParams<uint64_t>&, uint64_t,
+                                    const RlweCiphertext<uint64_t>&,
+                                    const FftPolynomial&, FftContext&);
 
 template absl::StatusOr<std::vector<RlweCiphertext<uint32_t>>>
 EncryptGadgetCiphertextFromRlweSamples<uint32_t>(

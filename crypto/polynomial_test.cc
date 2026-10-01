@@ -690,6 +690,142 @@ TEST(PolynomialTest, InnerProductFftOnChunkedFftRejectsMismatch) {
                        HasSubstr("same size")));
 }
 
+// Ternary key {0, 1, q - 1} as a Polynomial, with -1 stored as q - 1 (q = 0
+// denotes 2^64). `pattern` selects a random key or one of the extremes.
+enum class KeyPattern { kRandom, kAllMinusOne, kAlternating };
+
+Polynomial<uint64_t> TernaryKey(int d, uint64_t q, KeyPattern pattern,
+                                std::mt19937_64& gen) {
+  std::vector<uint64_t> coeffs(d);
+  for (int i = 0; i < d; ++i) {
+    int t;
+    switch (pattern) {
+      case KeyPattern::kRandom:
+        t = gen() % 3;
+        break;
+      case KeyPattern::kAllMinusOne:
+        t = 2;
+        break;
+      case KeyPattern::kAlternating:
+        t = (i % 2 == 0) ? 1 : 2;
+        break;
+    }
+    coeffs[i] = (t == 2) ? q - 1 : t;
+  }
+  return Polynomial<uint64_t>::Create(std::move(coeffs)).value();
+}
+
+// The negacyclic FFT product against a cached ternary key must agree bit for
+// bit (mod 2^64) with the NTT path on random and extreme operands at the
+// workload parameters (d = 2048, log q = 52) and at full 64-bit width,
+// including the widest single chunk (32 bits at d = 2048).
+TEST(PolynomialTest, MultFftWithFftPolynomialMatchesNttOnRandomAndExtremes) {
+  const int log_d = 11;
+  const int d = 1 << log_d;
+  std::mt19937_64 gen(2024);
+  ASSERT_OK_AND_ASSIGN(auto ctx, Context::CreateForTernary(log_d));
+  ASSERT_OK_AND_ASSIGN(auto fft_ctx, FftContext::Create(log_d));
+
+  struct Case {
+    uint64_t q;
+    int a_bits;
+    bool a_extreme;  // all coefficients equal to 2^a_bits - 1
+    KeyPattern key;
+  };
+  const Case cases[] = {
+      {uint64_t{1} << 52, 52, false, KeyPattern::kRandom},
+      {uint64_t{1} << 52, 52, true, KeyPattern::kAllMinusOne},
+      {uint64_t{1} << 52, 52, true, KeyPattern::kAlternating},
+      {uint64_t{1} << 52, 29, false, KeyPattern::kRandom},
+      {uint64_t{1} << 52, 29, true, KeyPattern::kAllMinusOne},
+      {uint64_t{1} << 52, 32, true, KeyPattern::kAllMinusOne},
+      {uint64_t{1} << 52, 32, true, KeyPattern::kAlternating},
+      {0, 64, false, KeyPattern::kRandom},
+      {0, 64, true, KeyPattern::kAllMinusOne},
+      {0, 64, true, KeyPattern::kAlternating},
+  };
+  for (const Case& c : cases) {
+    const uint64_t a_mask =
+        c.a_bits == 64 ? ~uint64_t{0} : (uint64_t{1} << c.a_bits) - 1;
+    std::vector<uint64_t> a_coeffs(d);
+    for (int i = 0; i < d; ++i) {
+      a_coeffs[i] = c.a_extreme ? a_mask : (gen() & a_mask);
+    }
+    ASSERT_OK_AND_ASSIGN(auto a, Polynomial<uint64_t>::Create(a_coeffs));
+    Polynomial<uint64_t> s = TernaryKey(d, c.q, c.key, gen);
+
+    ASSERT_OK_AND_ASSIGN(auto s_ntt, s.ToNtt(ctx, /*is_ternary=*/true));
+    ASSERT_OK_AND_ASSIGN(auto expected, a.Mult(s_ntt, ctx));
+
+    ASSERT_OK_AND_ASSIGN(auto s_fft, FftPolynomial::Create(s, *fft_ctx,
+                                                           /*bits=*/2,
+                                                           /*is_signed=*/true));
+    EXPECT_EQ(s_fft.MagnitudeBits(), 1);
+    ASSERT_OK_AND_ASSIGN(auto actual, a.MultFft(s_fft, *fft_ctx, c.a_bits));
+    EXPECT_EQ(actual.Coeffs(), expected.Coeffs())
+        << "q=" << c.q << " a_bits=" << c.a_bits;
+    // The full width must also agree when the high bits are zero.
+    ASSERT_OK_AND_ASSIGN(auto actual_full, a.MultFft(s_fft, *fft_ctx));
+    EXPECT_EQ(actual_full.Coeffs(), expected.Coeffs())
+        << "q=" << c.q << " a_bits=" << c.a_bits;
+  }
+}
+
+TEST(PolynomialTest, MultFftWithFftPolynomialMatchesNttUint32) {
+  const int log_d = 10;
+  const int d = 1 << log_d;
+  std::mt19937_64 gen(77);
+  ASSERT_OK_AND_ASSIGN(auto ctx, Context::CreateForTernary(log_d));
+  ASSERT_OK_AND_ASSIGN(auto fft_ctx, FftContext::Create(log_d));
+
+  std::vector<uint32_t> a_coeffs(d), s_coeffs(d);
+  for (int i = 0; i < d; ++i) {
+    a_coeffs[i] = static_cast<uint32_t>(gen());
+    const int t = gen() % 3;
+    s_coeffs[i] = (t == 2) ? ~uint32_t{0} : t;
+  }
+  ASSERT_OK_AND_ASSIGN(auto a, Polynomial<uint32_t>::Create(a_coeffs));
+  ASSERT_OK_AND_ASSIGN(auto s, Polynomial<uint32_t>::Create(s_coeffs));
+
+  ASSERT_OK_AND_ASSIGN(auto s_ntt, s.ToNtt(ctx, /*is_ternary=*/true));
+  ASSERT_OK_AND_ASSIGN(auto expected, a.Mult(s_ntt, ctx));
+  ASSERT_OK_AND_ASSIGN(auto s_fft, FftPolynomial::Create(s, *fft_ctx,
+                                                         /*bits=*/2,
+                                                         /*is_signed=*/true));
+  ASSERT_OK_AND_ASSIGN(auto actual, a.MultFft(s_fft, *fft_ctx));
+  EXPECT_EQ(actual.Coeffs(), expected.Coeffs());
+}
+
+TEST(PolynomialTest, MultFftWithFftPolynomialRejectsInvalidArguments) {
+  ASSERT_OK_AND_ASSIGN(auto fft_ctx, FftContext::Create(11));
+  ASSERT_OK_AND_ASSIGN(auto other_ctx, FftContext::Create(10));
+  ASSERT_OK_AND_ASSIGN(auto p, Polynomial<uint64_t>::CreateZero(2048));
+  ASSERT_OK_AND_ASSIGN(auto short_p, Polynomial<uint64_t>::CreateZero(1024));
+
+  EXPECT_THAT(FftPolynomial::Create(short_p, *fft_ctx, 2, true),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("context mismatch")));
+  EXPECT_THAT(FftPolynomial::Create(p, *fft_ctx, 0, false),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("Invalid bits")));
+
+  ASSERT_OK_AND_ASSIGN(auto key, FftPolynomial::Create(p, *fft_ctx, 2, true));
+  EXPECT_THAT(short_p.MultFft(key, *other_ctx),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("context mismatch")));
+  EXPECT_THAT(p.MultFft(key, *fft_ctx, 65),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("Invalid this_bits")));
+
+  // A 40-bit unsigned operand leaves no room for an exact chunk at d = 2048:
+  // 40 + 11 > kFftExactProductBits.
+  ASSERT_OK_AND_ASSIGN(auto wide,
+                       FftPolynomial::Create(p, *fft_ctx, 40, false));
+  EXPECT_THAT(p.MultFft(wide, *fft_ctx),
+              StatusIs(absl::StatusCode::kInvalidArgument,
+                       HasSubstr("too large")));
+}
+
 }  // namespace
 }  // namespace v2
 }  // namespace rlwe

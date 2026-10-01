@@ -67,6 +67,7 @@ cc_library(
         ":fft",
         ":polynomial",
         ":status_macros",
+        "@com_google_absl//absl/numeric:bits",
         "@com_google_absl//absl/status",
         "@com_google_absl//absl/status:statusor",
         "@com_google_absl//absl/types:span",
@@ -225,6 +226,7 @@ cc_library(
     hdrs = ["encryption.h"],
     deps = [
         ":polynomial",
+        ":polynomial_fft",
         ":status_macros",
         "@com_github_google_shell_encryption//shell_encryption:integral_types",
         "@com_github_google_shell_encryption//shell_encryption:montgomery",

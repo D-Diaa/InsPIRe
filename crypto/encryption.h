@@ -141,6 +141,17 @@ absl::StatusOr<std::vector<RlweSample<CoeffType>>> GenerateRlweSamples(
     ::rlwe::SecurePrng& prng,
     const Context& ctx);
 
+// Same, with the ternary secret key held in the FFT domain
+// (FftPolynomial::Create(secret_key, ctx, /*bits=*/2, /*is_signed=*/true)).
+// The samples are bit-identical to the NTT overloads' for the same `prng`.
+template <typename CoeffType>
+absl::StatusOr<std::vector<RlweSample<CoeffType>>> GenerateRlweSamples(
+    const RlweParams<CoeffType>& params,
+    const FftPolynomial& secret_key_fft,
+    const std::vector<Polynomial<CoeffType>>& a_components,
+    ::rlwe::SecurePrng& prng,
+    FftContext& ctx);
+
 // Represents an RLWE Ciphertext (a, b).
 //
 // `a` is the uniformly random polynomial from the RLWE sample.
@@ -220,6 +231,15 @@ absl::StatusOr<std::vector<CoeffType>> DecryptAfterModulusSwitch(
     const RlweCiphertext<CoeffType>& ciphertext,
     const NttPolynomial& secret_key_ntt,
     const Context& ctx);
+
+// Same, with the ternary secret key held in the FFT domain (see
+// GenerateRlweSamples); the result is bit-identical to the NTT overloads'.
+template <typename CoeffType>
+absl::StatusOr<std::vector<CoeffType>> DecryptAfterModulusSwitch(
+    const RlweParams<CoeffType>& params, CoeffType plaintext_modulus,
+    const RlweCiphertext<CoeffType>& ciphertext,
+    const FftPolynomial& secret_key_fft,
+    FftContext& ctx);
 
 // Encrypts a gadget ciphertext based on a set of independent RLWE samples.
 //

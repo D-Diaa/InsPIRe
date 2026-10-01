@@ -25,6 +25,7 @@ cc_library(
     deps = [
         "//crypto:encryption",
         "//crypto:polynomial",
+        "//crypto:polynomial_fft",
         "//crypto:status_macros",
         "//crypto/pir:pir_params",
         "@com_github_google_shell_encryption//shell_encryption/prng",

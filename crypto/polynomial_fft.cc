@@ -26,6 +26,7 @@
 
 #include "crypto/polynomial.h"
 #include "crypto/fft.h"
+#include "absl/numeric/bits.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/types/span.h"
@@ -47,11 +48,25 @@ absl::StatusOr<std::unique_ptr<FftContext>> FftContext::Create(int log_d) {
   ctx->d = d;
 
   ctx->forward_in.resize(len2);
+  ctx->forward_out.resize(len2);
+  ctx->backward_in.resize(len2);
   ctx->backward_out.resize(len2);
 
   ctx->plan = std::make_unique<fft::FftPlan<double, 1>>(
       std::array<size_t, 1>{static_cast<size_t>(len2)},
       fft::Normalization::kNone);
+
+  ctx->negacyclic_plan = std::make_unique<fft::FftPlan<double, 1>>(
+      std::array<size_t, 1>{static_cast<size_t>(d)},
+      fft::Normalization::kNone);
+  ctx->twist.resize(d);
+  ctx->untwist.resize(d);
+  const double pi = std::acos(-1.0);
+  for (int j = 0; j < d; ++j) {
+    const double angle = pi * j / d;
+    ctx->twist[j] = std::complex<double>(std::cos(angle), std::sin(angle));
+    ctx->untwist[j] = std::conj(ctx->twist[j]);
+  }
 
   return ctx;
 }
@@ -59,6 +74,19 @@ absl::StatusOr<std::unique_ptr<FftContext>> FftContext::Create(int log_d) {
 namespace {
 
 using Fft = std::vector<std::complex<double>>;
+
+// Returns bits [shift, shift + width) of `coeff` as a double, read as a
+// `signed_width`-bit two's complement value when `signed_width` > 0.
+double ChunkValue(uint64_t coeff, int shift, int width, int signed_width) {
+  const uint64_t mask = width >= 64 ? ~uint64_t{0} : (uint64_t{1} << width) - 1;
+  const uint64_t chunk = (coeff >> shift) & mask;
+  if (signed_width > 0) {
+    const int sign_shift = 64 - signed_width;
+    return static_cast<double>(static_cast<int64_t>(chunk << sign_shift) >>
+                               sign_shift);
+  }
+  return static_cast<double>(chunk);
+}
 
 // Number of base-2^chunk_bits digits of a `bits`-bit operand, capped at the
 // digits that fit in CoeffType.
@@ -76,20 +104,13 @@ absl::Status DigitFft(const std::vector<CoeffType>& coeffs, int chunk,
                       FftContext& ctx, Fft& out) {
   const int d = coeffs.size();
   const int len2 = 2 * d;
-  const uint64_t chunk_mask = (1ULL << chunk_bits) - 1;
+  const int signed_width =
+      (is_signed && chunk == num_chunks - 1) ? bits - chunk_bits * chunk : 0;
   for (int j = 0; j < len2; ++j) {
-    double val = 0.0;
-    if (j < d) {
-      uint64_t digit = (coeffs[j] >> (chunk_bits * chunk)) & chunk_mask;
-      if (is_signed && chunk == num_chunks - 1) {
-        int bits_in_chunk = bits - chunk_bits * chunk;
-        int shift = 64 - bits_in_chunk;
-        int64_t signed_digit = static_cast<int64_t>(digit << shift) >> shift;
-        val = static_cast<double>(signed_digit);
-      } else {
-        val = static_cast<double>(digit);
-      }
-    }
+    const double val =
+        j < d ? ChunkValue(coeffs[j], chunk_bits * chunk, chunk_bits,
+                           signed_width)
+              : 0.0;
     ctx.forward_in[j] = std::complex<double>(val, 0.0);
   }
   return fft::Fft(absl::MakeConstSpan(ctx.forward_in), absl::MakeSpan(out),
@@ -149,6 +170,81 @@ absl::StatusOr<Polynomial<CoeffType>> RecombineDigitProducts(
 }
 
 }  // namespace
+
+template <typename CoeffType>
+absl::StatusOr<FftPolynomial> FftPolynomial::Create(
+    const Polynomial<CoeffType>& poly, FftContext& ctx, int bits,
+    bool is_signed) {
+  const int d = poly.Len();
+  if (d != ctx.d || ctx.negacyclic_plan == nullptr) {
+    return absl::InvalidArgumentError(
+        "Polynomial length or context mismatch.");
+  }
+  if (bits <= 0 || bits > static_cast<int>(8 * sizeof(CoeffType))) {
+    return absl::InvalidArgumentError("Invalid bits.");
+  }
+  const int signed_width = is_signed ? bits : 0;
+  for (int j = 0; j < d; ++j) {
+    ctx.forward_in[j] =
+        ChunkValue(poly.Coeffs()[j], 0, bits, signed_width) * ctx.twist[j];
+  }
+  std::vector<std::complex<double>> result(d);
+  RETURN_IF_ERROR(fft::Fft(absl::MakeConstSpan(ctx.forward_in.data(), d),
+                           absl::MakeSpan(result), *ctx.negacyclic_plan));
+  return FftPolynomial(std::move(result), is_signed ? bits - 1 : bits);
+}
+
+template <typename CoeffType>
+absl::StatusOr<Polynomial<CoeffType>> Polynomial<CoeffType>::MultFft(
+    const FftPolynomial& that, FftContext& ctx, int this_bits) const {
+  const int d = Len();
+  if (d != ctx.d || that.Len() != d || ctx.negacyclic_plan == nullptr) {
+    return absl::InvalidArgumentError(
+        "Polynomial lengths or context mismatch.");
+  }
+  if (this_bits <= 0 ||
+      this_bits > static_cast<int>(8 * sizeof(CoeffType))) {
+    return absl::InvalidArgumentError("Invalid this_bits.");
+  }
+  const int log_d = absl::bit_width(static_cast<uint32_t>(d)) - 1;
+  const int chunk_bits = std::min(
+      this_bits, kFftExactProductBits - log_d - that.MagnitudeBits());
+  if (chunk_bits <= 0) {
+    return absl::InvalidArgumentError(
+        "Operands too large for an exact FFT product.");
+  }
+  const int num_chunks = (this_bits + chunk_bits - 1) / chunk_bits;
+
+  // Each chunk product is an exact integer polynomial (see
+  // kFftExactProductBits); the chunks are recombined modulo 2^(8 * sizeof
+  // CoeffType) by the shifts.
+  std::vector<CoeffType> result(d, 0);
+  for (int c = 0; c < num_chunks; ++c) {
+    const int shift = c * chunk_bits;
+    const int width = std::min(chunk_bits, this_bits - shift);
+    for (int j = 0; j < d; ++j) {
+      ctx.forward_in[j] =
+          ChunkValue(coeffs_[j], shift, width, 0) * ctx.twist[j];
+    }
+    RETURN_IF_ERROR(fft::Fft(absl::MakeConstSpan(ctx.forward_in.data(), d),
+                             absl::MakeSpan(ctx.forward_out.data(), d),
+                             *ctx.negacyclic_plan));
+    for (int j = 0; j < d; ++j) {
+      ctx.backward_in[j] = ctx.forward_out[j] * that.Fft()[j];
+    }
+    RETURN_IF_ERROR(fft::Ifft(absl::MakeConstSpan(ctx.backward_in.data(), d),
+                              absl::MakeSpan(ctx.backward_out.data(), d),
+                              *ctx.negacyclic_plan));
+    for (int j = 0; j < d; ++j) {
+      const double val = (ctx.backward_out[j] * ctx.untwist[j]).real() / d;
+      const int64_t val64 = static_cast<int64_t>(std::round(val));
+      result[j] += static_cast<CoeffType>(static_cast<uint64_t>(val64))
+                   << shift;
+    }
+  }
+
+  return Polynomial<CoeffType>::Create(std::move(result));
+}
 
 template <typename CoeffType>
 absl::StatusOr<Polynomial<CoeffType>> Polynomial<CoeffType>::MultFft(
@@ -294,6 +390,11 @@ absl::StatusOr<Polynomial<CoeffType>> Polynomial<CoeffType>::InnerProductFft(
   return RecombineDigitProducts<CoeffType>(accum, u_num_chunks, v_num_chunks,
                                            chunk_bits, ctx);
 }
+
+template absl::StatusOr<FftPolynomial> FftPolynomial::Create(
+    const Polynomial<uint32_t>&, FftContext&, int, bool);
+template absl::StatusOr<FftPolynomial> FftPolynomial::Create(
+    const Polynomial<uint64_t>&, FftContext&, int, bool);
 
 template class Polynomial<uint32_t>;
 template class Polynomial<uint64_t>;

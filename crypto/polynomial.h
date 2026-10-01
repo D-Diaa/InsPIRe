@@ -33,6 +33,7 @@ namespace v2 {
 
 struct FftContext;
 struct ChunkedFft;
+class FftPolynomial;
 
 // Context holds the precomputed NTT parameters and constants needed for
 // polynomial multiplication. It is independent of the coefficient type and
@@ -189,6 +190,14 @@ class Polynomial {
                                      int this_bits = 8 * sizeof(CoeffType),
                                      int that_bits = 8 * sizeof(CoeffType),
                                      int chunk_bits = 20) const;
+
+  // Exact product modulo 2^(8 * sizeof(CoeffType)) with a polynomial already
+  // in the negacyclic FFT domain (see FftPolynomial). Only the low `this_bits`
+  // bits of each coefficient of `this` are used; they are split into chunks
+  // of at most kFftExactProductBits - log2(d) - that.MagnitudeBits() bits.
+  absl::StatusOr<Polynomial> MultFft(
+      const FftPolynomial& that, FftContext& ctx,
+      int this_bits = 8 * sizeof(CoeffType)) const;
 
   // Computes the inner product of two vectors of polynomials efficiently
   // by performing all accumulations in the FFT domain and doing exactly one

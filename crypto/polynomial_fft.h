@@ -17,6 +17,7 @@
 
 #include <complex>
 #include <memory>
+#include <utility>
 #include <vector>
 
 #include "crypto/polynomial.h"
@@ -26,6 +27,18 @@
 namespace private_membership {
 namespace rlwe {
 namespace v2 {
+
+// Exactness budget of the chunked f64 negacyclic products in
+// Polynomial::MultFft(const FftPolynomial&, ...): with chunk magnitudes at
+// most 2^u and 2^v, every coefficient of a chunk product is an integer bounded
+// by ||x||_2 ||y||_2 <= 2^(u + v + log2 d). The f64 round trip (twist, two
+// forward FFTs, pointwise product, inverse FFT, untwist) perturbs it by at most
+// c * 2^-53 * ||x||_2 ||y||_2 with c < 2^8: Percival's bound for a radix-2 FFT
+// convolution with accurately rounded twiddles is c ~ 14 log2(d) + 15, i.e.
+// ~170 at d = 2^11 and < 256 up to d = 2^16. Rounding therefore recovers the
+// exact integer whenever
+//   u + v + log2(d) <= 53 - 8 - 1 = kFftExactProductBits.
+inline constexpr int kFftExactProductBits = 44;
 
 // FftContext holds pre-allocated buffers and precomputed FFT plans needed
 // for optimized FFT-based polynomial multiplication.
@@ -39,10 +52,22 @@ struct FftContext {
   FftContext& operator=(const FftContext&) = delete;
 
   int d;
+  // Scratch buffers, 2d long; MultFft(const FftPolynomial&, ...) uses their
+  // first d entries.
   std::vector<std::complex<double>> forward_in;
+  std::vector<std::complex<double>> forward_out;
+  std::vector<std::complex<double>> backward_in;
   std::vector<std::complex<double>> backward_out;
 
+  // 2d-point plan for the zero-padded products of InnerProductFft.
   std::unique_ptr<::security::fft::FftPlan<double, 1>> plan;
+
+  // d-point plan and twist tables w^j = exp(i*pi*j/d), j < d, for the
+  // negacyclic products of MultFft(const FftPolynomial&, ...): the cyclic
+  // convolution of x_j w^j and y_j w^j equals w^k (x * y mod X^d + 1)_k.
+  std::unique_ptr<::security::fft::FftPlan<double, 1>> negacyclic_plan;
+  std::vector<std::complex<double>> twist;
+  std::vector<std::complex<double>> untwist;
 
  private:
   FftContext() = default;
@@ -56,6 +81,34 @@ struct ChunkedFft {
   int chunk_bits = 0;
   // ffts[i][c] is the length-2d FFT of digit c of polynomial i, zero-padded.
   std::vector<std::vector<std::vector<std::complex<double>>>> ffts;
+};
+
+// A polynomial with small coefficients (e.g. a ternary secret key) held in
+// the negacyclic FFT domain of an FftContext, so that it can be multiplied
+// by many polynomials at the cost of the forward transforms of the other
+// operand only. The coefficients are read as `bits`-bit values, two's
+// complement if `is_signed` (a ternary key storing -1 as q - 1 is `bits` = 2,
+// `is_signed` = true); higher bits are ignored.
+class FftPolynomial {
+ public:
+  template <typename CoeffType>
+  static absl::StatusOr<FftPolynomial> Create(const Polynomial<CoeffType>& poly,
+                                              FftContext& ctx, int bits,
+                                              bool is_signed);
+
+  int Len() const { return fft_.size(); }
+
+  // Coefficient magnitudes are at most 2^MagnitudeBits().
+  int MagnitudeBits() const { return magnitude_bits_; }
+
+  const std::vector<std::complex<double>>& Fft() const { return fft_; }
+
+ private:
+  FftPolynomial(std::vector<std::complex<double>> fft, int magnitude_bits)
+      : fft_(std::move(fft)), magnitude_bits_(magnitude_bits) {}
+
+  std::vector<std::complex<double>> fft_;
+  int magnitude_bits_;
 };
 
 }  // namespace v2

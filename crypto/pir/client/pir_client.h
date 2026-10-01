@@ -23,6 +23,7 @@
 #include "crypto/encryption.h"
 #include "crypto/pir/pir_params.h"
 #include "crypto/polynomial.h"
+#include "crypto/polynomial_fft.h"
 #include "absl/status/statusor.h"
 #include "shell_encryption/prng/prng.h"
 
@@ -100,14 +101,14 @@ class PirClient {
   PirClient(const PirParams<CoeffType>& params,
             std::unique_ptr<::rlwe::SecurePrng> a_component_prng,
             std::unique_ptr<::rlwe::SecurePrng> prng,
-            Polynomial<CoeffType> secret_key, Context ctx,
-            NttPolynomial secret_key_ntt)
+            Polynomial<CoeffType> secret_key,
+            std::unique_ptr<FftContext> fft_ctx, FftPolynomial secret_key_fft)
       : params_(params),
         a_component_prng_(std::move(a_component_prng)),
         prng_(std::move(prng)),
         secret_key_(std::move(secret_key)),
-        ctx_(std::move(ctx)),
-        secret_key_ntt_(std::move(secret_key_ntt)) {}
+        fft_ctx_(std::move(fft_ctx)),
+        secret_key_fft_(std::move(secret_key_fft)) {}
 
   // Parameters for the PIR scheme.
   const PirParams<CoeffType> params_;
@@ -121,10 +122,11 @@ class PirClient {
   // The secret key used in the query generation.
   const Polynomial<CoeffType> secret_key_;
 
-  // Precomputed Context and NTT secret key cached for intra-request query
-  // generation.
-  const Context ctx_;
-  const NttPolynomial secret_key_ntt_;
+  // FFT context (its scratch buffers are reused by every product, which is
+  // why it is held by pointer) and the secret key in the FFT domain, cached
+  // for query generation and response decryption.
+  const std::unique_ptr<FftContext> fft_ctx_;
+  const FftPolynomial secret_key_fft_;
 };
 
 extern template class PirClient<uint32_t>;

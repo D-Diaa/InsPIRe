@@ -15,6 +15,7 @@
 #include "crypto/encryption.h"
 
 #include <cstdint>
+#include <random>
 #include <vector>
 
 #include "crypto/external_product.h"
@@ -859,6 +860,136 @@ TYPED_TEST(EncryptionTest,
       }
     }
   }
+}
+
+// With the same `a` components and the same (deterministic) error stream, the
+// FFT overload must produce b components bit-identical to the NTT overload.
+TYPED_TEST(EncryptionTest, GenerateRlweSamplesFftMatchesNtt) {
+  std::vector<TypeParam> moduli = {
+      0, 1024, static_cast<TypeParam>(1ULL << (sizeof(TypeParam) * 8 - 2))};
+  const int log_d = 11;
+  const int d = 1 << log_d;
+  for (TypeParam q : moduli) {
+    ASSERT_OK_AND_ASSIGN(auto params, RlweParams<TypeParam>::Create(d, q, 8));
+    FakePrng key_prng;
+    ASSERT_OK_AND_ASSIGN(auto s, SampleSecretKey<TypeParam>(params, key_prng));
+    ASSERT_OK_AND_ASSIGN(auto a_components,
+                         SampleAComponents<TypeParam>(params, 3, key_prng));
+
+    ASSERT_OK_AND_ASSIGN(auto ctx, Context::CreateForTernary(log_d));
+    ASSERT_OK_AND_ASSIGN(auto s_ntt, s.ToNtt(ctx, /*is_ternary=*/true));
+    FakePrng ntt_prng;
+    ASSERT_OK_AND_ASSIGN(auto expected,
+                         GenerateRlweSamples<TypeParam>(params, s_ntt,
+                                                        a_components, ntt_prng,
+                                                        ctx));
+
+    ASSERT_OK_AND_ASSIGN(auto fft_ctx, FftContext::Create(log_d));
+    ASSERT_OK_AND_ASSIGN(auto s_fft, FftPolynomial::Create(s, *fft_ctx,
+                                                           /*bits=*/2,
+                                                           /*is_signed=*/true));
+    FakePrng fft_prng;
+    ASSERT_OK_AND_ASSIGN(auto actual,
+                         GenerateRlweSamples<TypeParam>(params, s_fft,
+                                                        a_components, fft_prng,
+                                                        *fft_ctx));
+
+    ASSERT_EQ(actual.size(), expected.size());
+    for (size_t i = 0; i < actual.size(); ++i) {
+      EXPECT_EQ(actual[i].a.Coeffs(), expected[i].a.Coeffs());
+      EXPECT_EQ(actual[i].b.Coeffs(), expected[i].b.Coeffs()) << "q=" << q;
+    }
+  }
+}
+
+// Tiptoe parameters: d = 2048, q = 2^52, q1 = 2^29, q2 = 2^18, p = 2^16.
+absl::StatusOr<RlweParams<uint64_t>> TiptoeRlweParams() {
+  return RlweParams<uint64_t>::Create(2048, uint64_t{1} << 52,
+                                      uint64_t{1} << 29, uint64_t{1} << 18,
+                                      40);
+}
+
+// Decryption through the FFT key must match the NTT key on random
+// modulus-switched ciphertexts and on the extreme a = q1 - 1, s = -1.
+TEST(EncryptionFftTest, DecryptAfterModulusSwitchFftMatchesNttAtTiptoeParams) {
+  const int log_d = 11;
+  const int d = 1 << log_d;
+  const uint64_t p = 65536;
+  ASSERT_OK_AND_ASSIGN(auto params, TiptoeRlweParams());
+  ASSERT_OK_AND_ASSIGN(auto ctx, Context::CreateForTernary(log_d));
+  ASSERT_OK_AND_ASSIGN(auto fft_ctx, FftContext::Create(log_d));
+  std::mt19937_64 gen(5);
+  const uint64_t q1_mask = (uint64_t{1} << 29) - 1;
+  const uint64_t q2_mask = (uint64_t{1} << 18) - 1;
+
+  for (bool extreme : {false, true}) {
+    std::vector<uint64_t> s_coeffs(d), a_coeffs(d), b_coeffs(d);
+    for (int i = 0; i < d; ++i) {
+      const int t = extreme ? 2 : gen() % 3;
+      s_coeffs[i] = (t == 2) ? params.Modulus() - 1 : t;
+      a_coeffs[i] = extreme ? q1_mask : (gen() & q1_mask);
+      b_coeffs[i] = gen() & q2_mask;
+    }
+    ASSERT_OK_AND_ASSIGN(auto s, Polynomial<uint64_t>::Create(s_coeffs));
+    ASSERT_OK_AND_ASSIGN(auto a, Polynomial<uint64_t>::Create(a_coeffs));
+    ASSERT_OK_AND_ASSIGN(auto b, Polynomial<uint64_t>::Create(b_coeffs));
+    const RlweCiphertext<uint64_t> ct{a, b};
+
+    ASSERT_OK_AND_ASSIGN(auto s_ntt, s.ToNtt(ctx, /*is_ternary=*/true));
+    ASSERT_OK_AND_ASSIGN(auto expected,
+                         DecryptAfterModulusSwitch(params, p, ct, s_ntt, ctx));
+    ASSERT_OK_AND_ASSIGN(auto s_fft, FftPolynomial::Create(s, *fft_ctx,
+                                                           /*bits=*/2,
+                                                           /*is_signed=*/true));
+    ASSERT_OK_AND_ASSIGN(
+        auto actual, DecryptAfterModulusSwitch(params, p, ct, s_fft, *fft_ctx));
+    EXPECT_EQ(actual, expected) << "extreme=" << extreme;
+  }
+}
+
+// End to end through the FFT path at the Tiptoe parameters: encrypt from FFT
+// samples, modulus switch as the server does, decrypt with the FFT key.
+TEST(EncryptionFftTest, EncryptModulusSwitchDecryptFftAtTiptoeParams) {
+  const int log_d = 11;
+  const int d = 1 << log_d;
+  const uint64_t p = 65536;
+  ASSERT_OK_AND_ASSIGN(auto params, TiptoeRlweParams());
+  ASSERT_OK_AND_ASSIGN(auto seed,
+                       ::rlwe::SingleThreadChaChaPrng::GenerateSeed());
+  ASSERT_OK_AND_ASSIGN(auto prng, ::rlwe::SingleThreadChaChaPrng::Create(seed));
+  ASSERT_OK_AND_ASSIGN(auto s, SampleSecretKey<uint64_t>(params, *prng));
+  ASSERT_OK_AND_ASSIGN(auto fft_ctx, FftContext::Create(log_d));
+  ASSERT_OK_AND_ASSIGN(auto s_fft, FftPolynomial::Create(s, *fft_ctx,
+                                                         /*bits=*/2,
+                                                         /*is_signed=*/true));
+  ASSERT_OK_AND_ASSIGN(auto a_components,
+                       SampleAComponents<uint64_t>(params, 1, *prng));
+  ASSERT_OK_AND_ASSIGN(auto samples,
+                       GenerateRlweSamples<uint64_t>(params, s_fft,
+                                                     a_components, *prng,
+                                                     *fft_ctx));
+
+  std::vector<uint64_t> message(d);
+  for (int i = 0; i < d; ++i) {
+    message[i] = (i * 7919) % p;
+  }
+  ASSERT_OK_AND_ASSIGN(
+      auto ct, EncryptFromRlweSample<uint64_t>(params, p, samples[0], message));
+  ASSERT_OK_AND_ASSIGN(auto a_switched,
+                       ct.a.Rescale(params.LogModulus(),
+                                    params.LogModulus1AfterSwitch()));
+  ASSERT_OK_AND_ASSIGN(auto b_switched,
+                       ct.b.Rescale(params.LogModulus(),
+                                    params.LogModulus2AfterSwitch()));
+  const RlweCiphertext<uint64_t> switched{a_switched, b_switched};
+
+  ASSERT_OK_AND_ASSIGN(
+      auto decrypted,
+      DecryptAfterModulusSwitch(params, p, switched, s_fft, *fft_ctx));
+  EXPECT_EQ(decrypted, message);
+  ASSERT_OK_AND_ASSIGN(auto decrypted_ntt,
+                       DecryptAfterModulusSwitch(params, p, switched, s));
+  EXPECT_EQ(decrypted_ntt, message);
 }
 
 }  // namespace
