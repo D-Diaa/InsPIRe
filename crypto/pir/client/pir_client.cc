@@ -127,7 +127,7 @@ PirClient<CoeffType>::CreateFirstDimensionQueryForVector(
 
 template <typename CoeffType>
 absl::StatusOr<std::vector<CoeffType>>
-PirClient<CoeffType>::CreateFirstDimensionQuery(const int index) const {
+PirClient<CoeffType>::CreateFirstDimensionQuery(const int index, ::rlwe::SecurePrng* mask_prng) const {
   const auto& rlwe_params = params_.RlweParameters();
   const int d = rlwe_params.Degree();
   const int t = params_.InterpolationDegree();
@@ -140,7 +140,7 @@ PirClient<CoeffType>::CreateFirstDimensionQuery(const int index) const {
   const int r = params_.InterpolatedRows();
   const int num_samples = params_.NumFirstDimSamples();
   ASSIGN_OR_RETURN(auto a_first, SampleAComponents(rlwe_params, num_samples,
-                                                   *a_component_prng_));
+                                                   *(mask_prng == nullptr ? a_component_prng_.get() : mask_prng)));
   ASSIGN_OR_RETURN(
       auto rlwe_samples,
       GenerateRlweSamples(rlwe_params, secret_key_ntt_, a_first, *prng_, ctx_));
@@ -215,14 +215,14 @@ PirClient<CoeffType>::CreateSecondDimensionQuery(const int index) const {
 
 template <typename CoeffType>
 absl::StatusOr<std::vector<Polynomial<CoeffType>>>
-PirClient<CoeffType>::CreatePackingKey() const {
+PirClient<CoeffType>::CreatePackingKey(::rlwe::SecurePrng* mask_prng) const {
   const auto& rlwe_params = params_.RlweParameters();
   const int d = rlwe_params.Degree();
 
   const int num_samples = 2 * params_.PackGadgetParams().num_digits;
   ASSIGN_OR_RETURN(
       std::vector<Polynomial<CoeffType>> a_pack,
-      SampleAComponents(rlwe_params, num_samples, *a_component_prng_));
+      SampleAComponents(rlwe_params, num_samples, *(mask_prng == nullptr ? a_component_prng_.get() : mask_prng)));
   ASSIGN_OR_RETURN(
       std::vector<RlweSample<CoeffType>> rlwe_samples,
       GenerateRlweSamples(rlwe_params, secret_key_ntt_, a_pack, *prng_, ctx_));

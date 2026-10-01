@@ -252,8 +252,12 @@ PirServer<DbDataType, CoeffType, MatCoeffType>::ProcessResponse(
     return absl::InternalError(
         "Packing multiplication resulted in incorrect vector size.");
   }
+  const auto matrix_elapsed=absl::Now()-start_pack;
+  packing_time_ += matrix_elapsed;
+  pack_matrix_time_ += matrix_elapsed;
 
   for (int k = 0; k < entry_size_multiple; ++k) {
+    start_pack = absl::Now();
     // Stage 2: Packing
     std::vector<RlweCiphertext<CoeffType>> packed_ciphertexts;
     packed_ciphertexts.reserve(t);
@@ -277,13 +281,16 @@ PirServer<DbDataType, CoeffType, MatCoeffType>::ProcessResponse(
                              params_.PackGadgetParams(), *fft_ctx));
       packed_ciphertexts.push_back(std::move(pack_result));
     }
-    packing_time_ += (absl::Now() - start_pack);
+    const auto finalize_elapsed=absl::Now()-start_pack;
+    packing_time_ += finalize_elapsed;
+    finalize_time_ += finalize_elapsed;
 
     auto start_eval = absl::Now();
     ASSIGN_OR_RETURN(RlweCiphertext<CoeffType> final_ciphertext,
                      EvalPoly(packed_ciphertexts, rgsw_ct, *fft_ctx));
     poly_eval_time_ += (absl::Now() - start_eval);
 
+    const auto start_modswitch=absl::Now();
     // mod switch the first component of the ciphertext to q1
     ASSIGN_OR_RETURN(auto a_mod_switched,
                      final_ciphertext.a.Rescale(
@@ -300,6 +307,7 @@ PirServer<DbDataType, CoeffType, MatCoeffType>::ProcessResponse(
         std::move(a_mod_switched), std::move(b_mod_switched)};
 
     shard_responses.push_back(std::move(final_ciphertext_mod_switched));
+    modswitch_time_ += absl::Now()-start_modswitch;
   }
 
   return PirResponse<CoeffType>{std::move(shard_responses)};

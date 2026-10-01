@@ -93,3 +93,30 @@ cc_binary(
         "@com_google_absl//absl/time",
     ],
 )
+
+cc_binary(
+    name = "tiptoe_workload",
+    srcs = ["tiptoe_workload.cc"],
+    deps = [
+        "@highway//:hwy",
+        "//crypto:encryption",
+        "//crypto:matrix",
+        "//crypto:polynomial",
+        "//crypto:status_macros",
+        "//crypto/pir:pir_params",
+        "//crypto/pir/client:pir_client",
+        "//crypto/pir/server:pir_preprocessed_data",
+        "//crypto/pir/server:pir_server",
+        "//crypto/pir/server:preprocessing_server",
+        "@com_github_google_shell_encryption//shell_encryption/prng",
+        "@com_github_google_shell_encryption//shell_encryption/prng:chacha_prng",
+        "@com_google_absl//absl/flags:flag",
+        "@com_google_absl//absl/flags:parse",
+        "@com_google_absl//absl/log",
+        "@com_google_absl//absl/numeric:bits",
+        "@com_google_absl//absl/status",
+        "@com_google_absl//absl/strings",
+        "@com_google_absl//absl/strings:string_view",
+        "@com_google_absl//absl/time",
+    ],
+)

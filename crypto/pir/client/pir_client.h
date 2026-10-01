@@ -76,14 +76,23 @@ class PirClient {
   absl::StatusOr<std::vector<Polynomial<CoeffType>>> CreateSecondDimensionQuery(
       int index) const;
 
+  // A selector under a distinct public mask, sharing this request's fresh secret.
+  absl::StatusOr<std::vector<CoeffType>> CreateSelector(
+      int index, ::rlwe::SecurePrng* mask_prng) const {
+    if (params_.InterpolationDegree() != 1 || index < 0 || index >= params_.NumEntries() || mask_prng == nullptr) {
+      return absl::InvalidArgumentError("Invalid t=1 selector.");
+    }
+    return CreateFirstDimensionQuery(index, mask_prng);
+  }
+
   // Creates the key used for packing..
-  absl::StatusOr<std::vector<Polynomial<CoeffType>>> CreatePackingKey() const;
+  absl::StatusOr<std::vector<Polynomial<CoeffType>>> CreatePackingKey(::rlwe::SecurePrng* mask_prng = nullptr) const;
 
  private:
   // Creates the part of PIR query corresponding to the first dimension of
   // database items.
   absl::StatusOr<std::vector<CoeffType>> CreateFirstDimensionQuery(
-      int index) const;
+      int index, ::rlwe::SecurePrng* mask_prng = nullptr) const;
 
   absl::StatusOr<std::vector<CoeffType>> CreateFirstDimensionQueryForVector(
       const std::vector<CoeffType>& vec) const;

@@ -69,6 +69,13 @@ class PirServer {
 
   absl::Duration GetDbMultiplyTime() const { return db_mult_time_; }
   absl::Duration GetPackingTime() const { return packing_time_; }
+  absl::Duration GetPackMatrixTime() const { return pack_matrix_time_; }
+  absl::Duration GetFinalizeTime() const { return finalize_time_; }
+  absl::Duration GetModswitchTime() const { return modswitch_time_; }
+  int DbCols() const { return combined_db_matrix_.Cols(); }
+  int DbRows() const { return combined_db_matrix_.Rows(); }
+  int PackCols() const { return combined_pack_matrix_.Cols(); }
+  int PackRows() const { return combined_pack_matrix_.Rows(); }
   absl::Duration GetPolyEvalTime() const { return poly_eval_time_; }
 
  private:
@@ -105,6 +112,9 @@ class PirServer {
   const std::vector<Polynomial<CoeffType>> second_dim_query_a_;
   Context ctx_;
 
+  mutable absl::Duration pack_matrix_time_ = absl::ZeroDuration();
+  mutable absl::Duration finalize_time_ = absl::ZeroDuration();
+  mutable absl::Duration modswitch_time_ = absl::ZeroDuration();
   mutable absl::Duration db_mult_time_;
   mutable absl::Duration packing_time_;
   mutable absl::Duration poly_eval_time_;

@@ -66,7 +66,8 @@ class PreprocessingServer {
   }
 
   absl::StatusOr<PirPreprocessedData<DbValueType, CoeffType, MatCoeffType>>
-  Preprocess(const std::vector<DbValueType>& db_raw) const {
+  Preprocess(const std::vector<DbValueType>& db_raw,
+             absl::string_view packing_seed = "") const {
     ASSIGN_OR_RETURN(auto a_prng, ::rlwe::ChaChaPrng::Create(prng_seed_));
     const int d = params_->RlweParameters().Degree();
     const int t = params_->InterpolationDegree();
@@ -106,6 +107,13 @@ class PreprocessingServer {
       ASSIGN_OR_RETURN(second_dim_a,
                        SampleAComponents(params_->RlweParameters(),
                                          second_dim_a_samples, *a_prng));
+    }
+    // Batch requests use one common packing mask, distinct from every selector.
+    if (!packing_seed.empty()) {
+      if (params_->InterpolationDegree() != 1) {
+        return absl::InvalidArgumentError("Shared packing seed requires t=1.");
+      }
+      ASSIGN_OR_RETURN(a_prng, ::rlwe::ChaChaPrng::Create(packing_seed));
     }
     const int pack_a_samples = 2 * params_->PackGadgetParams().num_digits;
     ASSIGN_OR_RETURN(auto pack_a, SampleAComponents(params_->RlweParameters(),
