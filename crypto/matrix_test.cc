@@ -15,6 +15,7 @@
 #include "crypto/matrix.h"
 
 #include <cstdint>
+#include <random>
 #include <utility>
 #include <vector>
 
@@ -131,6 +132,52 @@ TEST(CondensedMultiplyHighwayI32U64Test, Correctness) {
   ASSERT_OK_AND_ASSIGN(auto result, matrix.template Multiply<uint64_t>(vec));
 
   EXPECT_THAT(result, ElementsAre(16, 16));
+}
+
+// The condensed kernel must agree bit-for-bit (mod 2^64) with the scalar
+// sign-extending product on random and extreme operands. 7 rows exercises
+// both the blocked path and the single-row tail.
+TEST(CondensedMultiplyHighwayI32U64Test, MatchesScalarOnRandomAndExtremes) {
+  const int rows = 7;
+  const int cols = 64;
+  std::mt19937_64 rng(12345);
+
+  std::vector<std::vector<int32_t>> matrix_data(rows,
+                                                std::vector<int32_t>(cols));
+  std::vector<uint64_t> vec(cols);
+  for (int i = 0; i < rows; ++i) {
+    for (int j = 0; j < cols; ++j) {
+      matrix_data[i][j] = static_cast<int32_t>(rng());
+    }
+  }
+  for (int j = 0; j < cols; ++j) {
+    vec[j] = rng();
+  }
+  const int32_t m_extremes[] = {INT32_MIN, INT32_MAX, -1, 0, 1};
+  const uint64_t y_extremes[] = {0,
+                                 1,
+                                 UINT64_MAX,
+                                 (uint64_t{1} << 52) - 1,
+                                 uint64_t{1} << 31,
+                                 (uint64_t{1} << 32) - 1,
+                                 uint64_t{1} << 32,
+                                 uint64_t{1} << 63};
+  int k = 0;
+  for (int32_t m : m_extremes) {
+    for (uint64_t y : y_extremes) {
+      matrix_data[k % rows][k % cols] = m;
+      vec[k % cols] = y;
+      ++k;
+    }
+  }
+
+  ASSERT_OK_AND_ASSIGN(auto plain, Matrix<int32_t>::Create(matrix_data));
+  ASSERT_OK_AND_ASSIGN(auto condensed,
+                       Matrix<int32_t>::CreateCondensed(matrix_data));
+  ASSERT_OK_AND_ASSIGN(auto expected, plain.template Multiply<uint64_t>(vec));
+  ASSERT_OK_AND_ASSIGN(auto result,
+                       condensed.template Multiply<uint64_t>(vec));
+  EXPECT_EQ(result, expected);
 }
 
 TEST(CondensedMultiplyHighwayU8U64Test, Correctness) {

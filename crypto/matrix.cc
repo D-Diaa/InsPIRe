@@ -317,61 +317,112 @@ absl::StatusOr<std::vector<uint64_t>> CondensedMultiply<uint16_t>(
   return result;
 }
 
+// z[i] = sum_j m[i][j] * y[j] mod 2^64 for an int32 matrix and a uint64 vector.
+//
+// AVX2 has no 64-bit multiply, so a 64x64 MulAdd costs several instructions
+// per lane and the loop is instruction-bound well below memory bandwidth.
+// Split y instead, once per call:
+//
+//   y_lo = int32(y mod 2^32)  (sign-extended by the multiply)
+//   y_hi = int32((y >> 32) + bit31(y))  (the +1 cancels that sign extension)
+//
+// so that y == y_lo + 2^32 * y_hi (mod 2^64) and
+//
+//   m * y == m * y_lo + 2^32 * (m * y_hi mod 2^32)  (mod 2^64).
+//
+// m * y_lo is one signed 32x32->64 product (MulEven); of m * y_hi only the low
+// 32 bits survive the shift, one 32x32->32 product (Mul). A condensed lane
+// holds (m[2j], m[2j+1]) as its low and high halves: MulEven reads the low
+// halves directly and the high halves after a 32-bit shift, while Mul sees
+// both as ordinary int32 lanes. Rows are processed kRowBlock at a time so
+// each y vector is loaded once per block.
+template <int kRows>
+HWY_INLINE void CondensedMultiplyInt32Rows(const uint64_t* const* m_rows,
+                                           int condensed_cols,
+                                           const int32_t* y_lo,
+                                           const int32_t* y_hi,
+                                           uint64_t* result) {
+  namespace hn = hwy::HWY_NAMESPACE;
+  const hn::ScalableTag<uint64_t> d64;
+  const hn::Repartition<int64_t, decltype(d64)> d64s;
+  const hn::Repartition<int32_t, decltype(d64)> d32;
+  const hn::Repartition<uint32_t, decltype(d64)> du32;
+  const size_t N = hn::Lanes(d64);
+
+  hn::Vec<decltype(d64s)> lo[kRows];
+  hn::Vec<decltype(du32)> hi[kRows];
+  for (int r = 0; r < kRows; ++r) {
+    lo[r] = hn::Zero(d64s);
+    hi[r] = hn::Zero(du32);
+  }
+
+  for (size_t c = 0; c < static_cast<size_t>(condensed_cols); c += N) {
+    const auto yl = hn::LoadU(d32, y_lo + 2 * c);
+    const auto yl_odd =
+        hn::BitCast(d32, hn::ShiftRight<32>(hn::BitCast(d64, yl)));
+    const auto yh = hn::LoadU(d32, y_hi + 2 * c);
+    for (int r = 0; r < kRows; ++r) {
+      const auto m = hn::LoadU(d64, m_rows[r] + c);
+      const auto m_even = hn::BitCast(d32, m);
+      const auto m_odd = hn::BitCast(d32, hn::ShiftRight<32>(m));
+      lo[r] = hn::Add(lo[r], hn::MulEven(m_even, yl));
+      lo[r] = hn::Add(lo[r], hn::MulEven(m_odd, yl_odd));
+      hi[r] = hn::Add(hi[r], hn::BitCast(du32, hn::Mul(m_even, yh)));
+    }
+  }
+
+  for (int r = 0; r < kRows; ++r) {
+    result[r] = static_cast<uint64_t>(hn::ReduceSum(d64s, lo[r])) +
+                (static_cast<uint64_t>(hn::ReduceSum(du32, hi[r])) << 32);
+  }
+}
+
 template <>
 absl::StatusOr<std::vector<uint64_t>> CondensedMultiply<int32_t>(
     const Matrix<int32_t>& condensed_matrix, absl::Span<const uint64_t> vec,
     int original_cols) {
   namespace hn = hwy::HWY_NAMESPACE;
-  hn::ScalableTag<uint64_t> d;
+  const hn::ScalableTag<uint64_t> d;
   const size_t N = hn::Lanes(d);
 
   if (original_cols % (2 * N) != 0) {
     return absl::InvalidArgumentError(
         "Original columns must be a multiple of 2 * Lanes.");
   }
-  if (vec.size() != original_cols) {
+  if (vec.size() != static_cast<size_t>(original_cols)) {
     return absl::InvalidArgumentError("Vector size mismatch.");
   }
-  int rows = condensed_matrix.Rows();
-  int condensed_cols = original_cols / 2;
-
-  std::vector<uint64_t> result(rows, 0);
+  const int rows = condensed_matrix.Rows();
+  const int condensed_cols = original_cols / 2;
   const std::vector<uint64_t>& data = condensed_matrix.CondensedData();
 
-  int num_blocks = original_cols / (2 * N);
-  std::vector<hn::Vec<decltype(d)>> V_0(num_blocks);
-  std::vector<hn::Vec<decltype(d)>> V_1(num_blocks);
-
-  for (int b = 0; b < num_blocks; ++b) {
-    int base = b * 2 * N;
-    hn::LoadInterleaved2(d, &vec[base], V_0[b], V_1[b]);
+  std::vector<int32_t> y_lo(original_cols);
+  std::vector<int32_t> y_hi(original_cols);
+  for (int j = 0; j < original_cols; ++j) {
+    y_lo[j] = static_cast<int32_t>(static_cast<uint32_t>(vec[j]));
+    y_hi[j] = static_cast<int32_t>(static_cast<uint32_t>(vec[j] >> 32) +
+                                   static_cast<uint32_t>((vec[j] >> 31) & 1));
   }
 
-  hn::ScalableTag<int64_t> d_signed;
-
-  for (int i = 0; i < rows; ++i) {
-    auto accum = hn::Zero(d);
-
-    for (int b = 0; b < num_blocks; ++b) {
-      auto m_condensed = hn::LoadU(d, &data[i * condensed_cols + b * N]);
-      auto m_condensed_signed = hn::BitCast(d_signed, m_condensed);
-
-      auto m1_signed = hn::ShiftRight<32>(m_condensed_signed);
-      auto m0_signed =
-          hn::ShiftRight<32>(hn::ShiftLeft<32>(m_condensed_signed));
-
-      auto m0 = hn::BitCast(d, m0_signed);
-      auto m1 = hn::BitCast(d, m1_signed);
-
-      accum = hn::MulAdd(m0, V_0[b], accum);
-      accum = hn::MulAdd(m1, V_1[b], accum);
+  constexpr int kRowBlock = 4;
+  std::vector<uint64_t> result(rows, 0);
+  int i = 0;
+  for (; i + kRowBlock <= rows; i += kRowBlock) {
+    const uint64_t* m_rows[kRowBlock];
+    for (int r = 0; r < kRowBlock; ++r) {
+      m_rows[r] = &data[static_cast<size_t>(i + r) * condensed_cols];
     }
-
-    result[i] = hn::ReduceSum(d, accum);
+    CondensedMultiplyInt32Rows<kRowBlock>(m_rows, condensed_cols, y_lo.data(),
+                                          y_hi.data(), &result[i]);
   }
-
+  for (; i < rows; ++i) {
+    const uint64_t* m_row = &data[static_cast<size_t>(i) * condensed_cols];
+    CondensedMultiplyInt32Rows<1>(&m_row, condensed_cols, y_lo.data(),
+                                  y_hi.data(), &result[i]);
+  }
   return result;
 }
+
 
 template <>
 absl::StatusOr<std::vector<uint64_t>> CondensedMultiply<uint8_t>(
