@@ -227,9 +227,6 @@ class PreprocessingServer {
     const int t = params_->InterpolationDegree();
 
     ASSIGN_OR_RETURN(
-        auto ctx,
-        Context::Create(absl::bit_width(static_cast<uint32_t>(d)) - 1));
-    ASSIGN_OR_RETURN(
         auto fft_ctx,
         FftContext::Create(absl::bit_width(static_cast<uint32_t>(d)) - 1));
     const int padded_cols = params_->PaddedCols();

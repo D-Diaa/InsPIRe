@@ -110,20 +110,30 @@ absl::Status EvaluateNttInPlace(std::vector<Polynomial<CoeffType>>& c) {
     }
   }
 
-  // 2) Iterative FFT stages
+  // 2) Iterative FFT stages in-place (zero per-butterfly allocations).
+  std::vector<CoeffType> b_tmp(d);
   for (int len = 2; len <= d; len *= 2) {
     int half = len / 2;
     int step = d / len;
     for (int i = 0; i < d; i += len) {
       for (int j = 0; j < half; ++j) {
-        Polynomial<CoeffType> u = c[i + j];
-        // Multiply c[i + j + half] by the twiddle factor omega^j = X^{2 * j *
-        // step}
-        ASSIGN_OR_RETURN(Polynomial<CoeffType> v,
-                         MultiplyByXPower(c[i + j + half], 2 * j * step));
-        ASSIGN_OR_RETURN(c[i + j], u.Add(v));
-        ASSIGN_OR_RETURN(Polynomial<CoeffType> v_neg, v.Negate());
-        ASSIGN_OR_RETURN(c[i + j + half], u.Add(v_neg));
+        const int power = 2 * j * step;
+        CoeffType* __restrict u_ptr = c[i + j].MutableCoeffs().data();
+        CoeffType* __restrict b_ptr = c[i + j + half].MutableCoeffs().data();
+        std::copy_n(b_ptr, d, b_tmp.data());
+        const CoeffType* __restrict bt = b_tmp.data();
+        for (int m = 0; m < power; ++m) {
+          const CoeffType u_val = u_ptr[m];
+          const CoeffType v_val = -bt[d - power + m];
+          u_ptr[m] = u_val + v_val;
+          b_ptr[m] = u_val - v_val;
+        }
+        for (int m = power; m < d; ++m) {
+          const CoeffType u_val = u_ptr[m];
+          const CoeffType v_val = bt[m - power];
+          u_ptr[m] = u_val + v_val;
+          b_ptr[m] = u_val - v_val;
+        }
       }
     }
   }

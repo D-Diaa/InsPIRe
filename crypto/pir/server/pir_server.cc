@@ -94,8 +94,8 @@ PirServer<DbDataType, CoeffType, MatCoeffType>::Create(
         "PolyEvalGadgetParams().num_digits.");
   }
   ASSIGN_OR_RETURN(
-      Context ctx,
-      Context::Create(absl::bit_width(static_cast<uint32_t>(d)) - 1));
+      auto fft_ctx,
+      FftContext::Create(absl::bit_width(static_cast<uint32_t>(d)) - 1));
 
   // Combine db_matrices
   ASSIGN_OR_RETURN(
@@ -119,7 +119,8 @@ PirServer<DbDataType, CoeffType, MatCoeffType>::Create(
 
   ASSIGN_OR_RETURN(
       auto t_vec_h_ffts,
-      PrecomputeTVecHFfts(params, preprocessed_data.preprocessed_outputs));
+      PrecomputeTVecHFfts(params, preprocessed_data.preprocessed_outputs,
+                          *fft_ctx));
 
   std::vector<Polynomial<CoeffType>> a_mod_switched_t1;
   if (t == 1) {
@@ -138,7 +139,7 @@ PirServer<DbDataType, CoeffType, MatCoeffType>::Create(
       params, std::move(combined_db_matrix), std::move(combined_pack_matrix),
       std::move(preprocessed_data.preprocessed_outputs),
       std::move(t_vec_h_ffts), std::move(a_mod_switched_t1),
-      std::move(preprocessed_data.second_dim_a), std::move(ctx)));
+      std::move(preprocessed_data.second_dim_a), std::move(fft_ctx)));
 }
 
 template <typename DbDataType, typename CoeffType, typename MatCoeffType>
@@ -147,11 +148,8 @@ PirServer<DbDataType, CoeffType, MatCoeffType>::PrecomputeTVecHFfts(
     const PirParams<CoeffType>& params,
     const std::vector<
         std::vector<PreprocessMatrixPackOutput<CoeffType, MatCoeffType>>>&
-        preprocessed_outputs) {
-  const int d = params.RlweParameters().Degree();
-  ASSIGN_OR_RETURN(
-      auto fft_ctx,
-      FftContext::Create(absl::bit_width(static_cast<uint32_t>(d)) - 1));
+        preprocessed_outputs,
+    FftContext& fft_ctx) {
   std::vector<std::vector<ChunkedFft>> t_vec_h_ffts(
       preprocessed_outputs.size());
   for (size_t k = 0; k < preprocessed_outputs.size(); ++k) {
@@ -159,7 +157,7 @@ PirServer<DbDataType, CoeffType, MatCoeffType>::PrecomputeTVecHFfts(
     for (const auto& output : preprocessed_outputs[k]) {
       ASSIGN_OR_RETURN(
           ChunkedFft fft,
-          TVecHFft(output.t_vec_h, params.PackGadgetParams(), *fft_ctx));
+          TVecHFft(output.t_vec_h, params.PackGadgetParams(), fft_ctx));
       t_vec_h_ffts[k].push_back(std::move(fft));
     }
   }
@@ -247,9 +245,7 @@ PirServer<DbDataType, CoeffType, MatCoeffType>::ProcessResponse(
     }
   }
 
-  ASSIGN_OR_RETURN(
-      auto fft_ctx,
-      FftContext::Create(absl::bit_width(static_cast<uint32_t>(d)) - 1));
+  FftContext* fft_ctx = fft_ctx_.get();
 
   std::vector<RlweCiphertext<CoeffType>> shard_responses;
   shard_responses.reserve(entry_size_multiple);
@@ -846,10 +842,10 @@ PirServer<DbDataType, CoeffType, MatCoeffType>::LoadFromBuffer(
 
   const int d = params.RlweParameters().Degree();
   ASSIGN_OR_RETURN(
-      Context ctx,
-      Context::Create(absl::bit_width(static_cast<uint32_t>(d)) - 1));
+      auto fft_ctx,
+      FftContext::Create(absl::bit_width(static_cast<uint32_t>(d)) - 1));
   ASSIGN_OR_RETURN(auto t_vec_h_ffts,
-                   PrecomputeTVecHFfts(params, preprocessed_outputs));
+                   PrecomputeTVecHFfts(params, preprocessed_outputs, *fft_ctx));
 
   std::vector<Polynomial<CoeffType>> a_mod_switched_t1;
   if (params.InterpolationDegree() == 1) {
@@ -868,7 +864,7 @@ PirServer<DbDataType, CoeffType, MatCoeffType>::LoadFromBuffer(
       params, std::move(combined_db_matrix), std::move(combined_pack_matrix),
       std::move(preprocessed_outputs), std::move(t_vec_h_ffts),
       std::move(a_mod_switched_t1), std::move(second_dim_query_a),
-      std::move(ctx)));
+      std::move(fft_ctx)));
 }
 
 template <typename DbDataType, typename CoeffType, typename MatCoeffType>

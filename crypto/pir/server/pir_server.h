@@ -87,7 +87,8 @@ class PirServer {
           preprocessed_outputs,
       std::vector<std::vector<ChunkedFft>> t_vec_h_ffts,
       std::vector<Polynomial<CoeffType>> a_mod_switched_t1,
-      std::vector<Polynomial<CoeffType>> second_dim_query_a, Context ctx)
+      std::vector<Polynomial<CoeffType>> second_dim_query_a,
+      std::unique_ptr<FftContext> fft_ctx)
       : params_(params),
         combined_db_matrix_(std::move(combined_db_matrix)),
         combined_pack_matrix_(std::move(combined_pack_matrix)),
@@ -95,7 +96,7 @@ class PirServer {
         t_vec_h_ffts_(std::move(t_vec_h_ffts)),
         a_mod_switched_t1_(std::move(a_mod_switched_t1)),
         second_dim_query_a_(std::move(second_dim_query_a)),
-        ctx_(std::move(ctx)),
+        fft_ctx_(std::move(fft_ctx)),
         db_mult_time_(absl::ZeroDuration()),
         packing_time_(absl::ZeroDuration()),
         poly_eval_time_(absl::ZeroDuration()) {}
@@ -108,7 +109,8 @@ class PirServer {
       const PirParams<CoeffType>& params,
       const std::vector<
           std::vector<PreprocessMatrixPackOutput<CoeffType, MatCoeffType>>>&
-          preprocessed_outputs);
+          preprocessed_outputs,
+      FftContext& fft_ctx);
 
   // Evaluates a polynomial where coefficients are given by `coeffs` using
   // Horner's method at the point x = `eval_point`.
@@ -126,7 +128,7 @@ class PirServer {
   const std::vector<std::vector<ChunkedFft>> t_vec_h_ffts_;
   const std::vector<Polynomial<CoeffType>> a_mod_switched_t1_;
   const std::vector<Polynomial<CoeffType>> second_dim_query_a_;
-  Context ctx_;
+  std::unique_ptr<FftContext> fft_ctx_;
 
   mutable absl::Duration pack_matrix_time_ = absl::ZeroDuration();
   mutable absl::Duration finalize_time_ = absl::ZeroDuration();

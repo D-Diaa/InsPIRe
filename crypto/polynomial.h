@@ -234,6 +234,7 @@ class Polynomial {
 
   // Accessor for coefficients.
   const std::vector<CoeffType>& Coeffs() const { return coeffs_; }
+  std::vector<CoeffType>& MutableCoeffs() { return coeffs_; }
 
   int Len() const { return coeffs_.size(); }
 

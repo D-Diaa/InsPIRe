@@ -69,6 +69,12 @@ struct FftContext {
   std::vector<std::complex<double>> twist;
   std::vector<std::complex<double>> untwist;
 
+  // Reusable scratch buffers for InnerProductFft to avoid per-call heap
+  // allocations.
+  std::vector<std::vector<std::complex<double>>> accum_scratch;
+  std::vector<std::vector<std::complex<double>>> u_ffts_scratch;
+  std::vector<std::vector<std::complex<double>>> v_ffts_scratch;
+
  private:
   FftContext() = default;
 };
@@ -79,6 +85,7 @@ struct FftContext {
 // products is transformed only once.
 struct ChunkedFft {
   int chunk_bits = 0;
+  int max_chunk_magnitude_bits = 0;
   // ffts[i][c] is the length-2d FFT of digit c of polynomial i, zero-padded.
   std::vector<std::vector<std::vector<std::complex<double>>>> ffts;
 };
