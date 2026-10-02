@@ -1,201 +1,69 @@
-# ReinsPIRe online-path improvements: I5, I3, I4
+# ReInsPIRe Improvements (Gen 1 & Gen 2)
 
-Three changes to the Tiptoe workload's online path (`crypto/pir/benchmarking/
-tiptoe_workload.cc`). None touches parameters, key material, the hint, the
-server file format or the wire format: every byte count is identical to the
-previous implementation, and each change is proven bit-identical to the code
-it replaces by a unit test against the old path on random and extreme inputs.
-All arithmetic stays in portable Highway / plain C++; no raw intrinsics.
+All online and offline optimizations across **Gen 1** (`I5, I3a, I3b, I4`) and **Gen 2** (`I1, I2, I3, I4`), classified into three tiers: **(1) Algorithmic & Transform-Domain**, **(2) Arithmetic Radix & Cache/SIMD Kernels**, and **(3) Wire Serialization & Plumbing**. None alters cryptographic parameters, noise margins, key material, or wire byte counts. Detailed benchmarks and 3-way comparisons are in [`results.md`](./results.md); the correctness, noise, and security audit is in [`audit.md`](./audit.md).
 
-| | where | before | after |
-|---|---|---|---|
-| I5 | server `pack_matrix` | emulated 64×64 `MulAdd` per lane, ~12 GB/s | 32×32 split kernel, ~25 GB/s (DRAM-bound) |
-| I3a | server `pack_finalize` | 8 forward + 3 inverse FFTs per `FinalizeMatrixPack` | forward FFTs precomputed (once per server / once per request), 3 inverse |
-| I3b | server `inner_product` | emulated 64×64 `MulAdd` per 16-bit field, ~8 GB/s | 32×32 split kernel + next-row-block prefetch, ~17 GB/s cold |
-| I4 | client encrypt / decrypt | NTT products per polynomial | exact chunked f64 negacyclic FFT against the cached FFT-domain secret key |
+## Summary by Class
 
-## Caveats at a glance
+| Class | ID | Target Phase | Change | Impact (`E072_M2048_P41_C4`) |
+|---|---|---|---|---|
+| **1. Algorithmic & Transform-Domain** | **Gen 1 `I3a`** | Server `pack_finalize` | Hoist query-independent `FFT(t_vec_h)` to offline setup and `FFT(y_vec_h)` to once per query ($8 \to 0$ forward FFTs per call) | `pack_finalize`: `109.0 → 54.1 ms` (**2.02×**) |
+| **1. Algorithmic & Transform-Domain** | **Gen 2 `I2a/b`** | Server `pack_finalize` & offline | Conjugate-symmetric `TwoDigitsFft` ($d_0 + i d_1$) + paired real IFFT ($11 \to 2$ transforms per packed RLWE) | `pack_finalize`: `54.1 → 23.5 ms` (**4.63×** vs Gen 0) |
+| **1. Algorithmic & Transform-Domain** | **Gen 1 `I4` + Gen 2 `I1b`** | Client `keygen/selector/decrypt`, Server `modswitch` | Cache secret key in twisted `f64` negacyclic FFT domain (`MultFft`) + pre-modswitch CRS mask `a_resp` to $q_1=2^{29}$ offline | Client crypto: `370.9 → 22.5 ms` (**16.5×**); `decrypt`: `261.6 → 6.2 ms` (**42.3×**) |
+| **2. Arithmetic Radix & Cache/SIMD Kernels** | **Gen 1 `I5` + Gen 2 `I4a/b`** | Server `pack_matrix` (`CondensedMultiply<int32_t>`) | $\mathbb{Z}_{2^{64}}$ $2^{32}$-radix split ($y = y_{\text{lo}} + 2^{32}y_{\text{hi}}$) + interleaved `y_packed` + 6-row register blocking (12 YMM accumulators) | `pack_matrix`: `445.9 → 224.3 → 176.7 ms` (**2.52×**, ~25 GB/s DRAM ceiling) |
+| **2. Arithmetic Radix & Cache/SIMD Kernels** | **Gen 1 `I3b` + Gen 2 `I3`** | Server `inner_product` (`CondensedMultiply<uint16_t>`) | Unsigned $2^{32}$-radix split + 4-plane `+64B` cache-set-skewed `y_split` + 6-row blocking + next-block prefetch | `inner_product`: `173.7 → 92.7 → 85.9 ms` (**2.02×**) |
+| **2. Arithmetic Radix & Cache/SIMD Kernels** | **Gen 2 `I2c`** | Server/Client FFT (`crypto/fft.h`) | AVX2+FMA stage-twiddle butterfly kernel (2 complex butterflies per `__m256d` FMA, radix-2/4 first stages) | Contributes to `pack_finalize` (**4.63×**) and `2.3×` offline speedup |
+| **3. Wire Serialization & Plumbing** | **Gen 2 `I1a/c`, `I2d`, `I4c`** | Bit-packing, `Rescale`, `FftContext`, offline `Transpose` | 128-bit word-stream bit-packer/unpacker; divisionless shift `Rescale`; persistent `fft_ctx_`; direct `CreateCondensed<int32_t>` | Wire pack/unpack: `43.0 → 3.6 ms` (**12.1×**); Offline setup: `117.7 → 51.8 s` (**2.27×**) |
 
-- **Server memory (I3a).** +512 KiB of precomputed FFTs per partition
-  (2 MiB at P=4, 41 MiB at P=82). The harness's peak RSS can grow by much
-  more (+36…+250 MB in the table below): glibc keeps the preprocessing
-  threads' arenas from being trimmed once the long-lived FFT buffers land in
-  them. This is allocator retention, not live data; it disappears with
-  tcmalloc/jemalloc. No allocator workaround was added.
-- **Per-client setup (I4).** `FftContext::Create` costs ≈0.4 ms and ~100 KiB
-  per `PirClient`; the harness builds one client per query, so this is
-  inside `keygen`. `PirClient` methods must not be called concurrently on one
-  instance (already the case before because of the owned PRNGs).
-- **Exactness budget (I4).** `kFftExactProductBits = 44` is a conservative
-  analytic bound. It is free at d=2048 with a ternary key (32-bit chunks); at
-  much larger d or wider keys it forces more chunks, and `MultFft` refuses
-  (`InvalidArgument`) if no exact chunking exists rather than silently
-  rounding.
-- **Host-tuned prefetch (I3b).** The next-row-block prefetch distance was
-  chosen by measurement on an AMD EPYC 7B13 (built `-march=znver2`); another
-  microarchitecture may prefer a different distance. Correctness does not
-  depend on it.
-- **I5 has no tradeoff**, but its kernel is now at the single-core DRAM
-  ceiling; further `pack_matrix` gains need multiple threads or a smaller
-  packing matrix.
-- **Everything else is unchanged:** parameters, noise, hint, server file
-  format, wire format (bytes identical on all nine workloads), and the RGSW
-  path.
+---
 
-## I5 — packing-matrix kernel (`crypto/matrix.cc`, `CondensedMultiply<int32_t>`)
+## Class 1: Algorithmic & Transform-Domain Improvements
 
-The online packing step is `combined_pack_matrix_ · y_vec_g`: an int32 matrix
-of `C·t·d` rows × `k_gadget·d` columns (8192 × 4096 = 128 MiB at C=4, d=2048,
-once per partition) times a uint64 vector, modulo 2⁶⁴. AVX2 has no 64-bit
-multiply, so the previous Highway `MulAdd` on emulated u64 lanes was
-instruction-bound at ~12 GB/s.
+1. **Hoisted LWE-to-RLWE Packing Transforms (`Gen 1 I3a` — `crypto/lwes_to_rlwe.cc`, `crypto/pir/server/pir_server.cc`)**:
+   - `FinalizeMatrixPack` computes $\langle \mathbf{t}_{\text{vec}, h}, \mathbf{y}_{\text{vec}, h} \rangle$ via a chunked negacyclic FFT inner product. Because $\mathbf{t}_{\text{vec}, h}$ depends only on the database/CRS and $\mathbf{y}_{\text{vec}, h}$ is shared across all partitions and columns of a request, precomputing `FFT(t_vec_h)` offline (`PrecomputeTVecHFfts`) and `FFT(y_vec_h)` once per request eliminates all 8 per-call forward FFTs.
+2. **Hermitian-Folded `TwoDigitsFft` & Paired Real IFFT (`Gen 2 I2a/b` — `crypto/polynomial_fft.cc`)**:
+   - Packs pairs of real digit chunks into one complex vector $Z[k] = d_0[k] + i d_1[k]$, runs a single twisted forward FFT, and separates $\text{FFT}(d_0), \text{FFT}(d_1)$ in $\mathcal{O}(d)$ via conjugate symmetry $\overline{Z[d - 1 - k]}$, halving forward FFTs in `ToChunkedFft` and offline preprocessing.
+   - Dually, packs pairs of real output accumulators as $A[k] + i B[k]$ to recover both polynomials from a single inverse FFT (`2` IFFTs instead of `3` per packed ciphertext). Combined with `I3a`, reduces per-call transforms in `FinalizeMatrixPack` from **11 FFTs to 2 IFFTs**.
+3. **Twisted-FFT Secret Key Cache & Pre-Modswitched CRS Mask (`Gen 1 I4` + `Gen 2 I1b` — `crypto/polynomial_fft.cc`, `crypto/encryption.cc`)**:
+   - Caches the ternary secret key $\mathbf{s} \in \{-1, 0, 1\}^d$ once in a twisted $d$-point `f64` negacyclic FFT domain (`FftPolynomial`). Because $u + v + \log_2 d \le 44$ bits (`kFftExactProductBits`) guarantees exact integer recovery after `nearbyint`, the 29-bit modulus-switched response decrypts in a **single unchunked `f64` transform** (replacing 52-bit NTT multiplications).
+   - Pre-rescaling the deterministic CRS mask $\mathbf{a}_{\text{resp}}$ from $q=2^{52}$ to $q_1=2^{29}$ once at setup (`a_mod_switched_t1_`) eliminates online mask rescaling during both server `ModSwitch` and client `Decrypt`.
 
-**Idea.** Split the vector once per call, `y = y_lo + 2³²·y_hi` with
-`y_lo = int32(y mod 2³²)` (sign-extended by the multiply) and
-`y_hi = (y >> 32) + bit31(y)` (the +1 cancels that sign extension). Then,
-modulo 2⁶⁴,
+---
 
-```
-m·y = m·y_lo + 2³²·(m·y_hi mod 2³²)
-```
+## Class 2: Arithmetic Radix & Cache/SIMD Kernel Optimizations
 
-so each product is one signed 32×32→64 `MulEven` plus one 32×32→32 `Mul`
-whose result is shifted into the top word. A condensed lane holds
-`(m[2j], m[2j+1])` as its low/high halves, which `MulEven` reads directly and
-after a 32-bit shift. Rows are processed four at a time so the split vector is
-loaded once per block.
+1. **$\mathbb{Z}_{2^{64}}$ $2^{32}$-Radix Split & 6-Row Blocked Packing Matrix (`Gen 1 I5` + `Gen 2 I4a/b` — `crypto/matrix.cc`)**:
+   - Splits the 64-bit vector once per call as $y = y_{\text{lo}} + 2^{32} y_{\text{hi}} \pmod{2^{64}}$ with $y_{\text{lo}} = \text{int32}(y \bmod 2^{32})$ and $y_{\text{hi}} = (y \gg 32) + \text{bit}_{31}(y)$ (canceling sign extension), replacing emulated 64-bit SIMD multiplies with native 32-bit `MulEven` ($32\times 32\to 64$) + `Mul` ($32\times 32\to 32$).
+   - Gen 2 `I4` interleaves `(y_lo, y_hi)` into a single `y_packed` stream and unrolls **6 matrix rows** per loop (12 YMM accumulators in 16 YMM registers), cutting vector L1 load traffic by `33%` and streaming the 128 MiB packing matrix at the single-core DRAM ceiling (~25 GB/s).
+2. **4-Plane Set-Skewed `y_split` & 6-Row Blocked DB Kernel (`Gen 1 I3b` + `Gen 2 I3` — `crypto/matrix.cc`)**:
+   - Applies the unsigned $2^{32}$-radix split to 16-bit database entries (`4` `uint16_t`s per 64-bit lane), using next-row-block software prefetching (`hwy::Prefetch`) to hide row-boundary hardware prefetcher resets.
+   - Gen 2 `I3` compresses the 6-plane `y_split` into 4 planes padded by `+64 B` (`kPlaneSkewU32 = 16`) between planes to eliminate 8-way L1D cache set-associative conflicts at $16\text{ KiB}$ ($M=2048$) strides, and unrolls 6 rows at a time.
+3. **AVX2+FMA Stage-Twiddle Butterfly Kernel (`Gen 2 I2c` — `crypto/fft.h`)**:
+   - Precomputes contiguous per-stage twiddle tables and executes 2 complex butterflies per 256-bit `__m256d` FMA with dedicated twiddle-free radix-2/radix-4 initial stages.
 
-**Result.** The kernel streams the matrix at ~25 GB/s (single-core DRAM
-ceiling on this host); `pack_matrix` is ≈2× faster on every shape. No
-tradeoff: same memory, same layout, same API.
+---
 
-## I3 — packing finalize and database kernel (server)
+## Class 3: Wire Serialization & Prototype Plumbing
 
-### I3a — precomputed FFTs (`crypto/lwes_to_rlwe.cc`, `crypto/polynomial_fft.cc`, `crypto/pir/server/pir_server.cc`)
+1. **128-Bit Word-Stream Bit-Packing (`Gen 2 I1a` — `crypto/polynomial.cc`)**: Replaces bit-by-bit loops in `ToProto`/`CreateFromProto` with a `uint128_t` word accumulator flushing/reading 64-bit words (`12–20×` faster pack/unpack).
+2. **Divisionless Power-of-Two `Rescale` & `Decrypt` (`Gen 2 I1c` — `crypto/polynomial.cc`, `crypto/encryption.cc`)**: Replaces 128-bit software divisions (`__udivti3`) by powers of two ($q=2^{52}, q_1=2^{29}, q_2=2^{18}, p=2^{16}$) with `(x + round_offset) >> shift`.
+3. **Persistent Server `FftContext` & In-Place Offline NTT (`Gen 2 I2d` — `crypto/pir/server/pir_server.cc`)**: Reuses a per-server `fft_ctx_` workspace instead of allocating `320 KiB` per `FinalizeMatrixPack` call, and reuses a 4-polynomial buffer in offline InspiRING NTT evaluation.
+4. **Direct `CreateCondensed<int32_t>` (`Gen 2 I4c` — `crypto/pir/server/pir_server.cc`)**: Constructs `combined_pack_matrix_` directly from column-major `pack_matrices` without an intermediate `Matrix::Transpose()` allocation.
 
-`FinalizeMatrixPack` ends with `InnerProduct(t_vec_h, y_vec_h)`, a chunked
-double-FFT negacyclic product. The forward transforms are redundant:
-`t_vec_h` depends only on the preprocessed data and `y_vec_h` is part of the
-packing key, identical for every (shard, chunk) of one request.
-`Polynomial::ToChunkedFft` produces the digit FFTs exactly as the streaming
-`InnerProductFft` did (shared helpers, same digit split, same accumulation
-order, same inverse transforms), so the result is bit-identical. The server
-transforms every `t_vec_h` once at construction (`PrecomputeTVecHFfts`, used
-by both `Create` and `LoadFromBuffer`) and `y_vec_h` once per request. Per
-`FinalizeMatrixPack` call this leaves the 3 inverse FFTs; `pack_finalize` is
-halved on every shape.
+---
 
-**Tradeoff — memory.** The server keeps `num_digits · 2d` complex doubles per
-(shard, chunk): 128 KiB at d=2048, 512 KiB per partition at C·t=4, i.e.
-2 MiB for P=4, 20.5 MiB for P=41, 41 MiB for P=82 (measured as live heap).
-Peak RSS of the harness can grow by more than that (up to a few hundred MB
-on some shapes): the long-lived FFT buffers are allocated in the
-preprocessing threads' glibc arenas after large transient allocations, which
-prevents those arenas from being trimmed. This is allocator retention, not
-live data; it does not occur with a non-arena allocator (tcmalloc/jemalloc)
-and no allocator hacks were added to the library.
+## Quantitative Contribution by Class (`E072_M2048_P41_C4`: `1,149.8 ms → 314.0 ms`, `3.66×`)
 
-### I3b — database kernel (`crypto/matrix.cc`, `CondensedMultiply<uint16_t>`)
+| Class | Latency Saved (`E072`) | Share of Total Latency Saved | Primary Effect |
+|---|---:|---:|---|
+| **Class 1: Algorithmic & Transform-Domain** | `-433.9 ms` | **51.9%** | `16.5×` client crypto speedup; `4.6×` server `pack_finalize` speedup |
+| **Class 2: Arithmetic Radix & Cache/SIMD Kernels** | `-357.0 ms` | **42.7%** | `2.52×` `pack_matrix` speedup; `2.02×` `inner_product` speedup |
+| **Class 3: Wire Serialization & Plumbing** | `-44.9 ms` | **5.4%** | `12.1×` wire pack/unpack speedup; `2.27×` offline setup speedup |
 
-Same split as I5, unsigned: for `m < 2¹⁶`, `m·y = m·y_lo + 2³²·(m·y_hi mod
-2³²)`. A condensed lane holds four 16-bit fields; viewed as uint32 lanes,
-`m & 0xFFFF` gives fields (0, 2) and `m >> 16` fields (1, 3), so one `Mul`
-against the matching `y_hi` pair covers two fields and `MulEven` consumes
-fields 0/1 directly and 2/3 after a 32-bit shift — six multiplies per
-32-byte lane group instead of four emulated 64-bit products. The split vector
-is laid out as six planes so the inner loop is loads, multiplies and adds;
-rows go four at a time.
+---
 
-**Caveat — prefetch.** The condensed rows are short (2 KiB at M=1024) and the
-DB matrix is cold after the 128 MiB packing matrix streamed through, so the
-hardware prefetcher restarts on every row; each row load is paired with a
-`hwy::Prefetch` of the same offset in the next row block (cold 12.6 → 17.4
-GB/s in isolation). The distance (one row block) was chosen by measurement on
-this host; other microarchitectures may prefer a different one.
+## Assumptions, Caveats & Tradeoffs
 
-## I4 — client arithmetic (`crypto/polynomial_fft.cc`, `crypto/encryption.cc`, `crypto/pir/client/pir_client.cc`)
-
-The client's RLWE encryptions (selector, packing/automorphism keys) and the
-response decryption each multiply a polynomial by the ternary secret key. The
-secret key is now cached once in a twisted d-point negacyclic f64 FFT domain
-(`FftPolynomial`), and `Polynomial::MultFft(const FftPolynomial&, …)`
-computes the exact product modulo 2^(8·sizeof(CoeffType)) by splitting the
-other operand into chunks and rounding each chunk product.
-
-**Exactness.** With chunk magnitudes ≤ 2ᵘ and 2ᵛ every coefficient of a chunk
-product is an integer bounded by 2^(u+v+log₂d); the f64 round trip perturbs
-it by at most c·2⁻⁵³ times that bound with c < 2⁸ (Percival's bound for a
-radix-2 FFT convolution, ≈170 at d=2¹¹). Rounding therefore recovers the exact
-integer whenever `u + v + log₂d ≤ 53 − 8 − 1 = kFftExactProductBits (44)`;
-`MultFft` derives the chunk width from this and returns `InvalidArgument` if
-no exact chunking exists. At d=2048 with a ternary key this gives 32-bit
-chunks: two transforms for a 52-bit operand, one for the 29-bit
-modulus-switched ciphertext. Encryption samples are bit-identical to the NTT
-path for the same PRNG stream and decryption is bit-identical on random and
-extreme inputs (tests in `polynomial_test.cc`, `encryption_test.cc`); the
-unchanged upload bytes and server behaviour confirm it end to end. The RGSW
-encryption path (not per query) stays on the NTT.
-
-**Tradeoffs.**
-
-- `FftContext::Create` costs ≈0.4 ms and ~100 KiB of tables per client; the
-  harness builds a client per query, so this shows up inside `keygen`.
-- `PirClient` methods are not concurrently callable on one instance (the
-  context's scratch buffers are shared) — already the case because of the
-  owned PRNGs.
-- The 44-bit budget is the conservative analytic bound; it costs nothing at
-  d=2048, but at much larger d or wider keys it would force more chunks.
-
-## Measurements
-
-One pinned core of an AMD EPYC 7B13 (online phase on CPU 13, offline
-preprocessing on 8 other cores), `-c opt -march=znver2`, medians over 6 (dev)
-or 4 (E0xx) queries after one warm-up. "Upstream" is the `tiptoe` branch
-(unmodified ReinsPIRe + harness). Full JSON in the benchmark logs.
-
-### Headline (medians, ms; upstream → final, speedup)
-
-| workload | server | client (query+decode) | roundtrip | offline s | up/down bytes | correct |
-|---|---|---|---|---|---|---|
-| dev_M1024_P4_C4 | 65.6 → 36.2 (1.81×) | 47.1 → 7.2 (6.56×) | 113.0 → 43.4 (2.60×) | 19.8 → 11.9 | 79896/192608 = | ✓ 6/6 |
-| dev_M2048_P4_C4 | 75.4 → 40.1 (1.88×) | 48.4 → 7.2 (6.70×) | 123.9 → 47.3 (2.62×) | 12.7 → 12.2 | 106520/192608 = | ✓ 6/6 |
-| dev_M2048_P4_C2 | 37.9 → 22.0 (1.72×) | 34.2 → 5.6 (6.05×) | 72.2 → 27.7 (2.61×) | 6.4 → 6.2 | 106520/96304 = | ✓ 6/6 |
-| dev_M512_P4_C8 | 120.4 → 64.5 (1.87×) | 73.6 → 10.1 (7.30×) | 193.8 → 74.5 (2.60×) | 24.1 → 23.4 | 66584/385216 = | ✓ 6/6 |
-| dev_M2048_P16_C4 | 294.5 → 165.5 (1.78×) | 159.7 → 22.4 (7.14×) | 455.5 → 187.9 (2.42×) | 42.8 → 41.2 | 266300/770432 = | ✓ 6/6 |
-| E035_M2048_P20_C4 | 366.9 → 207.7 (1.77×) | 195.3 → 27.3 (7.16×) | 562.6 → 235.0 (2.39×) | 54.6 → 52.9 | 319560/963040 = | ✓ 4/4 |
-| E072_M2048_P41_C4 | 761.8 → 403.6 (1.89×) | 383.9 → 54.0 (7.11×) | 1143.4 → 457.7 (2.50×) | 118.0 → 113.3 | 599175/1974232 = | ✓ 4/4 |
-| E071_M2048_P41_C2 | 383.3 → 225.8 (1.70×) | 257.9 → 37.8 (6.82×) | 640.9 → 263.8 (2.43×) | 59.2 → 57.6 | 599175/987116 = | ✓ 4/4 |
-| E069_M1024_P82_C4 | 1376.2 → 755.6 (1.82×) | 778.1 → 101.8 (7.64×) | 2156.8 → 857.7 (2.51×) | 223.0 → 213.1 | 599298/3948464 = | ✓ 4/4 |
-
-### Phase breakdown (medians, ms; upstream → final)
-
-| workload | server | inner_product | pack_matrix | pack_finalize | client_query | keygen | selector | client_decode | decrypt | roundtrip |
-|---|---|---|---|---|---|---|---|---|---|---|
-| dev_M1024_P4_C4 | 65.6 → 36.2 | 8.4 → 5.9 | 43.8 → 22.3 | 10.7 → 5.3 | 20.3 → 4.1 | 10.3 → 1.9 | 9.5 → 1.7 | 26.8 → 3.1 | 24.8 → 1.1 | 113.0 → 43.4 |
-| dev_M2048_P4_C4 | 75.4 → 40.1 | 17.8 → 9.5 | 43.9 → 22.2 | 10.7 → 5.3 | 20.6 → 4.1 | 10.3 → 1.8 | 9.6 → 1.6 | 27.8 → 3.1 | 25.8 → 1.1 | 123.9 → 47.3 |
-| dev_M2048_P4_C2 | 37.9 → 22.0 | 8.4 → 5.3 | 21.9 → 11.1 | 5.5 → 3.3 | 20.5 → 4.1 | 10.3 → 1.8 | 9.6 → 1.6 | 13.6 → 1.6 | 12.6 → 0.5 | 72.2 → 27.7 |
-| dev_M512_P4_C8 | 120.4 → 64.5 | 8.6 → 7.2 | 86.9 → 43.8 | 21.3 → 9.5 | 20.2 → 3.9 | 10.3 → 1.8 | 9.5 → 1.6 | 53.4 → 6.2 | 49.3 → 2.1 | 193.8 → 74.5 |
-| dev_M2048_P16_C4 | 294.5 → 165.5 | 67.9 → 44.5 | 174.5 → 88.7 | 42.4 → 21.5 | 50.3 → 10.0 | 10.3 → 1.9 | 38.4 → 6.5 | 109.4 → 12.4 | 101.1 → 4.3 | 455.5 → 187.9 |
-| E035_M2048_P20_C4 | 366.9 → 207.7 | 84.0 → 55.2 | 217.6 → 112.2 | 53.1 → 26.9 | 59.7 → 11.9 | 10.2 → 1.8 | 47.4 → 8.1 | 135.6 → 15.4 | 125.6 → 5.3 | 562.6 → 235.0 |
-| E072_M2048_P41_C4 | 761.8 → 403.6 | 175.0 → 93.9 | 451.3 → 228.0 | 109.6 → 54.5 | 111.3 → 22.2 | 10.3 → 1.9 | 97.5 → 16.8 | 272.6 → 31.8 | 251.8 → 11.1 | 1143.4 → 457.7 |
-| E071_M2048_P41_C2 | 383.3 → 225.8 | 86.8 → 58.3 | 225.3 → 114.3 | 54.4 → 33.7 | 112.0 → 22.1 | 10.3 → 1.9 | 98.1 → 16.7 | 145.9 → 15.7 | 135.5 → 5.4 | 640.9 → 263.8 |
-| E069_M1024_P82_C4 | 1376.2 → 755.6 | 171.4 → 109.0 | 946.0 → 487.4 | 216.9 → 110.8 | 209.6 → 38.8 | 10.4 → 1.9 | 195.7 → 33.3 | 568.5 → 63.0 | 527.0 → 21.7 | 2156.8 → 857.7 |
-
-### Peak RSS (MiB, harness process including offline preprocessing; upstream → final; see the I3a memory note)
-
-| workload | max_rss |
-|---|---|
-| dev_M1024_P4_C4 | 2006 → 2196 |
-| dev_M2048_P4_C4 | 2397 → 2433 |
-| dev_M2048_P4_C2 | 1600 → 1725 |
-| dev_M512_P4_C8 | 3191 → 3273 |
-| dev_M2048_P16_C4 | 6122 → 6102 |
-| E035_M2048_P20_C4 | 6798 → 6883 |
-| E072_M2048_P41_C4 | 10436 → 10636 |
-| E071_M2048_P41_C2 | 6216 → 6422 |
-| E069_M1024_P82_C4 | 15480 → 15728 |
-
-Remaining online time after these changes: server — `pack_matrix` (DRAM-bound
-at ~25 GB/s single-core; the next step would be multi-threading or a smaller
-packing matrix), `inner_product`, `pack_finalize` inverse FFTs; client — PRNG
-/ error sampling and harness bit (un)packing.
+- **Precomputed FFT & mask memory (`Gen 1 I3a`, `Gen 2 I1b`)**: `PrecomputeTVecHFfts` adds `512 KiB` per partition (`21 MiB` at `P=41`) and `a_mod_switched_t1_` adds `64 KiB` per partition (`2.6 MiB` at `P=41`). Note: Under glibc's default arena allocator, long-lived allocations after multi-threaded preprocessing can retain freed thread arenas in RSS; `tcmalloc`/`jemalloc` avoids this.
+- **Exactness budget (`Gen 1 I4`, `Gen 2 I2b`)**: `kFftExactProductBits = 44` is a conservative analytic bound ($53 - 8 - 1$) that holds with zero extra chunking at $d=2048$; `allow_paired_ifft` is guarded by $\log_2(N_{\text{polys}}) + \log_2 d + u_{\text{mag}} + v_{\text{mag}} \le 50.0$ (RMS error $\sim 0.0055 \ll 0.5$).
+- **Single-threaded execution per `PirServer` / `PirClient` instance (`Gen 1 I4`, `Gen 2 I2d`)**: Scratch buffers in `fft_ctx_` are reused across calls on the same instance; concurrent queries sharing a single `PirServer` shard should mark `fft_ctx_` `thread_local`.
+- **Hardware generalization**: All matrix kernels (`I5, I3b, I3, I4`) use portable Google Highway SIMD (compiling natively to x86 AVX2/AVX-512 and ARM64 NEON/SVE). `I2c` uses `#if defined(__AVX2__) && defined(__FMA__)` with a clean portable scalar `#else` fallback.

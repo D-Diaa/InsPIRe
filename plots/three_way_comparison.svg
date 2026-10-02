@@ -1,0 +1,144 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1060 560" width="100%" height="100%" font-family="system-ui, -apple-system, sans-serif">
+<rect width="100%" height="100%" fill="#ffffff"/>
+<text x="530" y="30" text-anchor="middle" font-size="17" font-weight="700" fill="#111827">Large Operating Points: Protocol Roundtrip Latency (ms, Median of 40 Runs, Log Scale)</text>
+<text x="530" y="50" text-anchor="middle" font-size="12" fill="#4b5563">Pinned Single Core (CPU 32, 3 Warmups + 20 Repeats × 2 Queries) — Lower is Better</text>
+<rect x="65" y="66" width="12" height="12" rx="2" fill="#93c5fd"/>
+<text x="81" y="76" font-size="11" fill="#1f2937">ReInsPIRe main (Gen 0)</text>
+<rect x="225" y="66" width="12" height="12" rx="2" fill="#3b82f6"/>
+<text x="241" y="76" font-size="11" fill="#1f2937">ReInsPIRe codex (Gen 1)</text>
+<rect x="385" y="66" width="12" height="12" rx="2" fill="#1d4ed8"/>
+<text x="401" y="76" font-size="11" fill="#1f2937">ReInsPIRe combined (Gen 2)</text>
+<rect x="545" y="66" width="12" height="12" rx="2" fill="#fca5a5"/>
+<text x="561" y="76" font-size="11" fill="#1f2937">RLWEPIR orig (Gen 0)</text>
+<rect x="705" y="66" width="12" height="12" rx="2" fill="#ef4444"/>
+<text x="721" y="76" font-size="11" fill="#1f2937">RLWEPIR codex (Gen 1)</text>
+<rect x="865" y="66" width="12" height="12" rx="2" fill="#b91c1c"/>
+<text x="881" y="76" font-size="11" fill="#1f2937">RLWEPIR combined (Gen 2)</text>
+<line x1="75" y1="480.0" x2="1025" y2="480.0" stroke="#e5e7eb" stroke-dasharray="3,3"/>
+<text x="67" y="484.0" text-anchor="end" font-size="11" fill="#6b7280">100 ms</text>
+<line x1="75" y1="425.0" x2="1025" y2="425.0" stroke="#e5e7eb" stroke-dasharray="3,3"/>
+<text x="67" y="429.0" text-anchor="end" font-size="11" fill="#6b7280">200 ms</text>
+<line x1="75" y1="352.3" x2="1025" y2="352.3" stroke="#e5e7eb" stroke-dasharray="3,3"/>
+<text x="67" y="356.3" text-anchor="end" font-size="11" fill="#6b7280">500 ms</text>
+<line x1="75" y1="297.2" x2="1025" y2="297.2" stroke="#e5e7eb" stroke-dasharray="3,3"/>
+<text x="67" y="301.2" text-anchor="end" font-size="11" fill="#6b7280">1000 ms</text>
+<line x1="75" y1="242.2" x2="1025" y2="242.2" stroke="#e5e7eb" stroke-dasharray="3,3"/>
+<text x="67" y="246.2" text-anchor="end" font-size="11" fill="#6b7280">2000 ms</text>
+<line x1="75" y1="169.5" x2="1025" y2="169.5" stroke="#e5e7eb" stroke-dasharray="3,3"/>
+<text x="67" y="173.5" text-anchor="end" font-size="11" fill="#6b7280">5000 ms</text>
+<line x1="75" y1="114.5" x2="1025" y2="114.5" stroke="#e5e7eb" stroke-dasharray="3,3"/>
+<text x="67" y="118.5" text-anchor="end" font-size="11" fill="#6b7280">10000 ms</text>
+<line x1="75" y1="480" x2="1025" y2="480" stroke="#374151" stroke-width="1.5"/>
+<rect x="89.0" y="343.3" width="15" height="136.7" fill="#93c5fd" rx="1.5"/>
+<text x="96.5" y="339.3" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 96.5 339.3)">560</text>
+<rect x="105.5" y="413.1" width="15" height="66.9" fill="#3b82f6" rx="1.5"/>
+<text x="113.0" y="409.1" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 113.0 409.1)">232</text>
+<rect x="122.0" y="442.1" width="15" height="37.9" fill="#1d4ed8" rx="1.5"/>
+<text x="129.5" y="438.1" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 129.5 438.1)">161</text>
+<rect x="138.5" y="176.4" width="15" height="303.6" fill="#fca5a5" rx="1.5"/>
+<text x="146.0" y="172.4" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 146.0 172.4)">4580</text>
+<rect x="155.0" y="350.6" width="15" height="129.4" fill="#ef4444" rx="1.5"/>
+<text x="162.5" y="346.6" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 162.5 346.6)">511</text>
+<rect x="171.5" y="393.5" width="15" height="86.5" fill="#b91c1c" rx="1.5"/>
+<text x="179.0" y="389.5" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 179.0 389.5)">297</text>
+<text x="137.0" y="500" text-anchor="middle" font-size="11" font-weight="600" fill="#111827">E035</text>
+<text x="137.0" y="515" text-anchor="middle" font-size="10" fill="#4b5563">(M2048 P20 C4)</text>
+<rect x="207.8" y="295.5" width="15" height="184.5" fill="#93c5fd" rx="1.5"/>
+<text x="215.2" y="291.5" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 215.2 291.5)">1022</text>
+<rect x="224.2" y="370.2" width="15" height="109.8" fill="#3b82f6" rx="1.5"/>
+<text x="231.8" y="366.2" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 231.8 366.2)">399</text>
+<rect x="240.8" y="401.6" width="15" height="78.4" fill="#1d4ed8" rx="1.5"/>
+<text x="248.2" y="397.6" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 248.2 397.6)">269</text>
+<rect x="257.2" y="178.4" width="15" height="301.6" fill="#fca5a5" rx="1.5"/>
+<text x="264.8" y="174.4" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 264.8 174.4)">4468</text>
+<rect x="273.8" y="334.8" width="15" height="145.2" fill="#ef4444" rx="1.5"/>
+<text x="281.2" y="330.8" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 281.2 330.8)">623</text>
+<rect x="290.2" y="370.2" width="15" height="109.8" fill="#b91c1c" rx="1.5"/>
+<text x="297.8" y="366.2" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 297.8 366.2)">399</text>
+<text x="255.8" y="500" text-anchor="middle" font-size="11" font-weight="600" fill="#111827">E032</text>
+<text x="255.8" y="515" text-anchor="middle" font-size="10" fill="#4b5563">(M1024 P40 C4)</text>
+<rect x="326.5" y="333.9" width="15" height="146.1" fill="#93c5fd" rx="1.5"/>
+<text x="334.0" y="329.9" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 334.0 329.9)">630</text>
+<rect x="343.0" y="403.9" width="15" height="76.1" fill="#3b82f6" rx="1.5"/>
+<text x="350.5" y="399.9" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 350.5 399.9)">261</text>
+<rect x="359.5" y="437.1" width="15" height="42.9" fill="#1d4ed8" rx="1.5"/>
+<text x="367.0" y="433.1" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 367.0 433.1)">172</text>
+<rect x="376.0" y="127.6" width="15" height="352.4" fill="#fca5a5" rx="1.5"/>
+<text x="383.5" y="123.6" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 383.5 123.6)">8470</text>
+<rect x="392.5" y="334.0" width="15" height="146.0" fill="#ef4444" rx="1.5"/>
+<text x="400.0" y="330.0" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 400.0 330.0)">629</text>
+<rect x="409.0" y="369.2" width="15" height="110.8" fill="#b91c1c" rx="1.5"/>
+<text x="416.5" y="365.2" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 416.5 365.2)">404</text>
+<text x="374.5" y="500" text-anchor="middle" font-size="11" font-weight="600" fill="#111827">E071</text>
+<text x="374.5" y="515" text-anchor="middle" font-size="10" fill="#4b5563">(M2048 P41 C2)</text>
+<rect x="445.2" y="286.2" width="15" height="193.8" fill="#93c5fd" rx="1.5"/>
+<text x="452.8" y="282.2" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 452.8 282.2)">1150</text>
+<rect x="461.8" y="360.4" width="15" height="119.6" fill="#3b82f6" rx="1.5"/>
+<text x="469.2" y="356.4" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 469.2 356.4)">451</text>
+<rect x="478.2" y="389.2" width="15" height="90.8" fill="#1d4ed8" rx="1.5"/>
+<text x="485.8" y="385.2" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 485.8 385.2)">314</text>
+<rect x="494.8" y="120.5" width="15" height="359.5" fill="#fca5a5" rx="1.5"/>
+<text x="502.2" y="116.5" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 502.2 116.5)">9272</text>
+<rect x="511.2" y="289.8" width="15" height="190.2" fill="#ef4444" rx="1.5"/>
+<text x="518.8" y="285.8" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 518.8 285.8)">1098</text>
+<rect x="527.8" y="336.6" width="15" height="143.4" fill="#b91c1c" rx="1.5"/>
+<text x="535.2" y="332.6" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 535.2 332.6)">609</text>
+<text x="493.2" y="500" text-anchor="middle" font-size="11" font-weight="600" fill="#111827">E072</text>
+<text x="493.2" y="515" text-anchor="middle" font-size="10" fill="#4b5563">(M2048 P41 C4)</text>
+<rect x="564.0" y="237.6" width="15" height="242.4" fill="#93c5fd" rx="1.5"/>
+<text x="571.5" y="233.6" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 571.5 233.6)">2120</text>
+<rect x="580.5" y="310.9" width="15" height="169.1" fill="#3b82f6" rx="1.5"/>
+<text x="588.0" y="306.9" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 588.0 306.9)">841</text>
+<rect x="597.0" y="339.9" width="15" height="140.1" fill="#1d4ed8" rx="1.5"/>
+<text x="604.5" y="335.9" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 604.5 335.9)">585</text>
+<rect x="613.5" y="119.7" width="15" height="360.3" fill="#fca5a5" rx="1.5"/>
+<text x="621.0" y="115.7" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 621.0 115.7)">9360</text>
+<rect x="630.0" y="278.1" width="15" height="201.9" fill="#ef4444" rx="1.5"/>
+<text x="637.5" y="274.1" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 637.5 274.1)">1273</text>
+<rect x="646.5" y="313.4" width="15" height="166.6" fill="#b91c1c" rx="1.5"/>
+<text x="654.0" y="309.4" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 654.0 309.4)">815</text>
+<text x="612.0" y="500" text-anchor="middle" font-size="11" font-weight="600" fill="#111827">E069</text>
+<text x="612.0" y="515" text-anchor="middle" font-size="10" fill="#4b5563">(M1024 P82 C4)</text>
+<rect x="682.8" y="192.0" width="15" height="288.0" fill="#93c5fd" rx="1.5"/>
+<text x="690.2" y="188.0" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 690.2 188.0)">3766</text>
+<rect x="699.2" y="265.7" width="15" height="214.3" fill="#3b82f6" rx="1.5"/>
+<text x="706.8" y="261.7" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 706.8 261.7)">1488</text>
+<rect x="715.8" y="293.9" width="15" height="186.1" fill="#1d4ed8" rx="1.5"/>
+<text x="723.2" y="289.9" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 723.2 289.9)">1043</text>
+<rect x="732.2" y="165.2" width="15" height="314.8" fill="#fca5a5" rx="1.5"/>
+<text x="739.8" y="161.2" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 739.8 161.2)">5276</text>
+<rect x="748.8" y="281.2" width="15" height="198.8" fill="#ef4444" rx="1.5"/>
+<text x="756.2" y="277.2" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 756.2 277.2)">1224</text>
+<rect x="765.2" y="314.0" width="15" height="166.0" fill="#b91c1c" rx="1.5"/>
+<text x="772.8" y="310.0" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 772.8 310.0)">809</text>
+<text x="730.8" y="500" text-anchor="middle" font-size="11" font-weight="600" fill="#111827">E084</text>
+<text x="730.8" y="515" text-anchor="middle" font-size="10" fill="#4b5563">(M512 P80 C8)</text>
+<rect x="801.5" y="194.3" width="15" height="285.7" fill="#93c5fd" rx="1.5"/>
+<text x="809.0" y="190.3" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 809.0 190.3)">3658</text>
+<rect x="818.0" y="268.1" width="15" height="211.9" fill="#3b82f6" rx="1.5"/>
+<text x="825.5" y="264.1" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 825.5 264.1)">1443</text>
+<rect x="834.5" y="298.5" width="15" height="181.5" fill="#1d4ed8" rx="1.5"/>
+<text x="842.0" y="294.5" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 842.0 294.5)">984</text>
+<rect x="851.0" y="201.7" width="15" height="278.3" fill="#fca5a5" rx="1.5"/>
+<text x="858.5" y="197.7" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 858.5 197.7)">3331</text>
+<rect x="867.5" y="291.7" width="15" height="188.3" fill="#ef4444" rx="1.5"/>
+<text x="875.0" y="287.7" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 875.0 287.7)">1072</text>
+<rect x="884.0" y="334.4" width="15" height="145.6" fill="#b91c1c" rx="1.5"/>
+<text x="891.5" y="330.4" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 891.5 330.4)">626</text>
+<text x="849.5" y="500" text-anchor="middle" font-size="11" font-weight="600" fill="#111827">E048</text>
+<text x="849.5" y="515" text-anchor="middle" font-size="10" fill="#4b5563">(M512 P40 C16)</text>
+<rect x="920.2" y="196.2" width="15" height="283.8" fill="#93c5fd" rx="1.5"/>
+<text x="927.8" y="192.2" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 927.8 192.2)">3572</text>
+<rect x="936.8" y="271.4" width="15" height="208.6" fill="#3b82f6" rx="1.5"/>
+<text x="944.2" y="267.4" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 944.2 267.4)">1385</text>
+<rect x="953.2" y="300.0" width="15" height="180.0" fill="#1d4ed8" rx="1.5"/>
+<text x="960.8" y="296.0" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 960.8 296.0)">966</text>
+<rect x="969.8" y="224.2" width="15" height="255.8" fill="#fca5a5" rx="1.5"/>
+<text x="977.2" y="220.2" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 977.2 220.2)">2510</text>
+<rect x="986.2" y="317.4" width="15" height="162.6" fill="#ef4444" rx="1.5"/>
+<text x="993.8" y="313.4" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 993.8 313.4)">776</text>
+<rect x="1002.8" y="339.6" width="15" height="140.4" fill="#b91c1c" rx="1.5"/>
+<text x="1010.2" y="335.6" text-anchor="middle" font-size="8.5" font-weight="600" fill="#111827" transform="rotate(-45 1010.2 335.6)">586</text>
+<text x="968.2" y="500" text-anchor="middle" font-size="11" font-weight="600" fill="#111827">E021</text>
+<text x="968.2" y="515" text-anchor="middle" font-size="10" fill="#4b5563">(M512 P20 C32)</text>
+</svg>
