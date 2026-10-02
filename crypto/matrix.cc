@@ -67,6 +67,38 @@ absl::StatusOr<Matrix<CoeffType>> Matrix<CoeffType>::Create(int rows,
 template <typename CoeffType>
 absl::StatusOr<Matrix<CoeffType>> Matrix<CoeffType>::CreateCondensed(
     std::vector<std::vector<CoeffType>> data) {
+  if constexpr (std::is_same_v<CoeffType, int32_t>) {
+    const int rows = data.size();
+    if (rows == 0) {
+      return Matrix<CoeffType>(std::vector<CoeffType>(), 0, 0,
+                               /*is_condensed=*/true, /*original_cols=*/0);
+    }
+    const int cols = data[0].size();
+    for (int i = 0; i < rows; ++i) {
+      if (static_cast<int>(data[i].size()) != cols) {
+        return absl::InvalidArgumentError(
+            "All rows must have the same number of columns.");
+      }
+    }
+    if (cols % 2 != 0) {
+      return absl::InvalidArgumentError(
+          "Columns must be a multiple of 2 to condense int32_t.");
+    }
+    const int phys_cols = cols / 2;
+    std::vector<uint64_t> condensed_flat(static_cast<size_t>(rows) * phys_cols,
+                                         0);
+    for (int i = 0; i < rows; ++i) {
+      if (cols > 0) {
+        std::memcpy(&condensed_flat[static_cast<size_t>(i) * phys_cols],
+                    data[i].data(),
+                    static_cast<size_t>(cols) * sizeof(int32_t));
+      }
+    }
+    Matrix<CoeffType> matrix(std::vector<CoeffType>(), rows, phys_cols,
+                             /*is_condensed=*/true, /*original_cols=*/cols);
+    matrix.condensed_data_ = std::move(condensed_flat);
+    return matrix;
+  }
   auto normal_matrix_or = Create(std::move(data));
   if (!normal_matrix_or.ok()) {
     return normal_matrix_or.status();
@@ -127,17 +159,11 @@ absl::StatusOr<Matrix<CoeffType>> Matrix<CoeffType>::CreateCondensed(
       return absl::InvalidArgumentError(
           "Columns must be a multiple of 2 to condense int32_t.");
     }
-    condensed_flat.resize(static_cast<size_t>(rows) * (cols / 2), 0);
-    for (size_t i = 0; i < rows; ++i) {
-      for (size_t j = 0; j < cols / 2; ++j) {
-        uint64_t condensed_val = 0;
-        for (size_t k = 0; k < 2; ++k) {
-          uint64_t val = static_cast<uint64_t>(static_cast<uint32_t>(
-              data[i * static_cast<size_t>(cols) + j * 2 + k]));
-          condensed_val |= (val & 0xFFFFFFFFULL) << (k * 32);
-        }
-        condensed_flat[i * static_cast<size_t>(cols / 2) + j] = condensed_val;
-      }
+    const size_t phys_cols = static_cast<size_t>(cols / 2);
+    condensed_flat.resize(static_cast<size_t>(rows) * phys_cols, 0);
+    if (rows > 0 && cols > 0) {
+      std::memcpy(condensed_flat.data(), data.data(),
+                  static_cast<size_t>(rows) * cols * sizeof(int32_t));
     }
   } else {
     return absl::FailedPreconditionError(
@@ -414,11 +440,9 @@ absl::StatusOr<std::vector<uint64_t>> CondensedMultiply<uint16_t>(
 // both as ordinary int32 lanes. Rows are processed kRowBlock at a time so
 // each y vector is loaded once per block.
 template <int kRows>
-HWY_INLINE void CondensedMultiplyInt32Rows(const uint64_t* const* m_rows,
-                                           int condensed_cols,
-                                           const int32_t* y_lo,
-                                           const int32_t* y_hi,
-                                           uint64_t* result) {
+HWY_INLINE void CondensedMultiplyInt32Rows(
+    const uint64_t* const* m_rows, int condensed_cols,
+    const int32_t* HWY_RESTRICT y_packed, uint64_t* HWY_RESTRICT result) {
   namespace hn = hwy::HWY_NAMESPACE;
   const hn::ScalableTag<uint64_t> d64;
   const hn::Repartition<int64_t, decltype(d64)> d64s;
@@ -433,17 +457,20 @@ HWY_INLINE void CondensedMultiplyInt32Rows(const uint64_t* const* m_rows,
     hi[r] = hn::Zero(du32);
   }
 
-  for (size_t c = 0; c < static_cast<size_t>(condensed_cols); c += N) {
-    const auto yl = hn::LoadU(d32, y_lo + 2 * c);
+  const int32_t* HWY_RESTRICT y_ptr = y_packed;
+  for (size_t c = 0; c < static_cast<size_t>(condensed_cols);
+       c += N, y_ptr += 4 * N) {
+    const auto yl = hn::LoadU(d32, y_ptr);
     const auto yl_odd =
         hn::BitCast(d32, hn::ShiftRight<32>(hn::BitCast(d64, yl)));
-    const auto yh = hn::LoadU(d32, y_hi + 2 * c);
+    const auto yh = hn::LoadU(d32, y_ptr + 2 * N);
+    HWY_UNROLL(kRows)
     for (int r = 0; r < kRows; ++r) {
       const auto m = hn::LoadU(d64, m_rows[r] + c);
       const auto m_even = hn::BitCast(d32, m);
       const auto m_odd = hn::BitCast(d32, hn::ShiftRight<32>(m));
-      lo[r] = hn::Add(lo[r], hn::MulEven(m_even, yl));
-      lo[r] = hn::Add(lo[r], hn::MulEven(m_odd, yl_odd));
+      lo[r] = hn::Add(
+          lo[r], hn::Add(hn::MulEven(m_even, yl), hn::MulEven(m_odd, yl_odd)));
       hi[r] = hn::Add(hi[r], hn::BitCast(du32, hn::Mul(m_even, yh)));
     }
   }
@@ -459,8 +486,8 @@ absl::StatusOr<std::vector<uint64_t>> CondensedMultiply<int32_t>(
     const Matrix<int32_t>& condensed_matrix, absl::Span<const uint64_t> vec,
     int original_cols) {
   namespace hn = hwy::HWY_NAMESPACE;
-  const hn::ScalableTag<uint64_t> d;
-  const size_t N = hn::Lanes(d);
+  const hn::ScalableTag<uint64_t> d64;
+  const size_t N = hn::Lanes(d64);
 
   if (original_cols % (2 * N) != 0) {
     return absl::InvalidArgumentError(
@@ -473,15 +500,21 @@ absl::StatusOr<std::vector<uint64_t>> CondensedMultiply<int32_t>(
   const int condensed_cols = original_cols / 2;
   const std::vector<uint64_t>& data = condensed_matrix.CondensedData();
 
-  std::vector<int32_t> y_lo(original_cols);
-  std::vector<int32_t> y_hi(original_cols);
-  for (int j = 0; j < original_cols; ++j) {
-    y_lo[j] = static_cast<int32_t>(static_cast<uint32_t>(vec[j]));
-    y_hi[j] = static_cast<int32_t>(static_cast<uint32_t>(vec[j] >> 32) +
-                                   static_cast<uint32_t>((vec[j] >> 31) & 1));
+  const size_t step_elems = 2 * N;
+  std::vector<int32_t> y_packed(2 * static_cast<size_t>(original_cols));
+  int32_t* HWY_RESTRICT yp = y_packed.data();
+  for (size_t j = 0; j < static_cast<size_t>(original_cols);
+       j += step_elems, yp += 2 * step_elems) {
+    for (size_t l = 0; l < step_elems; ++l) {
+      const uint64_t v = vec[j + l];
+      yp[l] = static_cast<int32_t>(static_cast<uint32_t>(v));
+      yp[step_elems + l] =
+          static_cast<int32_t>(static_cast<uint32_t>(v >> 32) +
+                               static_cast<uint32_t>((v >> 31) & 1));
+    }
   }
 
-  constexpr int kRowBlock = 4;
+  constexpr int kRowBlock = 6;
   std::vector<uint64_t> result(rows, 0);
   int i = 0;
   for (; i + kRowBlock <= rows; i += kRowBlock) {
@@ -489,13 +522,20 @@ absl::StatusOr<std::vector<uint64_t>> CondensedMultiply<int32_t>(
     for (int r = 0; r < kRowBlock; ++r) {
       m_rows[r] = &data[static_cast<size_t>(i + r) * condensed_cols];
     }
-    CondensedMultiplyInt32Rows<kRowBlock>(m_rows, condensed_cols, y_lo.data(),
-                                          y_hi.data(), &result[i]);
+    CondensedMultiplyInt32Rows<kRowBlock>(m_rows, condensed_cols,
+                                          y_packed.data(), &result[i]);
+  }
+  for (; i + 2 <= rows; i += 2) {
+    const uint64_t* m_rows[2] = {
+        &data[static_cast<size_t>(i) * condensed_cols],
+        &data[static_cast<size_t>(i + 1) * condensed_cols]};
+    CondensedMultiplyInt32Rows<2>(m_rows, condensed_cols, y_packed.data(),
+                                  &result[i]);
   }
   for (; i < rows; ++i) {
     const uint64_t* m_row = &data[static_cast<size_t>(i) * condensed_cols];
-    CondensedMultiplyInt32Rows<1>(&m_row, condensed_cols, y_lo.data(),
-                                  y_hi.data(), &result[i]);
+    CondensedMultiplyInt32Rows<1>(&m_row, condensed_cols, y_packed.data(),
+                                  &result[i]);
   }
   return result;
 }

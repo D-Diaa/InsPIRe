@@ -180,6 +180,31 @@ TEST(CondensedMultiplyHighwayI32U64Test, MatchesScalarOnRandomAndExtremes) {
   EXPECT_EQ(result, expected);
 }
 
+TEST(CondensedMultiplyHighwayI32U64Test, MatchesScalarOnTiledLargeScale) {
+  const int rows = 128;
+  const int cols = 1024;
+  std::mt19937_64 rng(98765);
+
+  std::vector<std::vector<int32_t>> matrix_data(rows,
+                                                std::vector<int32_t>(cols));
+  std::vector<uint64_t> vec(cols);
+  for (int i = 0; i < rows; ++i) {
+    for (int j = 0; j < cols; ++j) {
+      matrix_data[i][j] = static_cast<int32_t>(rng());
+    }
+  }
+  for (int j = 0; j < cols; ++j) {
+    vec[j] = rng();
+  }
+  ASSERT_OK_AND_ASSIGN(auto plain, Matrix<int32_t>::Create(matrix_data));
+  ASSERT_OK_AND_ASSIGN(auto condensed,
+                       Matrix<int32_t>::CreateCondensed(matrix_data));
+  ASSERT_OK_AND_ASSIGN(auto expected, plain.template Multiply<uint64_t>(vec));
+  ASSERT_OK_AND_ASSIGN(auto result,
+                       condensed.template Multiply<uint64_t>(vec));
+  EXPECT_EQ(result, expected);
+}
+
 // Same check for the uint16 kernel: 7 rows covers the 4-row block and the
 // single-row tail, and the extremes hit every 16-bit field position.
 TEST(CondensedMultiplyHighwayU16U64Test, MatchesScalarOnRandomAndExtremes) {

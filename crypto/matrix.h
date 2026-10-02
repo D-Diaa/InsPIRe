@@ -171,6 +171,10 @@ absl::StatusOr<std::vector<OutputType>> Matrix<CoeffType>::Multiply(
         "Vector size must match the number of matrix columns.");
   }
   if (is_condensed_) {
+    if constexpr (std::is_same_v<VecType, uint64_t> &&
+                  std::is_same_v<OutputType, uint64_t>) {
+      return CondensedMultiply(vec);
+    }
     std::vector<uint64_t> vec_u64(vec.begin(), vec.end());
     auto result_u64_or = CondensedMultiply(vec_u64);
     if (!result_u64_or.ok()) {
