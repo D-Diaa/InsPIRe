@@ -16,6 +16,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <memory>
 #include <string>
 #include <type_traits>
@@ -225,28 +226,35 @@ absl::StatusOr<Polynomial<CoeffType>> Polynomial<CoeffType>::CreateFromProto(
     return absl::InvalidArgumentError("Unexpected serialized size.");
   }
 
-  std::vector<CoeffType> coeffs;
-  coeffs.reserve(len);
+  std::vector<CoeffType> coeffs(len);
+  const uint8_t* raw = reinterpret_cast<const uint8_t*>(bytes.data());
+  const uint64_t mask = (log_modulus == 64)
+                            ? ~uint64_t{0}
+                            : ((uint64_t{1} << log_modulus) - 1);
 
+  unsigned __int128 bit_buf = 0;
+  int bits_in_buf = 0;
   size_t byte_idx = 0;
-  int bit_offset = 0;
 
   for (int j = 0; j < len; ++j) {
-    CoeffType coeff = 0;
-    for (int i = 0; i < log_modulus; ++i) {
-      if (byte_idx >= bytes.size()) {
-        return absl::InvalidArgumentError("Serialized polynomial too small.");
-      }
-      uint8_t current_byte = bytes[byte_idx];
-      CoeffType bit = (current_byte >> bit_offset) & 1;
-      coeff |= (bit << i);
-      bit_offset++;
-      if (bit_offset == 8) {
-        bit_offset = 0;
-        byte_idx++;
+    if (bits_in_buf < log_modulus) {
+      if (byte_idx + 8 <= expected_bytes) {
+        uint64_t word = 0;
+        std::memcpy(&word, raw + byte_idx, sizeof(uint64_t));
+        bit_buf |= static_cast<unsigned __int128>(word) << bits_in_buf;
+        bits_in_buf += 64;
+        byte_idx += 8;
+      } else {
+        while (byte_idx < expected_bytes && bits_in_buf <= 120) {
+          bit_buf |= static_cast<unsigned __int128>(raw[byte_idx++])
+                     << bits_in_buf;
+          bits_in_buf += 8;
+        }
       }
     }
-    coeffs.push_back(coeff);
+    coeffs[j] = static_cast<CoeffType>(static_cast<uint64_t>(bit_buf) & mask);
+    bit_buf >>= log_modulus;
+    bits_in_buf -= log_modulus;
   }
   return Polynomial::Create(std::move(coeffs));
 }
@@ -288,17 +296,20 @@ template <typename CoeffType>
 absl::StatusOr<Polynomial<CoeffType>> Polynomial<CoeffType>::Rescale(
     int log_current_modulus, int log_new_modulus) const {
   std::vector<CoeffType> result(Len());
-
-  absl::uint128 current_modulus = static_cast<absl::uint128>(CoeffType{1})
-                                  << log_current_modulus;
-  absl::uint128 new_modulus = static_cast<absl::uint128>(CoeffType{1})
-                              << log_new_modulus;
-  absl::uint128 half_current_modulus = current_modulus / 2;
-  for (int i = 0; i < Len(); ++i) {
-    result[i] = static_cast<CoeffType>(
-        (static_cast<absl::uint128>(coeffs_[i]) * new_modulus +
-         half_current_modulus) /
-        current_modulus);
+  if (log_current_modulus > log_new_modulus) {
+    const int shift = log_current_modulus - log_new_modulus;
+    const CoeffType half = CoeffType{1} << (shift - 1);
+    for (int i = 0; i < Len(); ++i) {
+      result[i] = static_cast<CoeffType>(
+          (static_cast<absl::uint128>(coeffs_[i]) + half) >> shift);
+    }
+  } else if (log_current_modulus < log_new_modulus) {
+    const int shift = log_new_modulus - log_current_modulus;
+    for (int i = 0; i < Len(); ++i) {
+      result[i] = coeffs_[i] << shift;
+    }
+  } else {
+    result = coeffs_;
   }
   return Polynomial::Create(std::move(result));
 }
@@ -565,23 +576,35 @@ absl::StatusOr<proto::Polynomial> Polynomial<CoeffType>::ToProto(
   if (log_modulus <= 0 || log_modulus > 8 * sizeof(CoeffType)) {
     return absl::InvalidArgumentError("Invalid log_modulus.");
   }
-  std::string bytes;
-  uint8_t current_byte = 0;
-  int bits_in_byte = 0;
+  const size_t total_bits = coeffs_.size() * static_cast<size_t>(log_modulus);
+  const size_t expected_bytes = (total_bits + 7) / 8;
+  std::string bytes(expected_bytes, '\0');
+  uint8_t* out_ptr = reinterpret_cast<uint8_t*>(&bytes[0]);
+  const uint64_t mask = (log_modulus == 64)
+                            ? ~uint64_t{0}
+                            : ((uint64_t{1} << log_modulus) - 1);
+
+  unsigned __int128 bit_buf = 0;
+  int bits_in_buf = 0;
+  size_t byte_idx = 0;
+
   for (CoeffType coeff : coeffs_) {
-    for (int i = 0; i < log_modulus; ++i) {
-      uint8_t bit = (coeff >> i) & 1;
-      current_byte |= (bit << bits_in_byte);
-      bits_in_byte++;
-      if (bits_in_byte == 8) {
-        bytes.push_back(current_byte);
-        current_byte = 0;
-        bits_in_byte = 0;
-      }
+    bit_buf |= static_cast<unsigned __int128>(static_cast<uint64_t>(coeff) &
+                                              mask)
+               << bits_in_buf;
+    bits_in_buf += log_modulus;
+    if (bits_in_buf >= 64) {
+      uint64_t word = static_cast<uint64_t>(bit_buf);
+      std::memcpy(out_ptr + byte_idx, &word, sizeof(uint64_t));
+      bit_buf >>= 64;
+      bits_in_buf -= 64;
+      byte_idx += 8;
     }
   }
-  if (bits_in_byte > 0) {
-    bytes.push_back(current_byte);
+  while (bits_in_buf > 0) {
+    out_ptr[byte_idx++] = static_cast<uint8_t>(bit_buf & 0xFF);
+    bit_buf >>= 8;
+    bits_in_buf -= 8;
   }
 
   proto::Polynomial result;

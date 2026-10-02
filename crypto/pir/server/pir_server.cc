@@ -121,11 +121,24 @@ PirServer<DbDataType, CoeffType, MatCoeffType>::Create(
       auto t_vec_h_ffts,
       PrecomputeTVecHFfts(params, preprocessed_data.preprocessed_outputs));
 
+  std::vector<Polynomial<CoeffType>> a_mod_switched_t1;
+  if (t == 1) {
+    a_mod_switched_t1.reserve(entry_size_multiple);
+    for (int k = 0; k < entry_size_multiple; ++k) {
+      ASSIGN_OR_RETURN(
+          auto a_ms,
+          preprocessed_data.preprocessed_outputs[k][0].a_tilde_agg.Rescale(
+              params.RlweParameters().LogModulus(),
+              params.RlweParameters().LogModulus1AfterSwitch()));
+      a_mod_switched_t1.push_back(std::move(a_ms));
+    }
+  }
+
   return absl::WrapUnique(new PirServer<DbDataType, CoeffType, MatCoeffType>(
       params, std::move(combined_db_matrix), std::move(combined_pack_matrix),
       std::move(preprocessed_data.preprocessed_outputs),
-      std::move(t_vec_h_ffts), std::move(preprocessed_data.second_dim_a),
-      std::move(ctx)));
+      std::move(t_vec_h_ffts), std::move(a_mod_switched_t1),
+      std::move(preprocessed_data.second_dim_a), std::move(ctx)));
 }
 
 template <typename DbDataType, typename CoeffType, typename MatCoeffType>
@@ -329,11 +342,16 @@ PirServer<DbDataType, CoeffType, MatCoeffType>::ProcessResponse(
     poly_eval_time_ += (absl::Now() - start_eval);
 
     const auto start_modswitch=absl::Now();
-    // mod switch the first component of the ciphertext to q1
-    ASSIGN_OR_RETURN(auto a_mod_switched,
-                     final_ciphertext.a.Rescale(
-                         params_.RlweParameters().LogModulus(),
-                         params_.RlweParameters().LogModulus1AfterSwitch()));
+    Polynomial<CoeffType> a_mod_switched;
+    if (t == 1 && static_cast<size_t>(k) < a_mod_switched_t1_.size()) {
+      a_mod_switched = a_mod_switched_t1_[k];
+    } else {
+      // mod switch the first component of the ciphertext to q1
+      ASSIGN_OR_RETURN(a_mod_switched,
+                       final_ciphertext.a.Rescale(
+                           params_.RlweParameters().LogModulus(),
+                           params_.RlweParameters().LogModulus1AfterSwitch()));
+    }
 
     // mod switch the second component of the ciphertext to q2
     ASSIGN_OR_RETURN(auto b_mod_switched,
@@ -833,10 +851,24 @@ PirServer<DbDataType, CoeffType, MatCoeffType>::LoadFromBuffer(
   ASSIGN_OR_RETURN(auto t_vec_h_ffts,
                    PrecomputeTVecHFfts(params, preprocessed_outputs));
 
+  std::vector<Polynomial<CoeffType>> a_mod_switched_t1;
+  if (params.InterpolationDegree() == 1) {
+    a_mod_switched_t1.reserve(preprocessed_outputs.size());
+    for (size_t k = 0; k < preprocessed_outputs.size(); ++k) {
+      ASSIGN_OR_RETURN(
+          auto a_ms,
+          preprocessed_outputs[k][0].a_tilde_agg.Rescale(
+              params.RlweParameters().LogModulus(),
+              params.RlweParameters().LogModulus1AfterSwitch()));
+      a_mod_switched_t1.push_back(std::move(a_ms));
+    }
+  }
+
   return absl::WrapUnique(new PirServer<DbDataType, CoeffType, MatCoeffType>(
       params, std::move(combined_db_matrix), std::move(combined_pack_matrix),
       std::move(preprocessed_outputs), std::move(t_vec_h_ffts),
-      std::move(second_dim_query_a), std::move(ctx)));
+      std::move(a_mod_switched_t1), std::move(second_dim_query_a),
+      std::move(ctx)));
 }
 
 template <typename DbDataType, typename CoeffType, typename MatCoeffType>

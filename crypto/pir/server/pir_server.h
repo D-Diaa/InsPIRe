@@ -86,12 +86,14 @@ class PirServer {
           std::vector<PreprocessMatrixPackOutput<CoeffType, MatCoeffType>>>
           preprocessed_outputs,
       std::vector<std::vector<ChunkedFft>> t_vec_h_ffts,
+      std::vector<Polynomial<CoeffType>> a_mod_switched_t1,
       std::vector<Polynomial<CoeffType>> second_dim_query_a, Context ctx)
       : params_(params),
         combined_db_matrix_(std::move(combined_db_matrix)),
         combined_pack_matrix_(std::move(combined_pack_matrix)),
         preprocessed_outputs_(std::move(preprocessed_outputs)),
         t_vec_h_ffts_(std::move(t_vec_h_ffts)),
+        a_mod_switched_t1_(std::move(a_mod_switched_t1)),
         second_dim_query_a_(std::move(second_dim_query_a)),
         ctx_(std::move(ctx)),
         db_mult_time_(absl::ZeroDuration()),
@@ -122,6 +124,7 @@ class PirServer {
       std::vector<PreprocessMatrixPackOutput<CoeffType, MatCoeffType>>>
       preprocessed_outputs_;
   const std::vector<std::vector<ChunkedFft>> t_vec_h_ffts_;
+  const std::vector<Polynomial<CoeffType>> a_mod_switched_t1_;
   const std::vector<Polynomial<CoeffType>> second_dim_query_a_;
   Context ctx_;
 

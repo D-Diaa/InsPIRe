@@ -274,15 +274,32 @@ absl::StatusOr<RlweCiphertext<CoeffType>> EncryptFromRlweSample(
   absl::uint128 p_128 = plaintext_modulus;
 
   std::vector<CoeffType> b_coeffs = rlwe_sample.b.Coeffs();
-  for (int i = 0; i < d; ++i) {
-    if (message[i] >= plaintext_modulus) {
-      return absl::InvalidArgumentError(
-          "Message components must be less than plaintext_modulus.");
+  if (absl::has_single_bit(static_cast<uint64_t>(plaintext_modulus)) &&
+      params.LogModulus() >=
+          absl::bit_width(static_cast<uint64_t>(plaintext_modulus)) - 1) {
+    const int log_p =
+        absl::bit_width(static_cast<uint64_t>(plaintext_modulus)) - 1;
+    const int shift = params.LogModulus() - log_p;
+    for (int i = 0; i < d; ++i) {
+      if (message[i] >= plaintext_modulus) {
+        return absl::InvalidArgumentError(
+            "Message components must be less than plaintext_modulus.");
+      }
+      b_coeffs[i] = (b_coeffs[i] + (message[i] << shift)) & (q - 1);
     }
-    absl::uint128 m_128 = message[i];
-    CoeffType scaled_m =
-        static_cast<CoeffType>((m_128 * q_128 + p_128 / 2) / p_128);
-    b_coeffs[i] = (b_coeffs[i] + scaled_m) & (q - 1);
+  } else {
+    absl::uint128 q_128 = absl::uint128{1} << params.LogModulus();
+    absl::uint128 p_128 = plaintext_modulus;
+    for (int i = 0; i < d; ++i) {
+      if (message[i] >= plaintext_modulus) {
+        return absl::InvalidArgumentError(
+            "Message components must be less than plaintext_modulus.");
+      }
+      absl::uint128 m_128 = message[i];
+      CoeffType scaled_m =
+          static_cast<CoeffType>((m_128 * q_128 + p_128 / 2) / p_128);
+      b_coeffs[i] = (b_coeffs[i] + scaled_m) & (q - 1);
+    }
   }
 
   ASSIGN_OR_RETURN(auto b_prime,
@@ -328,15 +345,27 @@ absl::StatusOr<std::vector<CoeffType>> Decrypt(
   ASSIGN_OR_RETURN(noisy_m, noisy_m.LowBits(log_q));
 
   std::vector<CoeffType> m_coeffs(d);
-  absl::uint128 q_128 = absl::uint128{1} << log_q;
-  absl::uint128 p_128 = plaintext_modulus;
-
-  for (int i = 0; i < d; ++i) {
-    CoeffType val = noisy_m.Coeffs()[i] & (q - 1);
-    // Decode with exact fraction round(c * P / Q)
-    absl::uint128 v_128 = val;
-    m_coeffs[i] = static_cast<CoeffType>((v_128 * p_128 + q_128 / 2) / q_128 %
-                                         plaintext_modulus);
+  if (absl::has_single_bit(static_cast<uint64_t>(plaintext_modulus)) &&
+      log_q >= absl::bit_width(static_cast<uint64_t>(plaintext_modulus)) - 1) {
+    const int log_p =
+        absl::bit_width(static_cast<uint64_t>(plaintext_modulus)) - 1;
+    const int shift = log_q - log_p;
+    const CoeffType half = shift > 0 ? (CoeffType{1} << (shift - 1)) : 0;
+    const CoeffType p_mask = plaintext_modulus - 1;
+    for (int i = 0; i < d; ++i) {
+      CoeffType val = noisy_m.Coeffs()[i] & (q - 1);
+      m_coeffs[i] = ((val + half) >> shift) & p_mask;
+    }
+  } else {
+    absl::uint128 q_128 = absl::uint128{1} << log_q;
+    absl::uint128 p_128 = plaintext_modulus;
+    for (int i = 0; i < d; ++i) {
+      CoeffType val = noisy_m.Coeffs()[i] & (q - 1);
+      // Decode with exact fraction round(c * P / Q)
+      absl::uint128 v_128 = val;
+      m_coeffs[i] = static_cast<CoeffType>((v_128 * p_128 + q_128 / 2) / q_128 %
+                                           plaintext_modulus);
+    }
   }
 
   return m_coeffs;
@@ -395,14 +424,29 @@ absl::StatusOr<std::vector<CoeffType>> DecryptAfterModulusSwitchImpl(
   }
 
   std::vector<CoeffType> m_coeffs(d);
-  absl::uint128 q_128 = absl::uint128{1} << params.LogModulus2AfterSwitch();
-  absl::uint128 p_128 = plaintext_modulus;
+  const int log_q2 = params.LogModulus2AfterSwitch();
+  if (absl::has_single_bit(static_cast<uint64_t>(plaintext_modulus)) &&
+      log_q2 >= absl::bit_width(static_cast<uint64_t>(plaintext_modulus)) - 1) {
+    const int log_p =
+        absl::bit_width(static_cast<uint64_t>(plaintext_modulus)) - 1;
+    const int shift = log_q2 - log_p;
+    const CoeffType half = shift > 0 ? (CoeffType{1} << (shift - 1)) : 0;
+    const CoeffType p_mask = plaintext_modulus - 1;
+    const CoeffType q2_mask = modulus2 - 1;
+    for (int i = 0; i < d; ++i) {
+      CoeffType val = noisy_m.Coeffs()[i] & q2_mask;
+      m_coeffs[i] = ((val + half) >> shift) & p_mask;
+    }
+  } else {
+    absl::uint128 q_128 = absl::uint128{1} << log_q2;
+    absl::uint128 p_128 = plaintext_modulus;
 
-  for (int i = 0; i < d; ++i) {
-    CoeffType val = noisy_m.Coeffs()[i] & (modulus2 - 1);
-    absl::uint128 v_128 = val;
-    m_coeffs[i] = static_cast<CoeffType>((v_128 * p_128 + q_128 / 2) / q_128 %
-                                         plaintext_modulus);
+    for (int i = 0; i < d; ++i) {
+      CoeffType val = noisy_m.Coeffs()[i] & (modulus2 - 1);
+      absl::uint128 v_128 = val;
+      m_coeffs[i] = static_cast<CoeffType>((v_128 * p_128 + q_128 / 2) / q_128 %
+                                           plaintext_modulus);
+    }
   }
 
   return m_coeffs;
