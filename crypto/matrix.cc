@@ -275,25 +275,19 @@ absl::StatusOr<std::vector<uint64_t>> CondensedMultiply(
 // of `condensed_cols` words: plane f < 4 is y_lo of field f, planes 4 and 5
 // are the (y_hi[4j], y_hi[4j+2]) and (y_hi[4j+1], y_hi[4j+3]) pairs.
 template <int kRows>
-HWY_INLINE void CondensedMultiplyUint16Rows(const uint64_t* const* m_rows,
-                                            int condensed_cols,
-                                            const uint64_t* y_split,
-                                            uint64_t* result) {
+HWY_INLINE void CondensedMultiplyUint16Rows(
+    const uint64_t* const* m_rows, int condensed_cols, size_t y_stride,
+    const uint64_t* HWY_RESTRICT y_split, uint64_t* HWY_RESTRICT result) {
   namespace hn = hwy::HWY_NAMESPACE;
   const hn::ScalableTag<uint64_t> d64;
   const hn::Repartition<uint32_t, decltype(d64)> d32;
   const size_t N = hn::Lanes(d64);
   const auto fields_02 = hn::Set(d64, 0x0000FFFF0000FFFFULL);
-  const uint64_t* y_lo0 = y_split;
-  const uint64_t* y_lo1 = y_split + condensed_cols;
-  const uint64_t* y_lo2 = y_split + 2 * condensed_cols;
-  const uint64_t* y_lo3 = y_split + 3 * condensed_cols;
-  const uint64_t* y_hi02 = y_split + 4 * condensed_cols;
-  const uint64_t* y_hi13 = y_split + 5 * condensed_cols;
-  // Rows are short (2 KiB at 1024 columns) and the matrix is usually cold, so
-  // the hardware prefetcher restarts on every row; touching the same offset of
-  // the next row block keeps the DRAM reads streaming.
-  const size_t next_block = kRows * condensed_cols;
+  const uint64_t* HWY_RESTRICT y_lo02 = y_split;
+  const uint64_t* HWY_RESTRICT y_lo13 = y_split + y_stride;
+  const uint64_t* HWY_RESTRICT y_hi02 = y_split + 2 * y_stride;
+  const uint64_t* HWY_RESTRICT y_hi13 = y_split + 3 * y_stride;
+  const size_t next_block = static_cast<size_t>(kRows) * condensed_cols;
 
   hn::Vec<decltype(d64)> lo[kRows];
   hn::Vec<decltype(d32)> hi[kRows];
@@ -303,10 +297,12 @@ HWY_INLINE void CondensedMultiplyUint16Rows(const uint64_t* const* m_rows,
   }
 
   for (size_t c = 0; c < static_cast<size_t>(condensed_cols); c += N) {
-    const auto yl0 = hn::BitCast(d32, hn::LoadU(d64, y_lo0 + c));
-    const auto yl1 = hn::BitCast(d32, hn::LoadU(d64, y_lo1 + c));
-    const auto yl2 = hn::BitCast(d32, hn::LoadU(d64, y_lo2 + c));
-    const auto yl3 = hn::BitCast(d32, hn::LoadU(d64, y_lo3 + c));
+    const auto yl02_64 = hn::LoadU(d64, y_lo02 + c);
+    const auto yl13_64 = hn::LoadU(d64, y_lo13 + c);
+    const auto yl0 = hn::BitCast(d32, yl02_64);
+    const auto yl2 = hn::BitCast(d32, hn::ShiftRight<32>(yl02_64));
+    const auto yl1 = hn::BitCast(d32, yl13_64);
+    const auto yl3 = hn::BitCast(d32, hn::ShiftRight<32>(yl13_64));
     const auto yh02 = hn::BitCast(d32, hn::LoadU(d64, y_hi02 + c));
     const auto yh13 = hn::BitCast(d32, hn::LoadU(d64, y_hi13 + c));
     HWY_UNROLL(kRows)
@@ -317,14 +313,11 @@ HWY_INLINE void CondensedMultiplyUint16Rows(const uint64_t* const* m_rows,
       const auto m13 = hn::ShiftRight<16>(hn::BitCast(d32, m));
       const auto m2 =
           hn::BitCast(d32, hn::ShiftRight<32>(hn::BitCast(d64, m02)));
-      const auto m3 =
-          hn::BitCast(d32, hn::ShiftRight<32>(hn::BitCast(d64, m13)));
-      lo[r] = hn::Add(lo[r], hn::MulEven(m02, yl0));
-      lo[r] = hn::Add(lo[r], hn::MulEven(m13, yl1));
-      lo[r] = hn::Add(lo[r], hn::MulEven(m2, yl2));
-      lo[r] = hn::Add(lo[r], hn::MulEven(m3, yl3));
-      hi[r] = hn::Add(hi[r], hn::Mul(m02, yh02));
-      hi[r] = hn::Add(hi[r], hn::Mul(m13, yh13));
+      const auto m3 = hn::BitCast(d32, hn::ShiftRight<48>(m));
+      const auto p02 = hn::Add(hn::MulEven(m02, yl0), hn::MulEven(m2, yl2));
+      const auto p13 = hn::Add(hn::MulEven(m13, yl1), hn::MulEven(m3, yl3));
+      lo[r] = hn::Add(lo[r], hn::Add(p02, p13));
+      hi[r] = hn::Add(hi[r], hn::Add(hn::Mul(m02, yh02), hn::Mul(m13, yh13)));
     }
   }
 
@@ -353,32 +346,50 @@ absl::StatusOr<std::vector<uint64_t>> CondensedMultiply<uint16_t>(
   const int condensed_cols = original_cols / 4;
   const std::vector<uint64_t>& data = condensed_matrix.CondensedData();
 
-  // See CondensedMultiplyUint16Rows for the layout.
-  std::vector<uint64_t> y_split(6 * condensed_cols);
+  // Pack 4 planes [y_lo02, y_lo13, y_hi02, y_hi13] with +8 uint64_t (1 cache
+  // line) stride padding so planes never alias to the same L1D cache set when
+  // condensed_cols * 8 is a multiple of 2 KiB or 4 KiB.
+  const size_t y_stride = static_cast<size_t>(condensed_cols) + 8;
+  std::vector<uint64_t> y_split(4 * y_stride);
+  uint64_t* HWY_RESTRICT y_lo02 = y_split.data();
+  uint64_t* HWY_RESTRICT y_lo13 = y_split.data() + y_stride;
+  uint64_t* HWY_RESTRICT y_hi02 = y_split.data() + 2 * y_stride;
+  uint64_t* HWY_RESTRICT y_hi13 = y_split.data() + 3 * y_stride;
   for (int c = 0; c < condensed_cols; ++c) {
     const uint64_t* y = &vec[4 * c];
-    for (int f = 0; f < 4; ++f) {
-      y_split[f * condensed_cols + c] = static_cast<uint32_t>(y[f]);
-    }
-    y_split[4 * condensed_cols + c] = (y[0] >> 32) | (y[2] & ~0xFFFFFFFFULL);
-    y_split[5 * condensed_cols + c] = (y[1] >> 32) | (y[3] & ~0xFFFFFFFFULL);
+    y_lo02[c] = static_cast<uint32_t>(y[0]) | (y[2] << 32);
+    y_lo13[c] = static_cast<uint32_t>(y[1]) | (y[3] << 32);
+    y_hi02[c] = (y[0] >> 32) | (y[2] & ~0xFFFFFFFFULL);
+    y_hi13[c] = (y[1] >> 32) | (y[3] & ~0xFFFFFFFFULL);
   }
 
-  constexpr int kRowBlock = 4;
   std::vector<uint64_t> result(rows, 0);
   int i = 0;
-  for (; i + kRowBlock <= rows; i += kRowBlock) {
-    const uint64_t* m_rows[kRowBlock];
-    for (int r = 0; r < kRowBlock; ++r) {
-      m_rows[r] = &data[static_cast<size_t>(i + r) * condensed_cols];
+  if (condensed_cols <= 256) {
+    constexpr int kRowBlock = 6;
+    for (; i + kRowBlock <= rows; i += kRowBlock) {
+      const uint64_t* m_rows[kRowBlock];
+      for (int r = 0; r < kRowBlock; ++r) {
+        m_rows[r] = &data[static_cast<size_t>(i + r) * condensed_cols];
+      }
+      CondensedMultiplyUint16Rows<kRowBlock>(m_rows, condensed_cols, y_stride,
+                                             y_split.data(), &result[i]);
     }
-    CondensedMultiplyUint16Rows<kRowBlock>(m_rows, condensed_cols,
-                                           y_split.data(), &result[i]);
+  } else {
+    constexpr int kRowBlock = 4;
+    for (; i + kRowBlock <= rows; i += kRowBlock) {
+      const uint64_t* m_rows[kRowBlock];
+      for (int r = 0; r < kRowBlock; ++r) {
+        m_rows[r] = &data[static_cast<size_t>(i + r) * condensed_cols];
+      }
+      CondensedMultiplyUint16Rows<kRowBlock>(m_rows, condensed_cols, y_stride,
+                                             y_split.data(), &result[i]);
+    }
   }
   for (; i < rows; ++i) {
     const uint64_t* m_row = &data[static_cast<size_t>(i) * condensed_cols];
-    CondensedMultiplyUint16Rows<1>(&m_row, condensed_cols, y_split.data(),
-                                   &result[i]);
+    CondensedMultiplyUint16Rows<1>(&m_row, condensed_cols, y_stride,
+                                   y_split.data(), &result[i]);
   }
   return result;
 }
