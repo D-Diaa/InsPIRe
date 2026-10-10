@@ -22,12 +22,14 @@
 
 #include "crypto/encryption.h"
 #include "crypto/file_util.h"
+#include "crypto/lwes_to_rlwe.h"
 #include "crypto/matrix.h"
 #include "crypto/pir/client/pir_client.h"
 #include "crypto/pir/pir_params.h"
 #include "crypto/pir/server/pir_preprocessed_data.h"
 #include "crypto/pir/server/preprocessing_server.h"
 #include "crypto/polynomial.h"
+#include "crypto/polynomial_fft.h"
 #include <gmock/gmock.h>
 #include "shell_encryption/testing/status_matchers.h"
 #include "crypto/status_macros.h"
@@ -349,6 +351,33 @@ TYPED_TEST(PirServerTest, ProcessResponseFailsWhenPackingKeyIsInvalidLength) {
   EXPECT_THAT(this->server_->ProcessResponse(request),
               StatusIs(absl::StatusCode::kInvalidArgument,
                        HasSubstr("Packing key must contain")));
+}
+
+TYPED_TEST(PirServerTest, PrecomputedYVecHFftGivesIdenticalResponse) {
+  using CoeffType = typename TypeParam::CoeffType;
+  const int d = this->params_->RlweParameters().Degree();
+  const int num_digits = this->params_->PackGadgetParams().num_digits;
+  ASSERT_OK_AND_ASSIGN(auto client, this->CreatePirClient());
+  ASSERT_OK_AND_ASSIGN(auto request, client->CreateRequest(35));
+  ASSERT_OK_AND_ASSIGN(
+      auto fft_ctx,
+      FftContext::Create(absl::bit_width(static_cast<uint32_t>(d)) - 1));
+  const std::vector<Polynomial<CoeffType>> y_vec_h(
+      request.packing_key.begin() + num_digits, request.packing_key.end());
+  ASSERT_OK_AND_ASSIGN(
+      ChunkedFft y_vec_h_fft,
+      YVecHFft(this->params_->RlweParameters(), y_vec_h, *fft_ctx));
+
+  ASSERT_OK_AND_ASSIGN(auto expected, this->server_->ProcessResponse(request));
+  ASSERT_OK_AND_ASSIGN(auto actual,
+                       this->server_->ProcessResponse(request, &y_vec_h_fft));
+  ASSERT_EQ(actual.ciphertexts.size(), expected.ciphertexts.size());
+  for (size_t k = 0; k < expected.ciphertexts.size(); ++k) {
+    EXPECT_EQ(actual.ciphertexts[k].a.Coeffs(),
+              expected.ciphertexts[k].a.Coeffs());
+    EXPECT_EQ(actual.ciphertexts[k].b.Coeffs(),
+              expected.ciphertexts[k].b.Coeffs());
+  }
 }
 
 TYPED_TEST(PirServerTest, EndToEndTestWithNonRingDegreeMultipleNumEntries) {

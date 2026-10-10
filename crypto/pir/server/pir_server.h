@@ -48,8 +48,6 @@ class PirServer {
          PirPreprocessedData<DbDataType, CoeffType, MatCoeffType>
              preprocessed_data);
 
-  // Processes a PirRequest to produce a PirResponse.
-
   // Serializes the server's preprocessed data and database to a binary file on
   // disk.
   absl::Status SaveToFile(absl::string_view file_path) const;
@@ -64,8 +62,13 @@ class PirServer {
       std::unique_ptr<PirServer<DbDataType, CoeffType, MatCoeffType>>>
   LoadFromFile(const PirParams<CoeffType>& params, absl::string_view file_path);
 
+  // Processes a PirRequest to produce a PirResponse. `y_vec_h_fft`, if given,
+  // must be YVecHFft of the request's y_vec_h (the last num_digits packing key
+  // polynomials), so that a caller answering one request with several servers
+  // transforms the shared key only once.
   absl::StatusOr<PirResponse<CoeffType>> ProcessResponse(
-      const PirRequest<CoeffType>& request) const;
+      const PirRequest<CoeffType>& request,
+      const ChunkedFft* y_vec_h_fft = nullptr) const;
 
   absl::Duration GetDbMultiplyTime() const { return db_mult_time_; }
   absl::Duration GetPackingTime() const { return packing_time_; }

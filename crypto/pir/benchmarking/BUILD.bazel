@@ -100,8 +100,10 @@ cc_binary(
     deps = [
         "@highway//:hwy",
         "//crypto:encryption",
+        "//crypto:lwes_to_rlwe",
         "//crypto:matrix",
         "//crypto:polynomial",
+        "//crypto:polynomial_fft",
         "//crypto:status_macros",
         "//crypto/pir:pir_params",
         "//crypto/pir/client:pir_client",

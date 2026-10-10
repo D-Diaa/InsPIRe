@@ -193,7 +193,7 @@ PirServer<DbDataType, CoeffType, MatCoeffType>::EvalPoly(
 template <typename DbDataType, typename CoeffType, typename MatCoeffType>
 absl::StatusOr<PirResponse<CoeffType>>
 PirServer<DbDataType, CoeffType, MatCoeffType>::ProcessResponse(
-    const PirRequest<CoeffType>& request) const {
+    const PirRequest<CoeffType>& request, const ChunkedFft* y_vec_h_fft) const {
   const int d = params_.RlweParameters().Degree();
   const int t = params_.InterpolationDegree();
   const int entry_size_multiple = params_.EntrySizeMultiple();
@@ -296,12 +296,16 @@ PirServer<DbDataType, CoeffType, MatCoeffType>::ProcessResponse(
   pack_matrix_time_ += matrix_elapsed;
 
   // The packing key's y_vec_h is shared by every shard and chunk below.
-  start_pack = absl::Now();
-  ASSIGN_OR_RETURN(ChunkedFft y_vec_h_fft,
-                   YVecHFft(params_.RlweParameters(), y_vec_h, *fft_ctx));
-  const auto y_fft_elapsed = absl::Now() - start_pack;
-  packing_time_ += y_fft_elapsed;
-  finalize_time_ += y_fft_elapsed;
+  ChunkedFft own_y_vec_h_fft;
+  if (y_vec_h_fft == nullptr) {
+    start_pack = absl::Now();
+    ASSIGN_OR_RETURN(own_y_vec_h_fft,
+                     YVecHFft(params_.RlweParameters(), y_vec_h, *fft_ctx));
+    const auto y_fft_elapsed = absl::Now() - start_pack;
+    packing_time_ += y_fft_elapsed;
+    finalize_time_ += y_fft_elapsed;
+    y_vec_h_fft = &own_y_vec_h_fft;
+  }
 
   for (int k = 0; k < entry_size_multiple; ++k) {
     start_pack = absl::Now();
@@ -323,7 +327,7 @@ PirServer<DbDataType, CoeffType, MatCoeffType>::ProcessResponse(
       ASSIGN_OR_RETURN(
           RlweCiphertext<CoeffType> pack_result,
           FinalizeMatrixPack(params_.RlweParameters(), chunk, b_agg_partial,
-                             y_vec_h_fft, t_vec_h_ffts_[k][i],
+                             *y_vec_h_fft, t_vec_h_ffts_[k][i],
                              preprocessed_outputs_[k][i].a_tilde_agg,
                              *fft_ctx));
       packed_ciphertexts.push_back(std::move(pack_result));

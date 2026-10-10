@@ -16,9 +16,11 @@
 #include <vector>
 
 #include "crypto/encryption.h"
+#include "crypto/lwes_to_rlwe.h"
 #include "crypto/pir/client/pir_client.h"
 #include "crypto/pir/server/pir_server.h"
 #include "crypto/pir/server/preprocessing_server.h"
+#include "crypto/polynomial_fft.h"
 #include "hwy/highway.h"
 #include "hwy/targets.h"
 #include "shell_encryption/prng/chacha_prng.h"
@@ -167,6 +169,7 @@ int Run(int argc, char** argv) {
             << ",\"Q\":" << q << ",\"C\":" << c << ",\"rows\":[";
   for (size_t i = 0; i < p; ++i) std::cout << (i ? "," : "") << rows[i];
   std::cout << "]}" << std::endl;
+  auto fft_ctx = Take(pm::FftContext::Create(11));  // log2(2048)
   for (size_t trial = 0; trial < size_t(warmups) + q * repeats; ++trial) {
     const bool warmup = trial < size_t(warmups);
     const size_t qi = warmup ? trial % q : (trial - warmups) / repeats;
@@ -205,6 +208,14 @@ int Run(int argc, char** argv) {
     double ingest_ms = Ms(server_begin), db_ms = 0, packing_ms = 0,
            encode_ms = 0;
     double matrix_ms = 0, finalize_ms = 0, modswitch_ms = 0, poly_eval_ms = 0;
+    // The key's y_vec_h is transformed once, not once per color; the
+    // transform counts towards the packing finalize phase.
+    const std::vector<Poly> y_vec_h(
+        request.packing_key.begin() + pack_gadget.num_digits,
+        request.packing_key.end());
+    const auto fft_begin = Clock::now();
+    const auto y_vec_h_fft = Take(pm::YVecHFft(rlwe_params, y_vec_h, *fft_ctx));
+    packing_ms = finalize_ms = Ms(fft_begin);
     std::string download;
     for (size_t slot = 0; slot < p; ++slot) {
       auto t = Clock::now();
@@ -218,7 +229,7 @@ int Run(int argc, char** argv) {
                  finalize_before = server->GetFinalizeTime();
       const auto modswitch_before = server->GetModswitchTime(),
                  eval_before = server->GetPolyEvalTime();
-      auto response = Take(server->ProcessResponse(request));
+      auto response = Take(server->ProcessResponse(request, &y_vec_h_fft));
       matrix_ms += absl::ToDoubleMilliseconds(server->GetPackMatrixTime() -
                                               matrix_before);
       finalize_ms += absl::ToDoubleMilliseconds(server->GetFinalizeTime() -
