@@ -62,9 +62,22 @@ All online and offline optimizations across **Gen 1** (`I5, I3a, I3b, I4`) and *
 
 ---
 
+## Multicore Online Server (`PIR_THREAD_CPUS`, Tiptoe adapter)
+
+`crypto/pir/benchmarking/tiptoe_workload.cc` can answer each request on several pinned threads. With `PIR_THREAD_CPUS` unset it behaves as before: one online thread, pinned by `PIR_ONLINE_CPU` if set, and `PIR_PREPROCESS_THREADS` offline jobs; the new setup fields then describe a single task (T = 1), and query records are unchanged.
+
+- **`PIR_THREAD_CPUS=c0,c1,...`**: one worker per listed logical CPU, so T = number of entries. The ids must be unique and inside the process affinity mask. The variable cannot be combined with `PIR_ONLINE_CPU`, and `PIR_PREPROCESS_THREADS` is ignored. Invalid settings exit nonzero with a message.
+- **Decomposition**: for P colors and C columns, $G = \min(P, T)$ color groups and $H = \min(C, \lfloor T/G \rfloor)$ column groups, each a balanced contiguous split with boundaries $\lfloor i n / k \rfloor$. Task $(g, h)$ runs on worker $w = gH + h$, pinned to `c_w`. Worker 0 is the main thread, which also runs the client. Workers persist across requests, and CPUs beyond the $G H$ tasks stay idle.
+- **Owner computes**: each worker pins itself, then builds one `PirServer` per color of its task holding only the task's columns (a column is one 4096-byte plaintext of each row). Per-column preprocessing does not depend on the other columns, so these servers return exactly the full table's ciphertexts for those columns, and their memory is local to the CPU that streams it. Every server, with its `FftContext` and timers, is used by a single thread.
+- **Per request**: the main thread decodes the key bundle and the selectors and computes `FFT(y_vec_h)` once (see Class 1). The workers only read them and encode their ciphertexts into per-(color, column group) buffers, which the main thread joins in color order, columns in order. The wire format and byte counts are those of the single-thread run.
+- **Records**: the setup record adds `online_threads` (T), `online_cpus`, `color_groups`, `column_groups` and `tasks` (`worker`, `cpu`, half-open `colors` and `columns` ranges). In threaded mode `offline_threads` is the number of tasks. In query records, `server_ms` is the main thread's wall time from request decode to serialized response. The `server_*_ms` phase fields follow the critical path: the serial phases (ingest; the shared FFT within finalize and packing; joining the buffers within encode) plus the phases of the slowest task. The threaded mode adds `server_cpu_ms`, the busy server time summed over all workers.
+- **Placement**: one thread per physical core (SMT siblings slow requests down), spread over both NUMA nodes (`pack_matrix` streams 32 MiB per (color, column), so DRAM bandwidth per node is the limit), and preferably not CPU 0.
+
+---
+
 ## Assumptions, Caveats & Tradeoffs
 
 - **Precomputed FFT & mask memory (`Gen 1 I3a`, `Gen 2 I1b`)**: `PrecomputeTVecHFfts` adds `512 KiB` per partition (`21 MiB` at `P=41`) and `a_mod_switched_t1_` adds `64 KiB` per partition (`2.6 MiB` at `P=41`). Note: Under glibc's default arena allocator, long-lived allocations after multi-threaded preprocessing can retain freed thread arenas in RSS; `tcmalloc`/`jemalloc` avoids this.
 - **Exactness budget (`Gen 1 I4`, `Gen 2 I2b`)**: `kFftExactProductBits = 44` is a conservative analytic bound ($53 - 8 - 1$) that holds with zero extra chunking at $d=2048$; `allow_paired_ifft` is guarded by $\log_2(N_{\text{polys}}) + \log_2 d + u_{\text{mag}} + v_{\text{mag}} \le 50.0$ (RMS error $\sim 0.0055 \ll 0.5$).
-- **Single-threaded execution per `PirServer` / `PirClient` instance (`Gen 1 I4`, `Gen 2 I2d`)**: Scratch buffers in `fft_ctx_` are reused across calls on the same instance; concurrent queries sharing a single `PirServer` shard should mark `fft_ctx_` `thread_local`.
+- **Single-threaded execution per `PirServer` / `PirClient` instance (`Gen 1 I4`, `Gen 2 I2d`)**: Scratch buffers in `fft_ctx_` are reused across calls on the same instance; concurrent queries sharing a single `PirServer` shard should mark `fft_ctx_` `thread_local`. The threaded Tiptoe adapter avoids this by giving every worker its own servers.
 - **Hardware generalization**: All matrix kernels (`I5, I3b, I3, I4`) use portable Google Highway SIMD (compiling natively to x86 AVX2/AVX-512 and ARM64 NEON/SVE). `I2c` uses `#if defined(__AVX2__) && defined(__FMA__)` with a clean portable scalar `#else` fallback.

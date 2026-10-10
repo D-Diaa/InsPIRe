@@ -1,18 +1,24 @@
 // Copyright 2026. Apache-2.0; uses the Google ReInsPIRe implementation.
 // A real multi-color t=1, p=65536 request, with a fresh shared secret per
-// request.
+// request. With PIR_THREAD_CPUS, pinned worker threads answer it as color
+// group x column group tasks (see improvements.md).
 #include <sched.h>
 
 #include <algorithm>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
+#include <exception>
 #include <fstream>
+#include <functional>
 #include <future>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "crypto/encryption.h"
@@ -84,10 +90,114 @@ Poly Decode(const std::string& wire, size_t& off, int degree, int bits) {
         "Polynomial parse failed");
   return Take(Poly::CreateFromProto(encoded, degree, bits));
 }
+void Pin(int cpu, const char* error) {
+  cpu_set_t mask;
+  CPU_ZERO(&mask);
+  CPU_SET(cpu, &mask);
+  Check(sched_setaffinity(0, sizeof(mask), &mask) == 0, error);
+}
+// PIR_THREAD_CPUS: comma-separated logical CPU ids, unique and inside the
+// process affinity mask. Worker w runs on the w-th.
+std::vector<int> ThreadCpus() {
+  const char* env = std::getenv("PIR_THREAD_CPUS");
+  if (!env) return {};
+  Check(!std::getenv("PIR_ONLINE_CPU"),
+        "PIR_THREAD_CPUS and PIR_ONLINE_CPU are mutually exclusive");
+  cpu_set_t allowed;
+  Check(sched_getaffinity(0, sizeof(allowed), &allowed) == 0,
+        "Failed to read the process affinity mask");
+  const std::string list = env;
+  std::vector<int> cpus;
+  for (size_t begin = 0; begin <= list.size();) {
+    const size_t end = std::min(list.find(',', begin), list.size());
+    const std::string id = list.substr(begin, end - begin);
+    Check(!id.empty() && id.size() <= 4 &&
+              id.find_first_not_of("0123456789") == std::string::npos,
+          "PIR_THREAD_CPUS must be a comma-separated list of CPU ids");
+    const int cpu = std::stoi(id);
+    Check(cpu < CPU_SETSIZE && CPU_ISSET(cpu, &allowed),
+          ("PIR_THREAD_CPUS: CPU " + id + " is not in the affinity mask")
+              .c_str());
+    Check(std::find(cpus.begin(), cpus.end(), cpu) == cpus.end(),
+          ("PIR_THREAD_CPUS: duplicate CPU " + id).c_str());
+    cpus.push_back(cpu);
+    begin = end + 1;
+  }
+  return cpus;
+}
+// Persistent fork-join workers: Run(job) calls job(w) for each of the n
+// workers, on the calling thread for w = 0, and returns once all calls have
+// returned, rethrowing the first exception.
+class Workers {
+ public:
+  explicit Workers(size_t n) : errors_(n) {
+    for (size_t w = 1; w < n; ++w)
+      threads_.emplace_back([this, w] { Loop(w); });
+  }
+  ~Workers() {
+    Start(nullptr);
+    for (auto& thread : threads_) thread.join();
+  }
+  void Run(const std::function<void(size_t)>& job) {
+    Start(&job);
+    Call(0);
+    std::unique_lock<std::mutex> lock(mu_);
+    done_.wait(lock, [this] { return busy_ == 0; });
+    for (const auto& error : errors_)
+      if (error) std::rethrow_exception(error);
+  }
+
+ private:
+  void Start(const std::function<void(size_t)>* job) {
+    {
+      std::lock_guard<std::mutex> lock(mu_);
+      job_ = job;
+      busy_ = threads_.size();
+      ++round_;
+    }
+    start_.notify_all();
+  }
+  void Call(size_t w) {
+    try {
+      (*job_)(w);
+    } catch (...) {
+      errors_[w] = std::current_exception();
+    }
+  }
+  void Loop(size_t w) {
+    for (size_t round = 1;; ++round) {
+      std::unique_lock<std::mutex> lock(mu_);
+      start_.wait(lock, [&] { return round_ >= round; });
+      if (!job_) return;
+      lock.unlock();
+      Call(w);
+      lock.lock();
+      if (--busy_ == 0) done_.notify_one();
+    }
+  }
+  std::mutex mu_;
+  std::condition_variable start_, done_;
+  const std::function<void(size_t)>* job_ = nullptr;
+  size_t round_ = 0, busy_ = 0;
+  std::vector<std::exception_ptr> errors_;
+  std::vector<std::thread> threads_;
+};
+// Colors [p0, p1) x columns [k0, k1) of every request, with one server per
+// color holding just those columns.
+struct Task {
+  size_t p0, p1, k0, k1;
+  std::vector<std::unique_ptr<Server>> servers;
+};
+// One task's server time for one request, in ms.
+struct Phases {
+  double db = 0, packing = 0, matrix = 0, finalize = 0, modswitch = 0,
+         poly_eval = 0, encode = 0, busy = 0;
+};
 int Run(int argc, char** argv) {
   Check(argc == 4, "usage: reinspire-workload WORKLOAD.bin WARMUPS REPEATS");
   Check(std::string(hwy::TargetName(HWY_STATIC_TARGET)) == "AVX2",
         "AVX2 backend required");
+  const std::vector<int> cpus = ThreadCpus();
   const int warmups = std::stoi(argv[2]), repeats = std::stoi(argv[3]);
   Check(warmups >= 0 && repeats > 0, "Invalid repetitions");
   std::ifstream input(argv[1], std::ios::binary);
@@ -110,13 +220,12 @@ int Run(int argc, char** argv) {
   const auto rlwe_params = Take(pm::RlweParams<uint64_t>::Create(
       2048, 1ULL << 52, 1ULL << 29, 1ULL << 18, 40));
   const pm::GadgetParams pack_gadget{19, 2}, eval_gadget{19, 3};
-  auto Params = [&](int m) {
+  auto Params = [&](int m, size_t cols) {
     return Take(pm::PirParams<uint64_t>::Create(rlwe_params, 65536, pack_gadget,
-                                                eval_gadget, m, 1, c));
+                                                eval_gadget, m, 1, cols));
   };
   const std::string packing_seed(32, 'K');
   std::vector<std::vector<uint16_t>> raw(p);
-  std::vector<std::unique_ptr<Server>> servers(p);
   for (size_t slot = 0; slot < p; ++slot) {
     raw[slot].resize(size_t(rows[slot]) * c * 2048);
     // Both native harnesses consume the same little-endian uint16 payloads.
@@ -126,26 +235,61 @@ int Run(int argc, char** argv) {
     for (size_t i = 0; i < raw[slot].size(); ++i)
       raw[slot][i] = uint16_t(bytes[2 * i]) | (uint16_t(bytes[2 * i + 1]) << 8);
   }
-  // Independent fixed-mask preprocessing can run concurrently. All online
-  // requests below still execute sequentially on one server thread.
-  const char* prep_env = std::getenv("PIR_PREPROCESS_THREADS");
-  const int requested_threads = prep_env ? std::stoi(prep_env) : 8;
-  Check(requested_threads > 0 && requested_threads <= 64,
-        "PIR_PREPROCESS_THREADS must be in [1,64]");
-  const size_t offline_threads = std::min(size_t(requested_threads), p);
-  auto offline_begin = Clock::now();
-  for (size_t first = 0; first < p; first += offline_threads) {
-    std::vector<std::future<void>> jobs;
-    for (size_t slot = first; slot < std::min(p, first + offline_threads);
-         ++slot) {
-      jobs.push_back(std::async(std::launch::async, [&, slot] {
-        auto params = Params(rows[slot]);
-        auto prep = Take(Prep::Create(&params, SelectorSeed(slot)));
-        auto data = Take(prep->Preprocess(raw[slot], packing_seed));
-        servers[slot] = Take(Server::Create(params, std::move(data)));
-      }));
+  // The server for columns [k0, k1) of table `slot`. A column is one
+  // 2048-coefficient plaintext of every row; per-column preprocessing does not
+  // depend on the other columns, so its responses match the full table's.
+  auto Build = [&](size_t slot, size_t k0, size_t k1) {
+    std::vector<uint16_t> slice;
+    if (k1 - k0 < c) {
+      for (size_t row = 0; row < size_t(rows[slot]); ++row)
+        slice.insert(slice.end(), raw[slot].begin() + (row * c + k0) * 2048,
+                     raw[slot].begin() + (row * c + k1) * 2048);
     }
-    for (auto& job : jobs) job.get();
+    auto params = Params(rows[slot], k1 - k0);
+    auto prep = Take(Prep::Create(&params, SelectorSeed(slot)));
+    auto data =
+        Take(prep->Preprocess(k1 - k0 < c ? slice : raw[slot], packing_seed));
+    return Take(Server::Create(params, std::move(data)));
+  };
+  // Task (g, h) covers color group g x column group h, both balanced
+  // contiguous splits, and runs on worker w = g * H + h.
+  const size_t threads = std::max<size_t>(cpus.size(), 1);
+  const size_t color_groups = std::min(p, threads);
+  const size_t column_groups = std::min(c, threads / color_groups);
+  std::vector<Task> tasks;
+  for (size_t g = 0; g < color_groups; ++g)
+    for (size_t h = 0; h < column_groups; ++h)
+      tasks.push_back({g * p / color_groups, (g + 1) * p / color_groups,
+                       h * c / column_groups, (h + 1) * c / column_groups});
+  Workers workers(tasks.size());
+  size_t offline_threads = tasks.size();
+  const auto offline_begin = Clock::now();
+  if (!cpus.empty()) {
+    // Owner computes: each worker pins itself and builds its own task's
+    // servers, so their memory is local to the CPU that serves them.
+    workers.Run([&](size_t w) {
+      Pin(cpus[w], "Failed to pin a worker to its PIR_THREAD_CPUS entry");
+      for (size_t slot = tasks[w].p0; slot < tasks[w].p1; ++slot)
+        tasks[w].servers.push_back(Build(slot, tasks[w].k0, tasks[w].k1));
+    });
+  } else {
+    // Independent fixed-mask preprocessing can run concurrently.
+    const char* prep_env = std::getenv("PIR_PREPROCESS_THREADS");
+    const int requested_threads = prep_env ? std::stoi(prep_env) : 8;
+    Check(requested_threads > 0 && requested_threads <= 64,
+          "PIR_PREPROCESS_THREADS must be in [1,64]");
+    offline_threads = std::min(size_t(requested_threads), p);
+    tasks[0].servers.resize(p);
+    for (size_t first = 0; first < p; first += offline_threads) {
+      std::vector<std::future<void>> jobs;
+      for (size_t slot = first; slot < std::min(p, first + offline_threads);
+           ++slot) {
+        jobs.push_back(std::async(std::launch::async, [&, slot] {
+          tasks[0].servers[slot] = Build(slot, 0, c);
+        }));
+      }
+      for (auto& job : jobs) job.get();
+    }
   }
   const double offline_ms = Ms(offline_begin);
   Check(input.peek() == std::char_traits<char>::eof(),
@@ -155,19 +299,31 @@ int Run(int argc, char** argv) {
   if (cpu_env) {
     Check(online_cpu >= 0 && online_cpu < CPU_SETSIZE,
           "Invalid PIR_ONLINE_CPU");
-    cpu_set_t mask;
-    CPU_ZERO(&mask);
-    CPU_SET(online_cpu, &mask);
-    Check(sched_setaffinity(0, sizeof(mask), &mask) == 0,
-          "Failed to bind online execution to PIR_ONLINE_CPU");
+    Pin(online_cpu, "Failed to bind online execution to PIR_ONLINE_CPU");
   }
+  const std::vector<int> online_cpus =
+      cpus.empty() && cpu_env ? std::vector<int>{online_cpu} : cpus;
   std::cout << "{\"type\":\"setup\",\"protocol\":\"reinspire\",\"backend\":"
-               "\"avx2\",\"online_threads\":1,\"plaintext_modulus\":65536,"
-               "\"interpolation_degree\":1,\"offline_ms\":"
+               "\"avx2\",\"online_threads\":"
+            << threads
+            << ",\"plaintext_modulus\":65536,\"interpolation_degree\":1,"
+               "\"offline_ms\":"
             << offline_ms << ",\"online_cpu\":" << online_cpu
             << ",\"offline_threads\":" << offline_threads << ",\"P\":" << p
             << ",\"Q\":" << q << ",\"C\":" << c << ",\"rows\":[";
   for (size_t i = 0; i < p; ++i) std::cout << (i ? "," : "") << rows[i];
+  std::cout << "],\"online_cpus\":[";
+  for (size_t i = 0; i < online_cpus.size(); ++i)
+    std::cout << (i ? "," : "") << online_cpus[i];
+  std::cout << "],\"color_groups\":" << color_groups
+            << ",\"column_groups\":" << column_groups << ",\"tasks\":[";
+  for (size_t w = 0; w < tasks.size(); ++w) {
+    std::cout << (w ? "," : "") << "{\"worker\":" << w << ",\"cpu\":"
+              << (w < online_cpus.size() ? std::to_string(online_cpus[w])
+                                         : "null")
+              << ",\"colors\":[" << tasks[w].p0 << "," << tasks[w].p1
+              << "],\"columns\":[" << tasks[w].k0 << "," << tasks[w].k1 << "]}";
+  }
   std::cout << "]}" << std::endl;
   auto fft_ctx = Take(pm::FftContext::Create(11));  // log2(2048)
   for (size_t trial = 0; trial < size_t(warmups) + q * repeats; ++trial) {
@@ -176,7 +332,7 @@ int Run(int argc, char** argv) {
     const int rep = warmup ? -1 : (trial - warmups) % repeats;
     const auto client_begin = Clock::now();
     auto client = Take(pm::PirClient<uint64_t>::Create(
-        Params(2048), Prng(SelectorSeed(0)),
+        Params(2048, c), Prng(SelectorSeed(0)),
         Prng(Take(::rlwe::ChaChaPrng::GenerateSeed()))));
     auto key_prng = Prng(packing_seed);
     auto keys = Take(client->CreatePackingKey(key_prng.get()));
@@ -201,13 +357,16 @@ int Run(int argc, char** argv) {
     const double client_query_ms = Ms(client_begin);
     const auto server_begin = Clock::now();
     size_t off = 0;
-    // One serialized key bundle decoded once, shared by all color servers.
+    // The serialized key bundle and every selector are decoded once and only
+    // read by the tasks.
     pm::PirRequest<uint64_t> request;
     for (int k = 0; k < 4; ++k)
       request.packing_key.push_back(Decode(upload, off, 2048, 52));
-    double ingest_ms = Ms(server_begin), db_ms = 0, packing_ms = 0,
-           encode_ms = 0;
-    double matrix_ms = 0, finalize_ms = 0, modswitch_ms = 0, poly_eval_ms = 0;
+    std::vector<std::vector<uint64_t>> queries(p);
+    for (size_t slot = 0; slot < p; ++slot)
+      queries[slot] = Decode(upload, off, rows[slot], 52).Coeffs();
+    Check(off == upload.size(), "Unconsumed request bytes");
+    const double ingest_ms = Ms(server_begin);
     // The key's y_vec_h is transformed once, not once per color; the
     // transform counts towards the packing finalize phase.
     const std::vector<Poly> y_vec_h(
@@ -215,42 +374,72 @@ int Run(int argc, char** argv) {
         request.packing_key.end());
     const auto fft_begin = Clock::now();
     const auto y_vec_h_fft = Take(pm::YVecHFft(rlwe_params, y_vec_h, *fft_ctx));
-    packing_ms = finalize_ms = Ms(fft_begin);
-    std::string download;
-    for (size_t slot = 0; slot < p; ++slot) {
-      auto t = Clock::now();
-      request.first_dimension_query =
-          Decode(upload, off, rows[slot], 52).Coeffs();
-      ingest_ms += Ms(t);
-      auto& server = servers[slot];
-      auto db_before = server->GetDbMultiplyTime(),
-           pack_before = server->GetPackingTime();
-      const auto matrix_before = server->GetPackMatrixTime(),
-                 finalize_before = server->GetFinalizeTime();
-      const auto modswitch_before = server->GetModswitchTime(),
-                 eval_before = server->GetPolyEvalTime();
-      auto response = Take(server->ProcessResponse(request, &y_vec_h_fft));
-      matrix_ms += absl::ToDoubleMilliseconds(server->GetPackMatrixTime() -
-                                              matrix_before);
-      finalize_ms += absl::ToDoubleMilliseconds(server->GetFinalizeTime() -
-                                                finalize_before);
-      modswitch_ms += absl::ToDoubleMilliseconds(server->GetModswitchTime() -
-                                                 modswitch_before);
-      poly_eval_ms +=
-          absl::ToDoubleMilliseconds(server->GetPolyEvalTime() - eval_before);
-      db_ms +=
-          absl::ToDoubleMilliseconds(server->GetDbMultiplyTime() - db_before);
-      packing_ms +=
-          absl::ToDoubleMilliseconds(server->GetPackingTime() - pack_before);
-      t = Clock::now();
-      for (const auto& ct : response.ciphertexts) {
-        Encode(ct.a, 29, download);
-        Encode(ct.b, 18, download);
+    const double fft_ms = Ms(fft_begin);
+    // Task w encodes color slot's responses for column group w % H into
+    // wires[slot * H + w % H].
+    std::vector<std::string> wires(p * column_groups);
+    std::vector<Phases> phases(tasks.size());
+    const auto tasks_begin = Clock::now();
+    workers.Run([&](size_t w) {
+      const auto task_begin = Clock::now();
+      Phases ms;
+      auto task_request = request;
+      for (size_t slot = tasks[w].p0; slot < tasks[w].p1; ++slot) {
+        task_request.first_dimension_query = queries[slot];
+        auto& server = tasks[w].servers[slot - tasks[w].p0];
+        auto db_before = server->GetDbMultiplyTime(),
+             pack_before = server->GetPackingTime();
+        const auto matrix_before = server->GetPackMatrixTime(),
+                   finalize_before = server->GetFinalizeTime();
+        const auto modswitch_before = server->GetModswitchTime(),
+                   eval_before = server->GetPolyEvalTime();
+        auto response =
+            Take(server->ProcessResponse(task_request, &y_vec_h_fft));
+        ms.matrix += absl::ToDoubleMilliseconds(server->GetPackMatrixTime() -
+                                                matrix_before);
+        ms.finalize += absl::ToDoubleMilliseconds(server->GetFinalizeTime() -
+                                                  finalize_before);
+        ms.modswitch += absl::ToDoubleMilliseconds(server->GetModswitchTime() -
+                                                   modswitch_before);
+        ms.poly_eval +=
+            absl::ToDoubleMilliseconds(server->GetPolyEvalTime() - eval_before);
+        ms.db +=
+            absl::ToDoubleMilliseconds(server->GetDbMultiplyTime() - db_before);
+        ms.packing +=
+            absl::ToDoubleMilliseconds(server->GetPackingTime() - pack_before);
+        const auto encode_begin = Clock::now();
+        std::string wire;
+        for (const auto& ct : response.ciphertexts) {
+          Encode(ct.a, 29, wire);
+          Encode(ct.b, 18, wire);
+        }
+        wires[slot * column_groups + w % column_groups] = std::move(wire);
+        ms.encode += Ms(encode_begin);
       }
-      encode_ms += Ms(t);
-    }
-    Check(off == upload.size(), "Unconsumed request bytes");
+      ms.busy = Ms(task_begin);
+      phases[w] = ms;
+    });
+    const double tasks_ms = Ms(tasks_begin);
+    // Responses in color order, and each color's columns in order.
+    const auto assemble_begin = Clock::now();
+    size_t download_size = 0;
+    for (const auto& wire : wires) download_size += wire.size();
+    std::string download;
+    download.reserve(download_size);
+    for (const auto& wire : wires) download += wire;
+    const double assemble_ms = Ms(assemble_begin);
     const double server_ms = Ms(server_begin);
+    // Phase fields follow the critical path: the serial phases plus those of
+    // the slowest task. server_cpu_ms adds up the busy time of all workers.
+    const Phases& slow = *std::max_element(
+        phases.begin(), phases.end(),
+        [](const Phases& a, const Phases& b) { return a.busy < b.busy; });
+    const double db_ms = slow.db, packing_ms = fft_ms + slow.packing,
+                 matrix_ms = slow.matrix, finalize_ms = fft_ms + slow.finalize,
+                 modswitch_ms = slow.modswitch, poly_eval_ms = slow.poly_eval,
+                 encode_ms = slow.encode + assemble_ms;
+    double server_cpu_ms = server_ms - tasks_ms;
+    for (const auto& task_ms : phases) server_cpu_ms += task_ms.busy;
     const auto decode_begin = Clock::now();
     off = 0;
     std::vector<std::vector<uint64_t>> recovered;
@@ -310,7 +499,9 @@ int Run(int argc, char** argv) {
               << ",\"upload_bytes\":" << upload.size()
               << ",\"download_bytes\":" << download.size()
               << ",\"total_communication_bytes\":"
-              << upload.size() + download.size() << "}" << std::endl;
+              << upload.size() + download.size();
+    if (!cpus.empty()) std::cout << ",\"server_cpu_ms\":" << server_cpu_ms;
+    std::cout << "}" << std::endl;
   }
   return 0;
 }
