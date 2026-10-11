@@ -630,6 +630,80 @@ TYPED_TEST(LwestoRlweTest,
   }
 }
 
+TEST(LwestoRlweNegacyclicTest,
+     FinalizeMatrixPackMatchesExactNttAtTiptoeParams) {
+  constexpr int kLogD = 11;
+  constexpr int kD = 1 << kLogD;  // 2048
+  constexpr int kLogQ = 52;
+  constexpr uint64_t kQ = uint64_t{1} << kLogQ;
+  constexpr uint64_t kMask = kQ - 1;
+  const GadgetParams gadget_params{.log_digit = 19, .num_digits = 2};
+
+  ASSERT_OK_AND_ASSIGN(auto params, RlweParams<uint64_t>::Create(kD, kQ, 40));
+  ASSERT_OK_AND_ASSIGN(auto ctx, Context::Create(kLogD));
+  ASSERT_OK_AND_ASSIGN(auto fft_ctx, FftContext::Create(kLogD));
+
+  absl::BitGen bitgen;
+  std::vector<uint64_t> b(kD);
+  std::vector<uint64_t> b_agg_partial(kD);
+  std::vector<uint64_t> t_vec_h_coeffs(kD);
+  std::vector<uint64_t> a_tilde_agg_coeffs(kD);
+  for (int i = 0; i < kD; ++i) {
+    b[i] = absl::Uniform<uint64_t>(bitgen, 0, kQ);
+    b_agg_partial[i] = absl::Uniform<uint64_t>(bitgen, 0, kQ);
+    t_vec_h_coeffs[i] = absl::Uniform<uint64_t>(bitgen, 0, kQ);
+    a_tilde_agg_coeffs[i] = absl::Uniform<uint64_t>(bitgen, 0, kQ);
+  }
+  ASSERT_OK_AND_ASSIGN(auto t_h_poly,
+                       Polynomial<uint64_t>::Create(t_vec_h_coeffs));
+  ASSERT_OK_AND_ASSIGN(auto t_h_mod, t_h_poly.LowBits(kLogQ));
+  ASSERT_OK_AND_ASSIGN(
+      auto t_vec_h,
+      t_h_mod.SignedGadgetInv(kLogQ, gadget_params.log_digit,
+                              gadget_params.num_digits));
+  ASSERT_OK_AND_ASSIGN(auto a_tilde_agg,
+                       Polynomial<uint64_t>::Create(a_tilde_agg_coeffs));
+
+  std::vector<Polynomial<uint64_t>> y_vec_h(gadget_params.num_digits);
+  for (int l = 0; l < gadget_params.num_digits; ++l) {
+    std::vector<uint64_t> y_coeffs(kD);
+    for (int i = 0; i < kD; ++i) {
+      y_coeffs[i] = absl::Uniform<uint64_t>(bitgen, 0, kQ);
+    }
+    ASSERT_OK_AND_ASSIGN(y_vec_h[l], Polynomial<uint64_t>::Create(y_coeffs));
+  }
+
+  // Negacyclic length-d FFT path via TVecHFft + YVecHFft + FinalizeMatrixPack.
+  ASSERT_OK_AND_ASSIGN(ChunkedFft y_vec_h_fft,
+                       YVecHFft(params, y_vec_h, *fft_ctx));
+  ASSERT_OK_AND_ASSIGN(ChunkedFft t_vec_h_fft,
+                       TVecHFft(t_vec_h, gadget_params, *fft_ctx));
+  ASSERT_EQ(t_vec_h_fft.ffts.size(),
+            static_cast<size_t>(gadget_params.num_digits));
+  ASSERT_EQ(t_vec_h_fft.ffts[0].size(), 1u);
+  EXPECT_EQ(t_vec_h_fft.ffts[0][0].size(), static_cast<size_t>(kD));
+
+  ASSERT_OK_AND_ASSIGN(
+      RlweCiphertext<uint64_t> packed,
+      FinalizeMatrixPack<uint64_t>(params, b, b_agg_partial, y_vec_h_fft,
+                                   t_vec_h_fft, a_tilde_agg, *fft_ctx));
+
+  // Reference exact NTT computation of b_agg = b + b_agg_partial + <y_h, t_vec_h>.
+  std::vector<uint64_t> expected_b(kD);
+  for (int i = 0; i < kD; ++i) {
+    expected_b[i] = (b[i] + b_agg_partial[i]) & kMask;
+  }
+  for (int l = 0; l < gadget_params.num_digits; ++l) {
+    ASSERT_OK_AND_ASSIGN(auto prod, y_vec_h[l].Mult(t_vec_h[l], ctx));
+    for (int i = 0; i < kD; ++i) {
+      expected_b[i] = (expected_b[i] + prod.Coeffs()[i]) & kMask;
+    }
+  }
+
+  EXPECT_EQ(packed.a.Coeffs(), a_tilde_agg.Coeffs());
+  EXPECT_EQ(packed.b.Coeffs(), expected_b);
+}
+
 }  // namespace
 }  // namespace v2
 }  // namespace rlwe

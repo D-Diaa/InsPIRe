@@ -131,45 +131,31 @@ int NumChunks(int bits, int chunk_bits) {
   return std::min((bits + chunk_bits - 1) / chunk_bits, max_chunks);
 }
 
-// Forward FFT (length 2d, zero-padded) of digit `chunk` of `coeffs`. The top
-// digit of a signed operand is sign-extended.
+// Forward twisted negacyclic FFT (length d) of digit `chunk` of `coeffs`. The
+// top digit of a signed operand is sign-extended.
 template <typename CoeffType>
 absl::Status DigitFft(const std::vector<CoeffType>& coeffs, int chunk,
                       int chunk_bits, int num_chunks, int bits, bool is_signed,
                       FftContext& ctx, Fft& out) {
   const int d = coeffs.size();
-  const int len2 = 2 * d;
   const int shift = chunk_bits * chunk;
   const int signed_width =
       (is_signed && chunk == num_chunks - 1) ? bits - shift : 0;
-  const uint64_t mask =
-      chunk_bits >= 64 ? ~uint64_t{0} : (uint64_t{1} << chunk_bits) - 1;
-  if (signed_width > 0) {
-    const int sign_shift = 64 - signed_width;
-    for (int j = 0; j < d; ++j) {
-      const uint64_t raw = (static_cast<uint64_t>(coeffs[j]) >> shift) & mask;
-      const double val = static_cast<double>(
-          static_cast<int64_t>(raw << sign_shift) >> sign_shift);
-      ctx.forward_in[j] = std::complex<double>(val, 0.0);
-    }
-  } else {
-    for (int j = 0; j < d; ++j) {
-      const uint64_t raw = (static_cast<uint64_t>(coeffs[j]) >> shift) & mask;
-      ctx.forward_in[j] = std::complex<double>(static_cast<double>(raw), 0.0);
-    }
+  const std::complex<double>* __restrict tw = ctx.twist.data();
+  std::complex<double>* __restrict fin = ctx.forward_in.data();
+  for (int j = 0; j < d; ++j) {
+    const double val = ChunkValue(coeffs[j], shift, chunk_bits, signed_width);
+    fin[j] = std::complex<double>(val * tw[j].real(), val * tw[j].imag());
   }
-  for (int j = d; j < len2; ++j) {
-    ctx.forward_in[j] = std::complex<double>(0.0, 0.0);
-  }
-  return fft::Fft(absl::MakeConstSpan(ctx.forward_in), absl::MakeSpan(out),
-                  *ctx.plan);
+  return fft::Fft(absl::MakeConstSpan(fin, d), absl::MakeSpan(out.data(), d),
+                  *ctx.negacyclic_plan);
 }
 
-// Simultaneous forward FFT (length 2d, zero-padded) of two real digit
-// polynomials via a single complex FFT z[j] = x[j] + i * y[j], followed by
-// conjugate-symmetry unpacking:
-//   X[k] = 0.5 * (Z[k] + conj(Z[2d - k]))
-//   Y[k] = -0.5i * (Z[k] - conj(Z[2d - k]))
+// Simultaneous forward twisted negacyclic FFT (length d) of two real digit
+// polynomials via a single complex FFT z[j] = (x[j] + i * y[j]) * w^j,
+// followed by conjugate-symmetry unpacking with kp = (d + 1 - k) mod d:
+//   X[k] = 0.5 * (Z[k] + conj(Z[kp]))
+//   Y[k] = -0.5i * (Z[k] - conj(Z[kp]))
 template <typename CoeffType>
 absl::Status TwoDigitsFft(const std::vector<CoeffType>& coeffs0, int chunk0,
                           const std::vector<CoeffType>& coeffs1, int chunk1,
@@ -177,43 +163,49 @@ absl::Status TwoDigitsFft(const std::vector<CoeffType>& coeffs0, int chunk0,
                           bool is_signed, FftContext& ctx, Fft& out0,
                           Fft& out1) {
   const int d = coeffs0.size();
-  const int len2 = 2 * d;
   const int shift0 = chunk_bits * chunk0;
   const int shift1 = chunk_bits * chunk1;
   const int signed_width0 =
       (is_signed && chunk0 == num_chunks - 1) ? bits - shift0 : 0;
   const int signed_width1 =
       (is_signed && chunk1 == num_chunks - 1) ? bits - shift1 : 0;
+  const std::complex<double>* __restrict tw = ctx.twist.data();
+  std::complex<double>* __restrict fin = ctx.forward_in.data();
+  std::complex<double>* __restrict fout = ctx.forward_out.data();
   for (int j = 0; j < d; ++j) {
     const double v0 =
         ChunkValue(coeffs0[j], shift0, chunk_bits, signed_width0);
     const double v1 =
         ChunkValue(coeffs1[j], shift1, chunk_bits, signed_width1);
-    ctx.forward_in[j] = std::complex<double>(v0, v1);
+    const double tw_r = tw[j].real();
+    const double tw_i = tw[j].imag();
+    fin[j] = std::complex<double>(v0 * tw_r - v1 * tw_i, v0 * tw_i + v1 * tw_r);
   }
-  for (int j = d; j < len2; ++j) {
-    ctx.forward_in[j] = std::complex<double>(0.0, 0.0);
+  RETURN_IF_ERROR(fft::Fft(absl::MakeConstSpan(fin, d),
+                           absl::MakeSpan(fout, d), *ctx.negacyclic_plan));
+  const std::complex<double>* __restrict z = fout;
+  if (d == 1) {
+    out0[0] = std::complex<double>(z[0].real(), 0.0);
+    out1[0] = std::complex<double>(z[0].imag(), 0.0);
+    return absl::OkStatus();
   }
-  RETURN_IF_ERROR(fft::Fft(absl::MakeConstSpan(ctx.forward_in),
-                           absl::MakeSpan(ctx.forward_out), *ctx.plan));
-  const std::complex<double>* __restrict z = ctx.forward_out.data();
-  out0[0] = std::complex<double>(z[0].real(), 0.0);
-  out1[0] = std::complex<double>(z[0].imag(), 0.0);
-  out0[d] = std::complex<double>(z[d].real(), 0.0);
-  out1[d] = std::complex<double>(z[d].imag(), 0.0);
-  for (int k = 1; k < d; ++k) {
+  auto unpack_pair = [&](int k, int kp) {
     const double ar = z[k].real();
     const double ai = z[k].imag();
-    const double br = z[len2 - k].real();
-    const double bi = z[len2 - k].imag();
+    const double br = z[kp].real();
+    const double bi = z[kp].imag();
     const double x_re = 0.5 * (ar + br);
     const double x_im = 0.5 * (ai - bi);
     const double y_re = 0.5 * (ai + bi);
     const double y_im = 0.5 * (br - ar);
     out0[k] = std::complex<double>(x_re, x_im);
-    out0[len2 - k] = std::complex<double>(x_re, -x_im);
+    out0[kp] = std::complex<double>(x_re, -x_im);
     out1[k] = std::complex<double>(y_re, y_im);
-    out1[len2 - k] = std::complex<double>(y_re, -y_im);
+    out1[kp] = std::complex<double>(y_re, -y_im);
+  };
+  unpack_pair(0, 1);
+  for (int k = 2; k <= d / 2; ++k) {
+    unpack_pair(k, d + 1 - k);
   }
   return absl::OkStatus();
 }
@@ -289,19 +281,18 @@ void AccumulateDigitProducts(const Fft* u, int u_num_chunks, const Fft* v,
   }
 }
 
-// Inverse-transforms each digit-pair accumulator, rounds it to integers and
-// folds the result modulo X^d + 1 at weight 2^(chunk_bits * (a + b)).
-// Because each accumulator is the spectrum of a real-valued sequence, pairs of
-// accumulators (A_0, A_1) are inverted simultaneously via a single complex
-// IFFT of A_0 + i * A_1 whenever the exactness budget has headroom for the
-// sqrt(2) norm increase.
+// Inverse-transforms each twisted negacyclic digit-pair accumulator, untwists,
+// rounds to integers and accumulates at weight 2^(chunk_bits * (a + b)).
+// Because each untwisted inverse transform is a real-valued sequence, pairs of
+// accumulators (A_0, A_1) are inverted simultaneously via a single length-d
+// complex IFFT of A_0 + i * A_1 whenever the exactness budget has headroom for
+// the sqrt(2) norm increase.
 template <typename CoeffType>
 absl::StatusOr<Polynomial<CoeffType>> RecombineDigitProducts(
     const std::vector<Fft>& accum, int u_num_chunks, int v_num_chunks,
     int chunk_bits, bool allow_paired_ifft, FftContext& ctx) {
   const int d = ctx.d;
-  const int len2 = 2 * d;
-  const double inv_len2 = 1.0 / static_cast<double>(len2);
+  const double inv_d = 1.0 / static_cast<double>(d);
   std::vector<CoeffType> result(d, 0);
 
   struct ActiveTerm {
@@ -319,6 +310,10 @@ absl::StatusOr<Polynomial<CoeffType>> RecombineDigitProducts(
     }
   }
 
+  const std::complex<double>* __restrict untw = ctx.untwist.data();
+  std::complex<double>* __restrict bin = ctx.backward_in.data();
+  std::complex<double>* __restrict bout = ctx.backward_out.data();
+
   size_t p = 0;
   if (allow_paired_ifft) {
     for (; p + 2 <= active.size(); p += 2) {
@@ -326,25 +321,24 @@ absl::StatusOr<Polynomial<CoeffType>> RecombineDigitProducts(
       const Fft& acc1 = accum[active[p + 1].idx];
       const int shift0 = active[p].shift;
       const int shift1 = active[p + 1].shift;
-      for (int j = 0; j < len2; ++j) {
-        ctx.backward_in[j] = std::complex<double>(
+      for (int j = 0; j < d; ++j) {
+        bin[j] = std::complex<double>(
             acc0[j].real() - acc1[j].imag(), acc0[j].imag() + acc1[j].real());
       }
-      RETURN_IF_ERROR(fft::Ifft(absl::MakeConstSpan(ctx.backward_in),
-                                absl::MakeSpan(ctx.backward_out), *ctx.plan));
+      RETURN_IF_ERROR(fft::Ifft(absl::MakeConstSpan(bin, d),
+                                absl::MakeSpan(bout, d),
+                                *ctx.negacyclic_plan));
       for (int j = 0; j < d; ++j) {
-        const int64_t v0_lo = static_cast<int64_t>(
-            std::nearbyint(ctx.backward_out[j].real() * inv_len2));
-        const int64_t v1_lo = static_cast<int64_t>(
-            std::nearbyint(ctx.backward_out[j].imag() * inv_len2));
-        const int64_t v0_hi = static_cast<int64_t>(
-            std::nearbyint(ctx.backward_out[j + d].real() * inv_len2));
-        const int64_t v1_hi = static_cast<int64_t>(
-            std::nearbyint(ctx.backward_out[j + d].imag() * inv_len2));
-        const CoeffType c0 =
-            static_cast<CoeffType>(static_cast<uint64_t>(v0_lo - v0_hi));
-        const CoeffType c1 =
-            static_cast<CoeffType>(static_cast<uint64_t>(v1_lo - v1_hi));
+        const double br = bout[j].real();
+        const double bi = bout[j].imag();
+        const double ur = untw[j].real();
+        const double ui = untw[j].imag();
+        const double re0 = br * ur - bi * ui;
+        const double re1 = br * ui + bi * ur;
+        const int64_t v0 = static_cast<int64_t>(std::nearbyint(re0 * inv_d));
+        const int64_t v1 = static_cast<int64_t>(std::nearbyint(re1 * inv_d));
+        const CoeffType c0 = static_cast<CoeffType>(static_cast<uint64_t>(v0));
+        const CoeffType c1 = static_cast<CoeffType>(static_cast<uint64_t>(v1));
         result[j] += (c0 << shift0) + (c1 << shift1);
       }
     }
@@ -353,15 +347,13 @@ absl::StatusOr<Polynomial<CoeffType>> RecombineDigitProducts(
   for (; p < active.size(); ++p) {
     const Fft& acc0 = accum[active[p].idx];
     const int shift0 = active[p].shift;
-    RETURN_IF_ERROR(fft::Ifft(absl::MakeConstSpan(acc0),
-                              absl::MakeSpan(ctx.backward_out), *ctx.plan));
+    RETURN_IF_ERROR(fft::Ifft(absl::MakeConstSpan(acc0.data(), d),
+                              absl::MakeSpan(bout, d), *ctx.negacyclic_plan));
     for (int j = 0; j < d; ++j) {
-      const int64_t v0_lo = static_cast<int64_t>(
-          std::nearbyint(ctx.backward_out[j].real() * inv_len2));
-      const int64_t v0_hi = static_cast<int64_t>(
-          std::nearbyint(ctx.backward_out[j + d].real() * inv_len2));
-      const CoeffType c0 =
-          static_cast<CoeffType>(static_cast<uint64_t>(v0_lo - v0_hi));
+      const double re0 =
+          bout[j].real() * untw[j].real() - bout[j].imag() * untw[j].imag();
+      const int64_t v0 = static_cast<int64_t>(std::nearbyint(re0 * inv_d));
+      const CoeffType c0 = static_cast<CoeffType>(static_cast<uint64_t>(v0));
       result[j] += (c0 << shift0);
     }
   }
@@ -517,14 +509,13 @@ absl::StatusOr<Polynomial<CoeffType>> Polynomial<CoeffType>::InnerProductFft(
     return absl::InvalidArgumentError("Polynomial vectors cannot be empty.");
   }
   int d = u[0].Len();
-  int len2 = 2 * d;
   for (size_t i = 0; i < u.size(); ++i) {
     if (u[i].Len() != d || v[i].Len() != d || d != ctx.d) {
       return absl::InvalidArgumentError(
           "Polynomial lengths or context mismatch.");
     }
   }
-  if (ctx.plan == nullptr) {
+  if (ctx.negacyclic_plan == nullptr) {
     return absl::InvalidArgumentError("FftContext plan is not initialized.");
   }
   if (u_bits <= 0 || v_bits <= 0 || chunk_bits <= 0 || chunk_bits > 63) {
@@ -543,9 +534,9 @@ absl::StatusOr<Polynomial<CoeffType>> Polynomial<CoeffType>::InnerProductFft(
   const bool allow_paired =
       (std::log2(u.size()) + std::log2(d) + eff_u_bits + eff_v_bits <= 50.0);
 
-  EnsureScratchSize(ctx.accum_scratch, u_num_chunks * v_num_chunks, len2);
-  EnsureScratchSize(ctx.u_ffts_scratch, 2 * u_num_chunks, len2);
-  EnsureScratchSize(ctx.v_ffts_scratch, 2 * v_num_chunks, len2);
+  EnsureScratchSize(ctx.accum_scratch, u_num_chunks * v_num_chunks, d);
+  EnsureScratchSize(ctx.u_ffts_scratch, 2 * u_num_chunks, d);
+  EnsureScratchSize(ctx.v_ffts_scratch, 2 * v_num_chunks, d);
 
   size_t i = 0;
   if (allow_paired) {
@@ -658,7 +649,7 @@ absl::StatusOr<ChunkedFft> Polynomial<CoeffType>::ToChunkedFft(
           "Polynomial lengths or context mismatch.");
     }
   }
-  if (ctx.plan == nullptr) {
+  if (ctx.negacyclic_plan == nullptr) {
     return absl::InvalidArgumentError("FftContext plan is not initialized.");
   }
   if (u_bits <= 0 || chunk_bits <= 0 || chunk_bits > 63) {
@@ -671,7 +662,7 @@ absl::StatusOr<ChunkedFft> Polynomial<CoeffType>::ToChunkedFft(
   result.max_chunk_magnitude_bits =
       u_is_signed ? std::min(chunk_bits, u_bits - 1)
                   : std::min(chunk_bits, u_bits);
-  result.ffts.assign(u.size(), std::vector<Fft>(num_chunks, Fft(2 * ctx.d)));
+  result.ffts.assign(u.size(), std::vector<Fft>(num_chunks, Fft(ctx.d)));
   const size_t total = u.size() * static_cast<size_t>(num_chunks);
   size_t idx = 0;
   for (; idx + 2 <= total; idx += 2) {
@@ -706,12 +697,12 @@ absl::StatusOr<Polynomial<CoeffType>> Polynomial<CoeffType>::InnerProductFft(
   if (u.chunk_bits != v.chunk_bits || u.chunk_bits <= 0 || u.chunk_bits > 63) {
     return absl::InvalidArgumentError("Invalid or mismatched chunk_bits.");
   }
-  if (ctx.plan == nullptr) {
+  if (ctx.negacyclic_plan == nullptr) {
     return absl::InvalidArgumentError("FftContext plan is not initialized.");
   }
   const int chunk_bits = u.chunk_bits;
   const int d = ctx.d;
-  const size_t len2 = 2 * d;
+  const size_t len_d = d;
   const int u_num_chunks = u.ffts[0].size();
   const int v_num_chunks = v.ffts[0].size();
   for (size_t i = 0; i < u.ffts.size(); ++i) {
@@ -720,12 +711,12 @@ absl::StatusOr<Polynomial<CoeffType>> Polynomial<CoeffType>::InnerProductFft(
       return absl::InvalidArgumentError("Inconsistent number of digits.");
     }
     for (const Fft& fft : u.ffts[i]) {
-      if (fft.size() != len2) {
+      if (fft.size() != len_d) {
         return absl::InvalidArgumentError("FFT length and context mismatch.");
       }
     }
     for (const Fft& fft : v.ffts[i]) {
-      if (fft.size() != len2) {
+      if (fft.size() != len_d) {
         return absl::InvalidArgumentError("FFT length and context mismatch.");
       }
     }
@@ -742,7 +733,7 @@ absl::StatusOr<Polynomial<CoeffType>> Polynomial<CoeffType>::InnerProductFft(
   const bool allow_paired =
       (std::log2(u.ffts.size()) + std::log2(d) + u_mag + v_mag <= 50.0);
 
-  EnsureScratchSize(ctx.accum_scratch, u_num_chunks * v_num_chunks, len2);
+  EnsureScratchSize(ctx.accum_scratch, u_num_chunks * v_num_chunks, len_d);
   for (size_t i = 0; i < u.ffts.size(); ++i) {
     AccumulateDigitProducts<CoeffType>(
         u.ffts[i].data(), u_num_chunks, v.ffts[i].data(), v_num_chunks,

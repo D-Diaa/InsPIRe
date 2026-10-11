@@ -17,6 +17,9 @@
 #include <cstddef>
 #include <cstdint>
 #include <cstring>
+#if defined(__AVX2__)
+#include <immintrin.h>
+#endif
 #include <string>
 #include <type_traits>
 #include <utility>
@@ -142,16 +145,13 @@ absl::StatusOr<Matrix<CoeffType>> Matrix<CoeffType>::CreateCondensed(
       return absl::InvalidArgumentError(
           "Columns must be a multiple of 4 to condense uint16_t.");
     }
-    condensed_flat.resize(static_cast<size_t>(rows) * (cols / 4), 0);
-    for (size_t i = 0; i < rows; ++i) {
-      for (size_t j = 0; j < cols / 4; ++j) {
-        uint64_t condensed_val = 0;
-        for (size_t k = 0; k < 4; ++k) {
-          condensed_val |= static_cast<uint64_t>(
-                               data[i * static_cast<size_t>(cols) + j * 4 + k])
-                           << (k * 16);
-        }
-        condensed_flat[i * static_cast<size_t>(cols / 4) + j] = condensed_val;
+    const size_t phys_cols = static_cast<size_t>(cols / 4);
+    condensed_flat.resize(static_cast<size_t>(rows) * phys_cols, 0);
+    if (rows > 0 && cols > 0) {
+      std::memcpy(condensed_flat.data(), data.data(),
+                  static_cast<size_t>(rows) * cols * sizeof(uint16_t));
+      for (uint64_t& w : condensed_flat) {
+        w ^= 0x8000800080008000ULL;
       }
     }
   } else if constexpr (std::is_same_v<CoeffType, int32_t>) {
@@ -287,69 +287,194 @@ absl::StatusOr<std::vector<uint64_t>> CondensedMultiply(
 
 // z[i] = sum_j m[i][j] * y[j] mod 2^64 for a uint16 matrix and a uint64 vector.
 //
-// Like the int32 kernel below, y is split once per call into unsigned halves,
-// y == y_lo + 2^32 * y_hi, so that for m < 2^16
+// In CreateCondensed<uint16_t>, each unsigned database entry m[i][j] in
+// [0, 65535] is centered to signed int16_t m'[i][j] = (m[i][j] ^ 0x8000) =
+// m[i][j] - 32768 in [-32768, 32767]. Thus:
+//   sum_j m[i][j] * y[j] == sum_j m'[i][j] * y[j] + 32768 * sum_j y[j] (mod 2^64)
+// where y_bias = 32768 * sum_j y[j] is computed once per call.
 //
-//   m * y == m * y_lo + 2^32 * (m * y_hi mod 2^32)  (mod 2^64):
-//
-// one unsigned 32x32->64 MulEven and one 32x32->32 Mul per product instead of
-// an emulated 64x64 multiply. A condensed lane holds m[4j..4j+3] as 16-bit
-// fields; viewed as uint32 lanes, m & 0xFFFF is (m[4j], m[4j+2]) and m >> 16
-// is (m[4j+1], m[4j+3]), so one Mul against the matching pair of y_hi values
-// covers two fields. MulEven only reads the even (low) uint32 lane, so the
-// upper two fields are first moved down by 32 bits. `y_split` holds six planes
-// of `condensed_cols` words: plane f < 4 is y_lo of field f, planes 4 and 5
-// are the (y_hi[4j], y_hi[4j+2]) and (y_hi[4j+1], y_hi[4j+3]) pairs.
-template <int kRows>
-HWY_INLINE void CondensedMultiplyUint16Rows(
-    const uint64_t* const* m_rows, int condensed_cols, size_t y_stride,
-    const uint64_t* HWY_RESTRICT y_split, uint64_t* HWY_RESTRICT result) {
-  namespace hn = hwy::HWY_NAMESPACE;
-  const hn::ScalableTag<uint64_t> d64;
-  const hn::Repartition<uint32_t, decltype(d64)> d32;
-  const size_t N = hn::Lanes(d64);
-  const auto fields_02 = hn::Set(d64, 0x0000FFFF0000FFFFULL);
-  const uint64_t* HWY_RESTRICT y_lo02 = y_split;
-  const uint64_t* HWY_RESTRICT y_lo13 = y_split + y_stride;
-  const uint64_t* HWY_RESTRICT y_hi02 = y_split + 2 * y_stride;
-  const uint64_t* HWY_RESTRICT y_hi13 = y_split + 3 * y_stride;
-  const size_t next_block = static_cast<size_t>(kRows) * condensed_cols;
+// Each query element (y[j] >> kShift) is decomposed once per call into signed
+// 14-bit digits d_k[j] in [-8191, +8192] at base 2^14:
+//   (y[j] >> kShift) == sum_{k=0}^{kNumDigits-1} d_k[j] * 2^{14k}.
+// Because m' in [-32768, +32767] and d_k in [-8191, +8192], each 16-lane
+// _mm256_madd_epi16(m', d_k) pairwise product lies in [-2^29, +2^29 - 16384],
+// so 4 consecutive vectors (64 columns) can be accumulated in int32_t without
+// overflow before widening to int64_t.
+template <int kNumDigits, int kShift>
+HWY_INLINE void PackQueryDigitsUint16(absl::Span<const uint64_t> vec,
+                                      int16_t* HWY_RESTRICT y_packed) {
+  const size_t num_vecs = vec.size() / 16;
+  for (size_t v_idx = 0; v_idx < num_vecs; ++v_idx) {
+    int16_t* HWY_RESTRICT out = y_packed + v_idx * kNumDigits * 16;
+    const uint64_t* HWY_RESTRICT in = vec.data() + v_idx * 16;
+    for (int lane = 0; lane < 16; ++lane) {
+      uint64_t v = in[lane] >> kShift;
+      HWY_UNROLL(kNumDigits)
+      for (int d = 0; d < kNumDigits; ++d) {
+        const uint64_t r = v & 0x3FFFULL;
+        const uint64_t borrow = (r > 8192ULL) ? 1ULL : 0ULL;
+        out[d * 16 + lane] = static_cast<int16_t>(
+            static_cast<int64_t>(r) - static_cast<int64_t>(borrow << 14));
+        v = (v >> 14) + borrow;
+      }
+    }
+  }
+}
 
-  hn::Vec<decltype(d64)> lo[kRows];
-  hn::Vec<decltype(d32)> hi[kRows];
+template <int kRows, int kNumDigits, int kShift>
+HWY_INLINE void CondensedMultiplyUint16Rows(
+    const uint64_t* const* m_rows, int condensed_cols,
+    const int16_t* HWY_RESTRICT y_packed, uint64_t y_bias,
+    uint64_t* HWY_RESTRICT result) {
+#if defined(__AVX2__)
+  const size_t next_block = static_cast<size_t>(kRows) * condensed_cols;
+  __m256i acc64[kRows][kNumDigits];
   for (int r = 0; r < kRows; ++r) {
-    lo[r] = hn::Zero(d64);
-    hi[r] = hn::Zero(d32);
+    for (int d = 0; d < kNumDigits; ++d) {
+      acc64[r][d] = _mm256_setzero_si256();
+    }
   }
 
-  for (size_t c = 0; c < static_cast<size_t>(condensed_cols); c += N) {
-    const auto yl02_64 = hn::LoadU(d64, y_lo02 + c);
-    const auto yl13_64 = hn::LoadU(d64, y_lo13 + c);
-    const auto yl0 = hn::BitCast(d32, yl02_64);
-    const auto yl2 = hn::BitCast(d32, hn::ShiftRight<32>(yl02_64));
-    const auto yl1 = hn::BitCast(d32, yl13_64);
-    const auto yl3 = hn::BitCast(d32, hn::ShiftRight<32>(yl13_64));
-    const auto yh02 = hn::BitCast(d32, hn::LoadU(d64, y_hi02 + c));
-    const auto yh13 = hn::BitCast(d32, hn::LoadU(d64, y_hi13 + c));
+  const int16_t* HWY_RESTRICT yp = y_packed;
+  size_t c = 0;
+  for (; c + 16 <= static_cast<size_t>(condensed_cols);
+       c += 16, yp += 4 * kNumDigits * 16) {
+    __m256i acc32[kRows][kNumDigits];
+    HWY_UNROLL(4)
+    for (int s = 0; s < 4; ++s) {
+      __m256i vm[kRows];
+      HWY_UNROLL(kRows)
+      for (int r = 0; r < kRows; ++r) {
+        if (s == 0 || s == 2) {
+          hwy::Prefetch(m_rows[r] + c + 4 * s + next_block);
+        }
+        vm[r] = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i*>(m_rows[r] + c + 4 * s));
+      }
+      HWY_UNROLL(kNumDigits)
+      for (int d = 0; d < kNumDigits; ++d) {
+        const __m256i vy = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i*>(yp + (s * kNumDigits + d) * 16));
+        HWY_UNROLL(kRows)
+        for (int r = 0; r < kRows; ++r) {
+          const __m256i prod = _mm256_madd_epi16(vm[r], vy);
+          acc32[r][d] = (s == 0) ? prod : _mm256_add_epi32(acc32[r][d], prod);
+        }
+      }
+    }
     HWY_UNROLL(kRows)
     for (int r = 0; r < kRows; ++r) {
-      hwy::Prefetch(m_rows[r] + c + next_block);
-      const auto m = hn::LoadU(d64, m_rows[r] + c);
-      const auto m02 = hn::BitCast(d32, hn::And(m, fields_02));
-      const auto m13 = hn::ShiftRight<16>(hn::BitCast(d32, m));
-      const auto m2 =
-          hn::BitCast(d32, hn::ShiftRight<32>(hn::BitCast(d64, m02)));
-      const auto m3 = hn::BitCast(d32, hn::ShiftRight<48>(m));
-      const auto p02 = hn::Add(hn::MulEven(m02, yl0), hn::MulEven(m2, yl2));
-      const auto p13 = hn::Add(hn::MulEven(m13, yl1), hn::MulEven(m3, yl3));
-      lo[r] = hn::Add(lo[r], hn::Add(p02, p13));
-      hi[r] = hn::Add(hi[r], hn::Add(hn::Mul(m02, yh02), hn::Mul(m13, yh13)));
+      HWY_UNROLL(kNumDigits)
+      for (int d = 0; d < kNumDigits; ++d) {
+        const __m256i lo64 =
+            _mm256_cvtepi32_epi64(_mm256_castsi256_si128(acc32[r][d]));
+        const __m256i hi64 =
+            _mm256_cvtepi32_epi64(_mm256_extracti128_si256(acc32[r][d], 1));
+        acc64[r][d] =
+            _mm256_add_epi64(acc64[r][d], _mm256_add_epi64(lo64, hi64));
+      }
+    }
+  }
+
+  const size_t rem_vecs = (static_cast<size_t>(condensed_cols) - c) / 4;
+  if (rem_vecs > 0) {
+    __m256i acc32[kRows][kNumDigits];
+    for (size_t s = 0; s < rem_vecs; ++s) {
+      __m256i vm[kRows];
+      HWY_UNROLL(kRows)
+      for (int r = 0; r < kRows; ++r) {
+        vm[r] = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i*>(m_rows[r] + c + 4 * s));
+      }
+      HWY_UNROLL(kNumDigits)
+      for (int d = 0; d < kNumDigits; ++d) {
+        const __m256i vy = _mm256_loadu_si256(
+            reinterpret_cast<const __m256i*>(yp + (s * kNumDigits + d) * 16));
+        HWY_UNROLL(kRows)
+        for (int r = 0; r < kRows; ++r) {
+          const __m256i prod = _mm256_madd_epi16(vm[r], vy);
+          acc32[r][d] = (s == 0) ? prod : _mm256_add_epi32(acc32[r][d], prod);
+        }
+      }
+    }
+    HWY_UNROLL(kRows)
+    for (int r = 0; r < kRows; ++r) {
+      HWY_UNROLL(kNumDigits)
+      for (int d = 0; d < kNumDigits; ++d) {
+        const __m256i lo64 =
+            _mm256_cvtepi32_epi64(_mm256_castsi256_si128(acc32[r][d]));
+        const __m256i hi64 =
+            _mm256_cvtepi32_epi64(_mm256_extracti128_si256(acc32[r][d], 1));
+        acc64[r][d] =
+            _mm256_add_epi64(acc64[r][d], _mm256_add_epi64(lo64, hi64));
+      }
     }
   }
 
   for (int r = 0; r < kRows; ++r) {
-    result[r] = hn::ReduceSum(d64, lo[r]) +
-                (static_cast<uint64_t>(hn::ReduceSum(d32, hi[r])) << 32);
+    __m256i total64 = (kShift == 0) ? acc64[r][0]
+                                    : _mm256_slli_epi64(acc64[r][0], kShift);
+    for (int d = 1; d < kNumDigits; ++d) {
+      total64 = _mm256_add_epi64(
+          total64, _mm256_slli_epi64(acc64[r][d], kShift + 14 * d));
+    }
+    const __m128i sum128 = _mm_add_epi64(_mm256_castsi256_si128(total64),
+                                         _mm256_extracti128_si256(total64, 1));
+    const __m128i hi64 = _mm_unpackhi_epi64(sum128, sum128);
+    const uint64_t row_sum =
+        static_cast<uint64_t>(_mm_cvtsi128_si64(_mm_add_epi64(sum128, hi64)));
+    result[r] = row_sum + y_bias;
+  }
+#else
+  for (int r = 0; r < kRows; ++r) {
+    uint64_t total = y_bias;
+    const int16_t* m_i16 = reinterpret_cast<const int16_t*>(m_rows[r]);
+    for (int v_idx = 0; v_idx < condensed_cols / 4; ++v_idx) {
+      const int16_t* yp = y_packed + v_idx * kNumDigits * 16;
+      for (int d = 0; d < kNumDigits; ++d) {
+        int64_t sum_d = 0;
+        for (int lane = 0; lane < 16; ++lane) {
+          sum_d += static_cast<int64_t>(m_i16[v_idx * 16 + lane]) *
+                   static_cast<int64_t>(yp[d * 16 + lane]);
+        }
+        total += static_cast<uint64_t>(sum_d) << (kShift + 14 * d);
+      }
+    }
+    result[r] = total;
+  }
+#endif
+}
+
+template <int kRowBlock, int kNumDigits, int kShift>
+HWY_INLINE void RunCondensedMultiplyUint16(const uint64_t* data, int rows,
+                                           int condensed_cols,
+                                           absl::Span<const uint64_t> vec,
+                                           uint64_t y_bias,
+                                           uint64_t* HWY_RESTRICT result) {
+  alignas(32) int16_t y_stack[2048 * kNumDigits];
+  std::vector<int16_t> y_heap;
+  int16_t* y_packed = y_stack;
+  if (vec.size() > 2048) {
+    y_heap.resize(vec.size() * kNumDigits);
+    y_packed = y_heap.data();
+  }
+  PackQueryDigitsUint16<kNumDigits, kShift>(vec, y_packed);
+
+  int i = 0;
+  if constexpr (kRowBlock > 1) {
+    for (; i + kRowBlock <= rows; i += kRowBlock) {
+      const uint64_t* m_rows[kRowBlock];
+      for (int r = 0; r < kRowBlock; ++r) {
+        m_rows[r] = &data[static_cast<size_t>(i + r) * condensed_cols];
+      }
+      CondensedMultiplyUint16Rows<kRowBlock, kNumDigits, kShift>(
+          m_rows, condensed_cols, y_packed, y_bias, &result[i]);
+    }
+  }
+  for (; i < rows; ++i) {
+    const uint64_t* m_row = &data[static_cast<size_t>(i) * condensed_cols];
+    CondensedMultiplyUint16Rows<1, kNumDigits, kShift>(
+        &m_row, condensed_cols, y_packed, y_bias, &result[i]);
   }
 }
 
@@ -372,50 +497,27 @@ absl::StatusOr<std::vector<uint64_t>> CondensedMultiply<uint16_t>(
   const int condensed_cols = original_cols / 4;
   const std::vector<uint64_t>& data = condensed_matrix.CondensedData();
 
-  // Pack 4 planes [y_lo02, y_lo13, y_hi02, y_hi13] with +8 uint64_t (1 cache
-  // line) stride padding so planes never alias to the same L1D cache set when
-  // condensed_cols * 8 is a multiple of 2 KiB or 4 KiB.
-  const size_t y_stride = static_cast<size_t>(condensed_cols) + 8;
-  std::vector<uint64_t> y_split(4 * y_stride);
-  uint64_t* HWY_RESTRICT y_lo02 = y_split.data();
-  uint64_t* HWY_RESTRICT y_lo13 = y_split.data() + y_stride;
-  uint64_t* HWY_RESTRICT y_hi02 = y_split.data() + 2 * y_stride;
-  uint64_t* HWY_RESTRICT y_hi13 = y_split.data() + 3 * y_stride;
-  for (int c = 0; c < condensed_cols; ++c) {
-    const uint64_t* y = &vec[4 * c];
-    y_lo02[c] = static_cast<uint32_t>(y[0]) | (y[2] << 32);
-    y_lo13[c] = static_cast<uint32_t>(y[1]) | (y[3] << 32);
-    y_hi02[c] = (y[0] >> 32) | (y[2] & ~0xFFFFFFFFULL);
-    y_hi13[c] = (y[1] >> 32) | (y[3] & ~0xFFFFFFFFULL);
+  uint64_t or_all = 0;
+  uint64_t y_sum = 0;
+  for (int j = 0; j < original_cols; ++j) {
+    or_all |= vec[j];
+    y_sum += vec[j];
   }
+  const uint64_t y_bias = y_sum << 15;
 
   std::vector<uint64_t> result(rows, 0);
-  int i = 0;
-  if (condensed_cols <= 256) {
-    constexpr int kRowBlock = 6;
-    for (; i + kRowBlock <= rows; i += kRowBlock) {
-      const uint64_t* m_rows[kRowBlock];
-      for (int r = 0; r < kRowBlock; ++r) {
-        m_rows[r] = &data[static_cast<size_t>(i + r) * condensed_cols];
-      }
-      CondensedMultiplyUint16Rows<kRowBlock>(m_rows, condensed_cols, y_stride,
-                                             y_split.data(), &result[i]);
-    }
+  if (((or_all & 0xFFFULL) == 0) && ((or_all >> 52) == 0)) {
+    // 40-bit modulus-switched selector in bits [12, 52): 3 signed 14-bit digits.
+    RunCondensedMultiplyUint16<1, 3, 12>(data.data(), rows, condensed_cols, vec,
+                                         y_bias, result.data());
+  } else if ((or_all >> 55) == 0) {
+    // Up to 55-bit query (including 52-bit RLWE modulus): 4 signed 14-bit digits.
+    RunCondensedMultiplyUint16<1, 4, 0>(data.data(), rows, condensed_cols, vec,
+                                        y_bias, result.data());
   } else {
-    constexpr int kRowBlock = 4;
-    for (; i + kRowBlock <= rows; i += kRowBlock) {
-      const uint64_t* m_rows[kRowBlock];
-      for (int r = 0; r < kRowBlock; ++r) {
-        m_rows[r] = &data[static_cast<size_t>(i + r) * condensed_cols];
-      }
-      CondensedMultiplyUint16Rows<kRowBlock>(m_rows, condensed_cols, y_stride,
-                                             y_split.data(), &result[i]);
-    }
-  }
-  for (; i < rows; ++i) {
-    const uint64_t* m_row = &data[static_cast<size_t>(i) * condensed_cols];
-    CondensedMultiplyUint16Rows<1>(&m_row, condensed_cols, y_stride,
-                                   y_split.data(), &result[i]);
+    // General 64-bit vector: 5 signed 14-bit digits.
+    RunCondensedMultiplyUint16<1, 5, 0>(data.data(), rows, condensed_cols, vec,
+                                        y_bias, result.data());
   }
   return result;
 }

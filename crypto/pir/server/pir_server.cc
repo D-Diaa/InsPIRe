@@ -49,6 +49,45 @@ namespace private_membership {
 namespace rlwe {
 namespace v2 {
 
+namespace {
+
+template <typename CoeffType>
+std::string PackCoefficientsToString(const std::vector<CoeffType>& coeffs,
+                                     int log_modulus) {
+  if (coeffs.empty() || log_modulus <= 0) return {};
+  const size_t total_bits = coeffs.size() * static_cast<size_t>(log_modulus);
+  const size_t expected_bytes = (total_bits + 7) / 8;
+  std::string bytes(expected_bytes, '\0');
+  uint8_t* __restrict out_ptr = reinterpret_cast<uint8_t*>(bytes.data());
+  const uint64_t mask = (log_modulus >= 64)
+                            ? ~uint64_t{0}
+                            : ((uint64_t{1} << log_modulus) - 1);
+  unsigned __int128 bit_buf = 0;
+  int bits_in_buf = 0;
+  size_t byte_idx = 0;
+  for (CoeffType coeff : coeffs) {
+    bit_buf |= static_cast<unsigned __int128>(static_cast<uint64_t>(coeff) &
+                                              mask)
+               << bits_in_buf;
+    bits_in_buf += log_modulus;
+    if (bits_in_buf >= 64) {
+      uint64_t word = static_cast<uint64_t>(bit_buf);
+      std::memcpy(out_ptr + byte_idx, &word, sizeof(uint64_t));
+      bit_buf >>= 64;
+      bits_in_buf -= 64;
+      byte_idx += 8;
+    }
+  }
+  while (bits_in_buf > 0) {
+    out_ptr[byte_idx++] = static_cast<uint8_t>(bit_buf & 0xFF);
+    bit_buf >>= 8;
+    bits_in_buf -= 8;
+  }
+  return bytes;
+}
+
+}  // namespace
+
 template <typename DbDataType, typename CoeffType, typename MatCoeffType>
 absl::StatusOr<std::unique_ptr<PirServer<DbDataType, CoeffType, MatCoeffType>>>
 PirServer<DbDataType, CoeffType, MatCoeffType>::Create(
@@ -123,14 +162,18 @@ PirServer<DbDataType, CoeffType, MatCoeffType>::Create(
                           *fft_ctx));
 
   std::vector<Polynomial<CoeffType>> a_mod_switched_t1;
+  std::vector<std::string> a_mod_switched_t1_packed;
   if (t == 1) {
     a_mod_switched_t1.reserve(entry_size_multiple);
+    a_mod_switched_t1_packed.reserve(entry_size_multiple);
+    const int log_q1 = params.RlweParameters().LogModulus1AfterSwitch();
     for (int k = 0; k < entry_size_multiple; ++k) {
       ASSIGN_OR_RETURN(
           auto a_ms,
           preprocessed_data.preprocessed_outputs[k][0].a_tilde_agg.Rescale(
-              params.RlweParameters().LogModulus(),
-              params.RlweParameters().LogModulus1AfterSwitch()));
+              params.RlweParameters().LogModulus(), log_q1));
+      a_mod_switched_t1_packed.push_back(
+          PackCoefficientsToString(a_ms.Coeffs(), log_q1));
       a_mod_switched_t1.push_back(std::move(a_ms));
     }
   }
@@ -139,6 +182,7 @@ PirServer<DbDataType, CoeffType, MatCoeffType>::Create(
       params, std::move(combined_db_matrix), std::move(combined_pack_matrix),
       std::move(preprocessed_data.preprocessed_outputs),
       std::move(t_vec_h_ffts), std::move(a_mod_switched_t1),
+      std::move(a_mod_switched_t1_packed),
       std::move(preprocessed_data.second_dim_a), std::move(fft_ctx)));
 }
 
@@ -193,7 +237,8 @@ PirServer<DbDataType, CoeffType, MatCoeffType>::EvalPoly(
 template <typename DbDataType, typename CoeffType, typename MatCoeffType>
 absl::StatusOr<PirResponse<CoeffType>>
 PirServer<DbDataType, CoeffType, MatCoeffType>::ProcessResponse(
-    const PirRequest<CoeffType>& request, const ChunkedFft* y_vec_h_fft) const {
+    const PirRequest<CoeffType>& request, const ChunkedFft* y_vec_h_fft,
+    bool skip_a_t1) const {
   const int d = params_.RlweParameters().Degree();
   const int t = params_.InterpolationDegree();
   const int entry_size_multiple = params_.EntrySizeMultiple();
@@ -307,7 +352,55 @@ PirServer<DbDataType, CoeffType, MatCoeffType>::ProcessResponse(
     y_vec_h_fft = &own_y_vec_h_fft;
   }
 
+  const int log_q = params_.RlweParameters().LogModulus();
+  const int log_q2 = params_.RlweParameters().LogModulus2AfterSwitch();
+  const CoeffType q_mask =
+      (log_q <= 0 || log_q >= static_cast<int>(8 * sizeof(CoeffType)))
+          ? ~CoeffType{0}
+          : ((CoeffType{1} << log_q) - 1);
+
   for (int k = 0; k < entry_size_multiple; ++k) {
+    if (t == 1) {
+      start_pack = absl::Now();
+      const size_t offset = static_cast<size_t>(k) * d;
+      ASSIGN_OR_RETURN(
+          Polynomial<CoeffType> b_agg,
+          Polynomial<CoeffType>::InnerProductFft(t_vec_h_ffts_[k][0],
+                                                 *y_vec_h_fft, *fft_ctx));
+      CoeffType* __restrict b_ptr = b_agg.MutableCoeffs().data();
+      const CoeffType* __restrict bp_ptr = b_prime_all.data() + offset;
+      const CoeffType* __restrict ba_ptr = b_agg_partial_all.data() + offset;
+      for (int m = 0; m < d; ++m) {
+        b_ptr[m] = (b_ptr[m] + bp_ptr[m] + ba_ptr[m]) & q_mask;
+      }
+      const auto finalize_elapsed = absl::Now() - start_pack;
+      packing_time_ += finalize_elapsed;
+      finalize_time_ += finalize_elapsed;
+
+      const auto start_modswitch = absl::Now();
+      if (log_q > log_q2) {
+        const int shift = log_q - log_q2;
+        const CoeffType half = CoeffType{1} << (shift - 1);
+        for (int m = 0; m < d; ++m) {
+          b_ptr[m] = static_cast<CoeffType>(
+              (static_cast<absl::uint128>(b_ptr[m]) + half) >> shift);
+        }
+      } else if (log_q < log_q2) {
+        const int shift = log_q2 - log_q;
+        for (int m = 0; m < d; ++m) {
+          b_ptr[m] <<= shift;
+        }
+      }
+      Polynomial<CoeffType> a_mod_switched;
+      if (!skip_a_t1 && static_cast<size_t>(k) < a_mod_switched_t1_.size()) {
+        a_mod_switched = a_mod_switched_t1_[k];
+      }
+      shard_responses.push_back(
+          {std::move(a_mod_switched), std::move(b_agg)});
+      modswitch_time_ += absl::Now() - start_modswitch;
+      continue;
+    }
+
     start_pack = absl::Now();
     // Stage 2: Packing
     std::vector<RlweCiphertext<CoeffType>> packed_ciphertexts;
@@ -852,14 +945,18 @@ PirServer<DbDataType, CoeffType, MatCoeffType>::LoadFromBuffer(
                    PrecomputeTVecHFfts(params, preprocessed_outputs, *fft_ctx));
 
   std::vector<Polynomial<CoeffType>> a_mod_switched_t1;
+  std::vector<std::string> a_mod_switched_t1_packed;
   if (params.InterpolationDegree() == 1) {
     a_mod_switched_t1.reserve(preprocessed_outputs.size());
+    a_mod_switched_t1_packed.reserve(preprocessed_outputs.size());
+    const int log_q1 = params.RlweParameters().LogModulus1AfterSwitch();
     for (size_t k = 0; k < preprocessed_outputs.size(); ++k) {
       ASSIGN_OR_RETURN(
           auto a_ms,
           preprocessed_outputs[k][0].a_tilde_agg.Rescale(
-              params.RlweParameters().LogModulus(),
-              params.RlweParameters().LogModulus1AfterSwitch()));
+              params.RlweParameters().LogModulus(), log_q1));
+      a_mod_switched_t1_packed.push_back(
+          PackCoefficientsToString(a_ms.Coeffs(), log_q1));
       a_mod_switched_t1.push_back(std::move(a_ms));
     }
   }
@@ -867,8 +964,8 @@ PirServer<DbDataType, CoeffType, MatCoeffType>::LoadFromBuffer(
   return absl::WrapUnique(new PirServer<DbDataType, CoeffType, MatCoeffType>(
       params, std::move(combined_db_matrix), std::move(combined_pack_matrix),
       std::move(preprocessed_outputs), std::move(t_vec_h_ffts),
-      std::move(a_mod_switched_t1), std::move(second_dim_query_a),
-      std::move(fft_ctx)));
+      std::move(a_mod_switched_t1), std::move(a_mod_switched_t1_packed),
+      std::move(second_dim_query_a), std::move(fft_ctx)));
 }
 
 template <typename DbDataType, typename CoeffType, typename MatCoeffType>

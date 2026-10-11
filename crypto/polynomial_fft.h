@@ -86,7 +86,7 @@ struct FftContext {
 struct ChunkedFft {
   int chunk_bits = 0;
   int max_chunk_magnitude_bits = 0;
-  // ffts[i][c] is the length-2d FFT of digit c of polynomial i, zero-padded.
+  // ffts[i][c] is the length-d negacyclic FFT of digit c of polynomial i.
   std::vector<std::vector<std::vector<std::complex<double>>>> ffts;
 };
 

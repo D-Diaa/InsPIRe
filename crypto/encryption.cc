@@ -102,24 +102,33 @@ absl::StatusOr<Polynomial<CoeffType>> SampleSecretKey(
     const RlweParams<CoeffType>& params, ::rlwe::SecurePrng& prng) {
   const int d = params.Degree();
   const CoeffType q = params.Modulus();
+  const CoeffType minus = q - 1;
 
-  using ModularInt = ::rlwe::MontgomeryInt<::rlwe::Uint32>;
-  ASSIGN_OR_RETURN(auto mod_params, ModularInt::Params::Create(3));
-
-  ASSIGN_OR_RETURN(
-      std::vector<ModularInt> ternary_coeffs,
-      ::rlwe::SampleFromUniformTernary<ModularInt>(d, mod_params.get(), &prng));
-
+  // Direct bitsliced rejection sampling on {-1, 0, 1} mod q without
+  // MontgomeryInt conversion overhead.
   std::vector<CoeffType> coeffs(d);
-  for (int i = 0; i < d; ++i) {
-    uint32_t val = ternary_coeffs[i].ExportInt(mod_params.get());
-    if (val > 2) {
-      return absl::InternalError("Invalid ternary sample from rlwe library.");
+  int offset = 0;
+  while (offset < d) {
+    const int num_filled = std::min(d - offset, 8);
+    uint8_t missing_bits =
+        num_filled < 8 ? static_cast<uint8_t>((1u << num_filled) - 1u) : 0xFFu;
+    uint8_t encoding_bits0 = 0;
+    uint8_t encoding_bits1 = 0;
+    while (missing_bits != 0) {
+      ASSIGN_OR_RETURN(uint8_t rand_bits0, prng.Rand8());
+      ASSIGN_OR_RETURN(uint8_t rand_bits1, prng.Rand8());
+      encoding_bits0 ^= (rand_bits0 & missing_bits);
+      encoding_bits1 ^= (rand_bits1 & missing_bits);
+      missing_bits = static_cast<uint8_t>(~encoding_bits0 & encoding_bits1);
     }
-    // Constant-time mapping of {2, 0, 1} to {-1, 0, 1} mod q.
-    CoeffType is_one_mask = -static_cast<CoeffType>(val == 1);
-    CoeffType is_two_mask = -static_cast<CoeffType>(val == 2);
-    coeffs[i] = (is_one_mask & 1) | (is_two_mask & (q - 1));
+    for (int i = 0; i < num_filled; ++i) {
+      const uint8_t bit0 = (encoding_bits0 >> i) & 1u;
+      const uint8_t bit1 = (encoding_bits1 >> i) & 1u;
+      const CoeffType is_plus = -static_cast<CoeffType>(bit0 & ~bit1);
+      const CoeffType is_minus = -static_cast<CoeffType>(bit0 & bit1);
+      coeffs[offset + i] = (is_plus & CoeffType{1}) | (is_minus & minus);
+    }
+    offset += num_filled;
   }
 
   return Polynomial<CoeffType>::Create(std::move(coeffs));
@@ -130,7 +139,7 @@ absl::StatusOr<std::vector<Polynomial<CoeffType>>> SampleAComponents(
     const RlweParams<CoeffType>& params, int num_a_components,
     ::rlwe::SecurePrng& prng) {
   const int d = params.Degree();
-  const CoeffType q = params.Modulus();
+  const CoeffType q_mask = params.Modulus() - 1;
   if (num_a_components <= 0) {
     return absl::InvalidArgumentError("num_a_components must be positive.");
   }
@@ -140,7 +149,7 @@ absl::StatusOr<std::vector<Polynomial<CoeffType>>> SampleAComponents(
     std::vector<CoeffType> coeffs(d);
     for (int j = 0; j < d; ++j) {
       ASSIGN_OR_RETURN(auto r64, prng.Rand64());
-      coeffs[j] = static_cast<CoeffType>(r64) & (q - 1);
+      coeffs[j] = static_cast<CoeffType>(r64) & q_mask;
     }
     ASSIGN_OR_RETURN(a_components[i],
                      Polynomial<CoeffType>::Create(std::move(coeffs)));
@@ -151,6 +160,99 @@ absl::StatusOr<std::vector<Polynomial<CoeffType>>> SampleAComponents(
 
 namespace {
 
+template <typename CoeffType>
+absl::StatusOr<std::vector<CoeffType>> SampleCenteredBinomialAndSubtract(
+    const RlweParams<CoeffType>& params, const Polynomial<CoeffType>& as,
+    int num_coeffs, ::rlwe::SecurePrng& prng) {
+  const int d = params.Degree();
+  if (as.Len() != d) {
+    return absl::InvalidArgumentError("as length must match degree.");
+  }
+  if (num_coeffs < 0 || num_coeffs > d) {
+    return absl::InvalidArgumentError("num_coeffs out of bounds.");
+  }
+  const int variance = params.Variance();
+  if (variance <= 0 ||
+      static_cast<uint64_t>(variance) > ::rlwe::kMaxVariance) {
+    return absl::InvalidArgumentError("variance exceeds kMaxVariance.");
+  }
+
+  const CoeffType q_mask = params.Modulus() - 1;
+  const CoeffType* __restrict as_coeffs = as.Coeffs().data();
+  std::vector<CoeffType> b_coeffs(num_coeffs);
+  CoeffType* __restrict b_ptr = b_coeffs.data();
+
+  if (variance == 40) {
+    // Bit-sliced fast path for variance = 40 (k = 80 bits per binomial draw =
+    // 160 bits per coefficient = 5 uint64_t words per 2 coefficients).
+    int i = 0;
+    for (; i + 1 < num_coeffs; i += 2) {
+      ASSIGN_OR_RETURN(uint64_t w0, prng.Rand64());
+      ASSIGN_OR_RETURN(uint64_t w1, prng.Rand64());
+      ASSIGN_OR_RETURN(uint64_t w2, prng.Rand64());
+      ASSIGN_OR_RETURN(uint64_t w3, prng.Rand64());
+      ASSIGN_OR_RETURN(uint64_t w4, prng.Rand64());
+
+      const int x0 =
+          absl::popcount(w0) + absl::popcount(static_cast<uint16_t>(w4));
+      const int y0 =
+          absl::popcount(w1) + absl::popcount(static_cast<uint16_t>(w4 >> 16));
+      const CoeffType e0 =
+          static_cast<CoeffType>(static_cast<int64_t>(x0 - y0));
+      b_ptr[i] = (e0 - as_coeffs[i]) & q_mask;
+
+      const int x1 =
+          absl::popcount(w2) + absl::popcount(static_cast<uint16_t>(w4 >> 32));
+      const int y1 =
+          absl::popcount(w3) + absl::popcount(static_cast<uint16_t>(w4 >> 48));
+      const CoeffType e1 =
+          static_cast<CoeffType>(static_cast<int64_t>(x1 - y1));
+      b_ptr[i + 1] = (e1 - as_coeffs[i + 1]) & q_mask;
+    }
+    if (i < num_coeffs) {
+      ASSIGN_OR_RETURN(uint64_t w0, prng.Rand64());
+      ASSIGN_OR_RETURN(uint64_t w1, prng.Rand64());
+      ASSIGN_OR_RETURN(uint64_t w2, prng.Rand64());
+      const int x0 =
+          absl::popcount(w0) + absl::popcount(static_cast<uint16_t>(w2));
+      const int y0 =
+          absl::popcount(w1) + absl::popcount(static_cast<uint16_t>(w2 >> 16));
+      const CoeffType e0 =
+          static_cast<CoeffType>(static_cast<int64_t>(x0 - y0));
+      b_ptr[i] = (e0 - as_coeffs[i]) & q_mask;
+    }
+    return b_coeffs;
+  }
+
+  for (int i = 0; i < num_coeffs; ++i) {
+    int k = variance << 1;
+    int diff = 0;
+    while (k > 0) {
+      if (k >= 64) {
+        ASSIGN_OR_RETURN(uint64_t r0, prng.Rand64());
+        ASSIGN_OR_RETURN(uint64_t r1, prng.Rand64());
+        diff += absl::popcount(r0) - absl::popcount(r1);
+        k -= 64;
+      } else if (k >= 8) {
+        ASSIGN_OR_RETURN(uint8_t r0, prng.Rand8());
+        ASSIGN_OR_RETURN(uint8_t r1, prng.Rand8());
+        diff += absl::popcount(r0) - absl::popcount(r1);
+        k -= 8;
+      } else {
+        const uint8_t mask = static_cast<uint8_t>((1u << k) - 1u);
+        ASSIGN_OR_RETURN(uint8_t r0, prng.Rand8());
+        ASSIGN_OR_RETURN(uint8_t r1, prng.Rand8());
+        diff += absl::popcount(static_cast<uint8_t>(r0 & mask)) -
+                absl::popcount(static_cast<uint8_t>(r1 & mask));
+        break;
+      }
+    }
+    const CoeffType e_val = static_cast<CoeffType>(static_cast<int64_t>(diff));
+    b_ptr[i] = (e_val - as_coeffs[i]) & q_mask;
+  }
+  return b_coeffs;
+}
+
 // Generates (a, b = e - a * s mod q) for every a in `a_components`, with the
 // product a * s supplied by `multiply_by_secret`.
 template <typename CoeffType, typename MultiplyBySecret>
@@ -159,12 +261,6 @@ absl::StatusOr<std::vector<RlweSample<CoeffType>>> GenerateRlweSamplesImpl(
     const std::vector<Polynomial<CoeffType>>& a_components,
     ::rlwe::SecurePrng& prng, MultiplyBySecret&& multiply_by_secret) {
   const int d = params.Degree();
-  const CoeffType q = params.Modulus();
-  const int variance = params.Variance();
-
-  using ModularInt = ::rlwe::MontgomeryInt<::rlwe::Uint32>;
-  ASSIGN_OR_RETURN(auto mod_params_large,
-                   ModularInt::Params::Create((1u << 30) - 1));
 
   std::vector<RlweSample<CoeffType>> samples;
   samples.reserve(a_components.size());
@@ -176,31 +272,11 @@ absl::StatusOr<std::vector<RlweSample<CoeffType>>> GenerateRlweSamplesImpl(
     }
 
     ASSIGN_OR_RETURN(auto as, multiply_by_secret(a));
-
-    ASSIGN_OR_RETURN(std::vector<ModularInt> e_coeffs_large,
-                     ::rlwe::SampleFromErrorDistribution<ModularInt>(
-                         d, variance, &prng, mod_params_large.get()));
-
-    const ::rlwe::Uint32 modulus = mod_params_large->modulus;
-    std::vector<CoeffType> b_coeffs(d);
-    for (int i = 0; i < d; ++i) {
-      ::rlwe::Uint32 val = e_coeffs_large[i].ExportInt(mod_params_large.get());
-      // Constant-time representation mapping to avoid branching on secret
-      // noise.
-      bool is_negative = val > (modulus >> 1);
-      CoeffType mask = -static_cast<CoeffType>(is_negative);
-      CoeffType e_val_neg = q - (modulus - val);
-      CoeffType e_val_pos = val;
-      CoeffType e_val = (mask & e_val_neg) | (~mask & e_val_pos);
-
-      // mod q is equivalent to bitwise AND with q - 1 since q is a power of
-      // two.
-      b_coeffs[i] = (e_val - as.Coeffs()[i]) & (q - 1);
-    }
-
+    ASSIGN_OR_RETURN(auto b_coeffs,
+                     SampleCenteredBinomialAndSubtract(params, as, d, prng));
     ASSIGN_OR_RETURN(auto b,
                      Polynomial<CoeffType>::Create(std::move(b_coeffs)));
-    samples.push_back({a, b});
+    samples.push_back({a, std::move(b)});
   }
 
   return samples;
@@ -406,15 +482,40 @@ absl::StatusOr<std::vector<CoeffType>> DecryptAfterModulusSwitchImpl(
   }
 
   ASSIGN_OR_RETURN(auto as, multiply_by_secret(ciphertext.a));
+  const int log_q1 = params.LogModulus1AfterSwitch();
+  const int log_q2 = params.LogModulus2AfterSwitch();
+  if (absl::has_single_bit(static_cast<uint64_t>(plaintext_modulus)) &&
+      log_q1 >= log_q2 &&
+      log_q2 >= absl::bit_width(static_cast<uint64_t>(plaintext_modulus)) - 1) {
+    const int log_p =
+        absl::bit_width(static_cast<uint64_t>(plaintext_modulus)) - 1;
+    const int b_shift = log_q1 - log_q2;
+    const int m_shift = log_q1 - log_p;
+    const CoeffType half = m_shift > 0 ? (CoeffType{1} << (m_shift - 1)) : 0;
+    const CoeffType q1_mask =
+        log_q1 >= static_cast<int>(8 * sizeof(CoeffType))
+            ? ~CoeffType{0}
+            : ((CoeffType{1} << log_q1) - 1);
+    const CoeffType p_mask = plaintext_modulus - 1;
+    const auto& as_coeffs = as.Coeffs();
+    const auto& b_coeffs = ciphertext.b.Coeffs();
+    std::vector<CoeffType> m_coeffs(d);
+    for (int i = 0; i < d; ++i) {
+      const CoeffType noisy_val =
+          (as_coeffs[i] + (b_coeffs[i] << b_shift)) & q1_mask;
+      m_coeffs[i] = ((noisy_val + half) >> m_shift) & p_mask;
+    }
+    return m_coeffs;
+  }
+
   // mod by q1
-  ASSIGN_OR_RETURN(as, as.LowBits(params.LogModulus1AfterSwitch()));
+  ASSIGN_OR_RETURN(as, as.LowBits(log_q1));
   // scale as from q1 to q2
-  ASSIGN_OR_RETURN(as, as.Rescale(params.LogModulus1AfterSwitch(),
-                                  params.LogModulus2AfterSwitch()));
+  ASSIGN_OR_RETURN(as, as.Rescale(log_q1, log_q2));
 
   ASSIGN_OR_RETURN(auto noisy_m, ciphertext.b.Add(as));
   // mod by q2
-  ASSIGN_OR_RETURN(noisy_m, noisy_m.LowBits(params.LogModulus2AfterSwitch()));
+  ASSIGN_OR_RETURN(noisy_m, noisy_m.LowBits(log_q2));
 
   CoeffType modulus2 = 1;
   if (params.LogModulus2AfterSwitch() < 8 * sizeof(CoeffType)) {
@@ -424,7 +525,6 @@ absl::StatusOr<std::vector<CoeffType>> DecryptAfterModulusSwitchImpl(
   }
 
   std::vector<CoeffType> m_coeffs(d);
-  const int log_q2 = params.LogModulus2AfterSwitch();
   if (absl::has_single_bit(static_cast<uint64_t>(plaintext_modulus)) &&
       log_q2 >= absl::bit_width(static_cast<uint64_t>(plaintext_modulus)) - 1) {
     const int log_p =

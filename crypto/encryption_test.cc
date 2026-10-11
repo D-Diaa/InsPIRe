@@ -992,6 +992,121 @@ TEST(EncryptionFftTest, EncryptModulusSwitchDecryptFftAtTiptoeParams) {
   EXPECT_EQ(decrypted_ntt, message);
 }
 
+// Single-rounding q1-precision DecryptAfterModulusSwitch at kLogQ1 = 25,
+// kLogQ2 = 18, p = 2^16.
+TEST(EncryptionFftTest,
+     EncryptModulusSwitchDecryptSingleRoundingAtLogQ1_25) {
+  const int log_d = 11;
+  const int d = 1 << log_d;
+  const uint64_t p = 65536;
+  ASSERT_OK_AND_ASSIGN(
+      auto params, RlweParams<uint64_t>::Create(
+                       d, uint64_t{1} << 52, uint64_t{1} << 25,
+                       uint64_t{1} << 18, 40));
+  ASSERT_OK_AND_ASSIGN(auto seed,
+                       ::rlwe::SingleThreadChaChaPrng::GenerateSeed());
+  ASSERT_OK_AND_ASSIGN(auto prng, ::rlwe::SingleThreadChaChaPrng::Create(seed));
+  ASSERT_OK_AND_ASSIGN(auto s, SampleSecretKey<uint64_t>(params, *prng));
+  ASSERT_OK_AND_ASSIGN(auto fft_ctx, FftContext::Create(log_d));
+  ASSERT_OK_AND_ASSIGN(auto s_fft, FftPolynomial::Create(s, *fft_ctx,
+                                                         /*bits=*/2,
+                                                         /*is_signed=*/true));
+  ASSERT_OK_AND_ASSIGN(auto a_components,
+                       SampleAComponents<uint64_t>(params, 1, *prng));
+  ASSERT_OK_AND_ASSIGN(auto samples,
+                       GenerateRlweSamples<uint64_t>(params, s_fft,
+                                                     a_components, *prng,
+                                                     *fft_ctx));
+
+  std::vector<uint64_t> message(d);
+  for (int i = 0; i < d; ++i) {
+    message[i] = (i * 7919) % p;
+  }
+  ASSERT_OK_AND_ASSIGN(
+      auto ct, EncryptFromRlweSample<uint64_t>(params, p, samples[0], message));
+  ASSERT_OK_AND_ASSIGN(auto a_switched,
+                       ct.a.Rescale(params.LogModulus(),
+                                    params.LogModulus1AfterSwitch()));
+  ASSERT_OK_AND_ASSIGN(auto b_switched,
+                       ct.b.Rescale(params.LogModulus(),
+                                    params.LogModulus2AfterSwitch()));
+  const RlweCiphertext<uint64_t> switched{a_switched, b_switched};
+
+  ASSERT_OK_AND_ASSIGN(
+      auto decrypted,
+      DecryptAfterModulusSwitch(params, p, switched, s_fft, *fft_ctx));
+  EXPECT_EQ(decrypted, message);
+  ASSERT_OK_AND_ASSIGN(auto decrypted_ntt,
+                       DecryptAfterModulusSwitch(params, p, switched, s));
+  EXPECT_EQ(decrypted_ntt, message);
+}
+
+TEST(EncryptionFftTest,
+     CenteredBinomialAndTernaryDistributionAtTiptoeParams) {
+  const int log_d = 11;
+  const int d = 1 << log_d;
+  ASSERT_OK_AND_ASSIGN(auto params, TiptoeRlweParams());
+  const uint64_t q = params.Modulus();
+  const uint64_t q_mask = q - 1;
+  ASSERT_OK_AND_ASSIGN(auto seed,
+                       ::rlwe::SingleThreadChaChaPrng::GenerateSeed());
+  ASSERT_OK_AND_ASSIGN(auto prng, ::rlwe::SingleThreadChaChaPrng::Create(seed));
+
+  // Verify bitsliced ternary secret key distribution over 32 * 2048 = 65536
+  // samples.
+  int count_zero = 0, count_plus = 0, count_minus = 0;
+  for (int trial = 0; trial < 32; ++trial) {
+    ASSERT_OK_AND_ASSIGN(auto s, SampleSecretKey<uint64_t>(params, *prng));
+    for (uint64_t v : s.Coeffs()) {
+      if (v == 0) {
+        ++count_zero;
+      } else if (v == 1) {
+        ++count_plus;
+      } else if (v == q - 1) {
+        ++count_minus;
+      } else {
+        FAIL() << "Invalid ternary coefficient: " << v;
+      }
+    }
+  }
+  const double total_ternary = count_zero + count_plus + count_minus;
+  EXPECT_NEAR(count_zero / total_ternary, 1.0 / 3.0, 0.01);
+  EXPECT_NEAR(count_plus / total_ternary, 1.0 / 3.0, 0.01);
+  EXPECT_NEAR(count_minus / total_ternary, 1.0 / 3.0, 0.01);
+
+  // Verify bitsliced centered binomial error distribution (variance = 40)
+  // over 32 * 2048 = 65536 samples with a = 0 -> b = e mod q.
+  ASSERT_OK_AND_ASSIGN(auto s, SampleSecretKey<uint64_t>(params, *prng));
+  ASSERT_OK_AND_ASSIGN(auto fft_ctx, FftContext::Create(log_d));
+  ASSERT_OK_AND_ASSIGN(auto s_fft, FftPolynomial::Create(s, *fft_ctx,
+                                                         /*bits=*/2,
+                                                         /*is_signed=*/true));
+  ASSERT_OK_AND_ASSIGN(auto zero_poly,
+                       Polynomial<uint64_t>::Create(std::vector<uint64_t>(d, 0)));
+  std::vector<Polynomial<uint64_t>> zero_a(32, zero_poly);
+  ASSERT_OK_AND_ASSIGN(auto samples,
+                       GenerateRlweSamples<uint64_t>(params, s_fft, zero_a,
+                                                     *prng, *fft_ctx));
+  double sum = 0.0, sum_sq = 0.0;
+  const int n_err = 32 * d;
+  for (const auto& sample : samples) {
+    for (uint64_t raw : sample.b.Coeffs()) {
+      const uint64_t u = raw & q_mask;
+      const int64_t signed_e =
+          (u >= (q >> 1)) ? static_cast<int64_t>(u) - static_cast<int64_t>(q)
+                          : static_cast<int64_t>(u);
+      ASSERT_GE(signed_e, -80);
+      ASSERT_LE(signed_e, 80);
+      sum += static_cast<double>(signed_e);
+      sum_sq += static_cast<double>(signed_e) * static_cast<double>(signed_e);
+    }
+  }
+  const double mean = sum / n_err;
+  const double var = sum_sq / n_err - mean * mean;
+  EXPECT_NEAR(mean, 0.0, 0.1);
+  EXPECT_NEAR(var, 40.0, 1.0);
+}
+
 }  // namespace
 }  // namespace v2
 }  // namespace rlwe

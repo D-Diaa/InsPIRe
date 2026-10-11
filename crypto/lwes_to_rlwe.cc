@@ -500,23 +500,20 @@ absl::StatusOr<RlweCiphertext<CoeffType>> FinalizeMatrixPack(
     return absl::InvalidArgumentError("b_agg_partial size mismatch.");
   }
 
-  // Incorporate b_agg_partial into b_agg
-  std::vector<CoeffType> b_coeffs = b;
-  for (int m = 0; m < d; ++m) {
-    b_coeffs[m] += b_agg_partial[m];
-  }
   ASSIGN_OR_RETURN(Polynomial<CoeffType> b_agg,
-                   Polynomial<CoeffType>::Create(b_coeffs));
-  ASSIGN_OR_RETURN(b_agg, b_agg.LowBits(params.LogModulus()));
-
-  // Add InnerProduct(y_vec_h, t_vec_h)
-  ASSIGN_OR_RETURN(Polynomial<CoeffType> inner_h,
                    Polynomial<CoeffType>::InnerProductFft(t_vec_h_fft,
                                                           y_vec_h_fft, ctx));
-  ASSIGN_OR_RETURN(b_agg, b_agg.Add(inner_h));
-  ASSIGN_OR_RETURN(b_agg, b_agg.LowBits(params.LogModulus()));
+  const int log_q = params.LogModulus();
+  const CoeffType mask =
+      (log_q <= 0 || log_q >= static_cast<int>(8 * sizeof(CoeffType)))
+          ? ~CoeffType{0}
+          : ((CoeffType{1} << log_q) - 1);
+  CoeffType* __restrict out = b_agg.MutableCoeffs().data();
+  for (int m = 0; m < d; ++m) {
+    out[m] = (out[m] + b[m] + b_agg_partial[m]) & mask;
+  }
 
-  return RlweCiphertext<CoeffType>{a_tilde_agg, b_agg};
+  return RlweCiphertext<CoeffType>{a_tilde_agg, std::move(b_agg)};
 }
 
 template <typename CoeffType, typename MatCoeffType>

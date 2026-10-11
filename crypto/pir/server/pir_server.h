@@ -16,6 +16,7 @@
 #define CRYPTO_PIR_SERVER_PIR_SERVER_H_
 
 #include <memory>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -68,7 +69,12 @@ class PirServer {
   // transforms the shared key only once.
   absl::StatusOr<PirResponse<CoeffType>> ProcessResponse(
       const PirRequest<CoeffType>& request,
-      const ChunkedFft* y_vec_h_fft = nullptr) const;
+      const ChunkedFft* y_vec_h_fft = nullptr,
+      bool skip_a_t1 = false) const;
+
+  const std::string& GetPrepackedAModSwitched(int k) const {
+    return a_mod_switched_t1_packed_[k];
+  }
 
   absl::Duration GetDbMultiplyTime() const { return db_mult_time_; }
   absl::Duration GetPackingTime() const { return packing_time_; }
@@ -90,6 +96,7 @@ class PirServer {
           preprocessed_outputs,
       std::vector<std::vector<ChunkedFft>> t_vec_h_ffts,
       std::vector<Polynomial<CoeffType>> a_mod_switched_t1,
+      std::vector<std::string> a_mod_switched_t1_packed,
       std::vector<Polynomial<CoeffType>> second_dim_query_a,
       std::unique_ptr<FftContext> fft_ctx)
       : params_(params),
@@ -98,6 +105,7 @@ class PirServer {
         preprocessed_outputs_(std::move(preprocessed_outputs)),
         t_vec_h_ffts_(std::move(t_vec_h_ffts)),
         a_mod_switched_t1_(std::move(a_mod_switched_t1)),
+        a_mod_switched_t1_packed_(std::move(a_mod_switched_t1_packed)),
         second_dim_query_a_(std::move(second_dim_query_a)),
         fft_ctx_(std::move(fft_ctx)),
         db_mult_time_(absl::ZeroDuration()),
@@ -130,6 +138,7 @@ class PirServer {
       preprocessed_outputs_;
   const std::vector<std::vector<ChunkedFft>> t_vec_h_ffts_;
   const std::vector<Polynomial<CoeffType>> a_mod_switched_t1_;
+  const std::vector<std::string> a_mod_switched_t1_packed_;
   const std::vector<Polynomial<CoeffType>> second_dim_query_a_;
   std::unique_ptr<FftContext> fft_ctx_;
 

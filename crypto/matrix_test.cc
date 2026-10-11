@@ -250,6 +250,81 @@ TEST(CondensedMultiplyHighwayU16U64Test, MatchesScalarOnRandomAndExtremes) {
   EXPECT_EQ(result, expected);
 }
 
+TEST(CondensedMultiplyHighwayU16U64Test,
+     MatchesScalarAcrossDimensionsAndQueryBitWidths) {
+  std::mt19937_64 rng(777777);
+  const int test_cols[] = {16, 32, 48, 64, 256, 512, 1024, 2048};
+  const int test_rows[] = {1, 2, 6, 15, 2048};
+
+  for (int cols : test_cols) {
+    for (int rows : test_rows) {
+      if (rows == 2048 && cols != 256 && cols != 2048) {
+        continue;
+      }
+      std::vector<std::vector<uint16_t>> matrix_data(
+          rows, std::vector<uint16_t>(cols));
+      for (int i = 0; i < rows; ++i) {
+        for (int j = 0; j < cols; ++j) {
+          matrix_data[i][j] = static_cast<uint16_t>(rng());
+        }
+      }
+      // Inject extreme uint16_t values including 0, 0x7FFF, 0x8000, 0xFFFF.
+      const uint16_t m_extremes[] = {0, 1, 0x7FFF, 0x8000, 0xFFFF};
+      for (int e = 0; e < 5; ++e) {
+        matrix_data[e % rows][e % cols] = m_extremes[e];
+      }
+
+      ASSERT_OK_AND_ASSIGN(auto plain, Matrix<uint16_t>::Create(matrix_data));
+      ASSERT_OK_AND_ASSIGN(auto condensed,
+                           Matrix<uint16_t>::CreateCondensed(matrix_data));
+
+      // 1. Arbitrary 64-bit vector (5-digit general path).
+      std::vector<uint64_t> vec64(cols);
+      for (int j = 0; j < cols; ++j) {
+        vec64[j] = rng();
+      }
+      vec64[0] = 0;
+      vec64[1 % cols] = UINT64_MAX;
+      vec64[2 % cols] = (uint64_t{1} << 63);
+      ASSERT_OK_AND_ASSIGN(auto expected64,
+                           plain.template Multiply<uint64_t>(vec64));
+      ASSERT_OK_AND_ASSIGN(auto result64,
+                           condensed.template Multiply<uint64_t>(vec64));
+      EXPECT_EQ(result64, expected64)
+          << "Mismatch on 64-bit vec at rows=" << rows << " cols=" << cols;
+
+      // 2. 52-bit RLWE vector (4-digit path).
+      std::vector<uint64_t> vec52(cols);
+      for (int j = 0; j < cols; ++j) {
+        vec52[j] = rng() & ((uint64_t{1} << 52) - 1);
+      }
+      vec52[0] = (uint64_t{1} << 52) - 1;
+      ASSERT_OK_AND_ASSIGN(auto expected52,
+                           plain.template Multiply<uint64_t>(vec52));
+      ASSERT_OK_AND_ASSIGN(auto result52,
+                           condensed.template Multiply<uint64_t>(vec52));
+      EXPECT_EQ(result52, expected52)
+          << "Mismatch on 52-bit vec at rows=" << rows << " cols=" << cols;
+
+      // 3. 40-bit modulus-switched selector shifted left by 12 (3-digit path).
+      std::vector<uint64_t> vec40(cols);
+      for (int j = 0; j < cols; ++j) {
+        vec40[j] = (rng() & ((uint64_t{1} << 40) - 1)) << 12;
+      }
+      vec40[0] = 0;
+      vec40[1 % cols] = ((uint64_t{1} << 40) - 1) << 12;
+      vec40[2 % cols] = uint64_t{8192} << 12;
+      ASSERT_OK_AND_ASSIGN(auto expected40,
+                           plain.template Multiply<uint64_t>(vec40));
+      ASSERT_OK_AND_ASSIGN(auto result40,
+                           condensed.template Multiply<uint64_t>(vec40));
+      EXPECT_EQ(result40, expected40)
+          << "Mismatch on 40-bit shifted vec at rows=" << rows
+          << " cols=" << cols;
+    }
+  }
+}
+
 TEST(CondensedMultiplyHighwayU8U64Test, Correctness) {
   const int rows = 2;
   const int cols = 64;

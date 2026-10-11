@@ -9,6 +9,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <exception>
 #include <fstream>
 #include <functional>
@@ -60,35 +61,114 @@ std::string SelectorSeed(uint64_t slot) {
   for (int i = 0; i < 8; ++i) seed[24 + i] = char(slot >> (8 * i));
   return seed;
 }
-std::unique_ptr<::rlwe::SecurePrng> Prng(const std::string& seed) {
-  return Take(::rlwe::ChaChaPrng::Create(seed));
-}
-void Encode(const Poly& poly, int bits, std::string& wire) {
-  wire += Take(poly.ToProto(bits)).SerializeAsString();
-}
-// Each upstream polynomial protobuf is a bytes field: tag, varint, coefficient
-// bytes. Its own length delimiter lets a complete request use concatenated
-// components.
-Poly Decode(const std::string& wire, size_t& off, int degree, int bits) {
-  const size_t start = off;
-  Check(off < wire.size() && uint8_t(wire[off++]) == 10,
-        "Invalid polynomial tag");
-  size_t len = 0;
-  int shift = 0;
-  while (true) {
-    Check(off < wire.size() && shift < 63, "Invalid polynomial length");
-    uint8_t byte = wire[off++];
-    len |= size_t(byte & 127) << shift;
-    if (!(byte & 128)) break;
-    shift += 7;
+// Lock-free single-threaded ChaCha20 PRNG producing the exact same byte stream
+// as ::rlwe::ChaChaPrng without per-call mutex locking or byte-by-byte loops.
+class FastChaChaPrng final : public ::rlwe::SecurePrng {
+ public:
+  explicit FastChaChaPrng(std::string key) : key_(std::move(key)) {}
+
+  absl::StatusOr<::rlwe::Uint8> Rand8() override {
+    if (position_in_buffer_ >= static_cast<int>(buffer_.size())) {
+      RETURN_IF_ERROR(::rlwe::internal::ChaChaPrngResalt(
+          key_, ::rlwe::internal::kChaChaOutputBytes, &salt_counter_,
+          &position_in_buffer_, &buffer_));
+    }
+    return buffer_[position_in_buffer_++];
   }
-  Check(len == (size_t(degree) * bits + 7) / 8 && len <= wire.size() - off,
-        "Invalid polynomial payload");
-  off += len;
-  pm::proto::Polynomial encoded;
-  Check(encoded.ParseFromArray(wire.data() + start, off - start),
-        "Polynomial parse failed");
-  return Take(Poly::CreateFromProto(encoded, degree, bits));
+
+  absl::StatusOr<::rlwe::Uint64> Rand64() override {
+    if (position_in_buffer_ + 8 > static_cast<int>(buffer_.size())) {
+      if (position_in_buffer_ == static_cast<int>(buffer_.size())) {
+        RETURN_IF_ERROR(::rlwe::internal::ChaChaPrngResalt(
+            key_, ::rlwe::internal::kChaChaOutputBytes, &salt_counter_,
+            &position_in_buffer_, &buffer_));
+      } else {
+        return ::rlwe::internal::ChaChaPrngRand64(
+            key_, &position_in_buffer_, &salt_counter_, &buffer_);
+      }
+    }
+    ::rlwe::Uint64 rand64;
+    std::memcpy(&rand64, buffer_.data() + position_in_buffer_, sizeof(rand64));
+    position_in_buffer_ += 8;
+    return rand64;
+  }
+
+ private:
+  const std::string key_;
+  int position_in_buffer_ = 0;
+  int salt_counter_ = 0;
+  std::vector<::rlwe::Uint8> buffer_;
+};
+std::unique_ptr<::rlwe::SecurePrng> Prng(const std::string& seed) {
+  Check(static_cast<int>(seed.size()) == ::rlwe::internal::kChaChaKeyBytesSize,
+        "Invalid ChaCha PRNG seed size");
+  return std::make_unique<FastChaChaPrng>(seed);
+}
+void PackCoeffsAppend(const std::vector<uint64_t>& coeffs, int bits,
+                      std::string& wire) {
+  const size_t n = coeffs.size();
+  const size_t num_bytes = (n * static_cast<size_t>(bits) + 7) / 8;
+  const size_t old_size = wire.size();
+  wire.resize(old_size + num_bytes);
+  uint8_t* __restrict out_ptr =
+      reinterpret_cast<uint8_t*>(wire.data() + old_size);
+  const uint64_t mask =
+      (bits >= 64) ? ~uint64_t{0} : ((uint64_t{1} << bits) - 1);
+  unsigned __int128 bit_buf = 0;
+  int bits_in_buf = 0;
+  size_t byte_idx = 0;
+  for (size_t i = 0; i < n; ++i) {
+    bit_buf |= static_cast<unsigned __int128>(coeffs[i] & mask) << bits_in_buf;
+    bits_in_buf += bits;
+    if (bits_in_buf >= 64) {
+      uint64_t word = static_cast<uint64_t>(bit_buf);
+      std::memcpy(out_ptr + byte_idx, &word, sizeof(uint64_t));
+      bit_buf >>= 64;
+      bits_in_buf -= 64;
+      byte_idx += 8;
+    }
+  }
+  while (bits_in_buf > 0) {
+    out_ptr[byte_idx++] = static_cast<uint8_t>(bit_buf & 0xFF);
+    bit_buf >>= 8;
+    bits_in_buf -= 8;
+  }
+}
+
+std::vector<uint64_t> UnpackCoeffs(const std::string& wire, size_t& off,
+                                   int degree, int bits) {
+  const size_t num_bytes = (static_cast<size_t>(degree) * bits + 7) / 8;
+  Check(num_bytes <= wire.size() - off, "Invalid polynomial payload");
+  const uint8_t* __restrict raw =
+      reinterpret_cast<const uint8_t*>(wire.data() + off);
+  off += num_bytes;
+  std::vector<uint64_t> coeffs(degree);
+  const uint64_t mask =
+      (bits >= 64) ? ~uint64_t{0} : ((uint64_t{1} << bits) - 1);
+  unsigned __int128 bit_buf = 0;
+  int bits_in_buf = 0;
+  size_t byte_idx = 0;
+  for (int j = 0; j < degree; ++j) {
+    if (bits_in_buf < bits) {
+      if (byte_idx + 8 <= num_bytes) {
+        uint64_t word = 0;
+        std::memcpy(&word, raw + byte_idx, sizeof(uint64_t));
+        bit_buf |= static_cast<unsigned __int128>(word) << bits_in_buf;
+        bits_in_buf += 64;
+        byte_idx += 8;
+      } else {
+        while (byte_idx < num_bytes && bits_in_buf <= 120) {
+          bit_buf |= static_cast<unsigned __int128>(raw[byte_idx++])
+                     << bits_in_buf;
+          bits_in_buf += 8;
+        }
+      }
+    }
+    coeffs[j] = static_cast<uint64_t>(bit_buf) & mask;
+    bit_buf >>= bits;
+    bits_in_buf -= bits;
+  }
+  return coeffs;
 }
 void Pin(int cpu, const char* error) {
   cpu_set_t mask;
@@ -100,34 +180,31 @@ void Pin(int cpu, const char* error) {
 // process affinity mask. Worker w runs on the w-th.
 std::vector<int> ThreadCpus() {
   const char* env = std::getenv("PIR_THREAD_CPUS");
-  if (!env) return {};
+  if (!env || !*env) return {};
   Check(!std::getenv("PIR_ONLINE_CPU"),
         "PIR_THREAD_CPUS and PIR_ONLINE_CPU are mutually exclusive");
   cpu_set_t allowed;
+  CPU_ZERO(&allowed);
   Check(sched_getaffinity(0, sizeof(allowed), &allowed) == 0,
-        "Failed to read the process affinity mask");
-  const std::string list = env;
+        "Failed to read CPU affinity mask");
   std::vector<int> cpus;
-  for (size_t begin = 0; begin <= list.size();) {
-    const size_t end = std::min(list.find(',', begin), list.size());
-    const std::string id = list.substr(begin, end - begin);
-    Check(!id.empty() && id.size() <= 4 &&
-              id.find_first_not_of("0123456789") == std::string::npos,
-          "PIR_THREAD_CPUS must be a comma-separated list of CPU ids");
-    const int cpu = std::stoi(id);
-    Check(cpu < CPU_SETSIZE && CPU_ISSET(cpu, &allowed),
-          ("PIR_THREAD_CPUS: CPU " + id + " is not in the affinity mask")
-              .c_str());
-    Check(std::find(cpus.begin(), cpus.end(), cpu) == cpus.end(),
-          ("PIR_THREAD_CPUS: duplicate CPU " + id).c_str());
-    cpus.push_back(cpu);
-    begin = end + 1;
+  for (const char* p = env;;) {
+    char* end = nullptr;
+    const long v = std::strtol(p, &end, 10);
+    Check(end != p && (*end == ',' || *end == '\0') && v >= 0 &&
+              v < CPU_SETSIZE,
+          "Invalid CPU id in PIR_THREAD_CPUS");
+    Check(CPU_ISSET(int(v), &allowed),
+          "PIR_THREAD_CPUS entry is outside the process affinity mask");
+    Check(std::find(cpus.begin(), cpus.end(), int(v)) == cpus.end(),
+          "Duplicate CPU in PIR_THREAD_CPUS");
+    cpus.push_back(int(v));
+    if (*end == '\0') break;
+    p = end + 1;
   }
   return cpus;
 }
-// Persistent fork-join workers: Run(job) calls job(w) for each of the n
-// workers, on the calling thread for w = 0, and returns once all calls have
-// returned, rethrowing the first exception.
+// Persistent workers; the calling thread is worker 0.
 class Workers {
  public:
   explicit Workers(size_t n) : errors_(n) {
@@ -136,7 +213,7 @@ class Workers {
   }
   ~Workers() {
     Start(nullptr);
-    for (auto& thread : threads_) thread.join();
+    for (auto& t : threads_) t.join();
   }
   void Run(const std::function<void(size_t)>& job) {
     Start(&job);
@@ -218,7 +295,7 @@ int Run(int argc, char** argv) {
     Check(targets[i] < size_t(rows[i % p]), "Invalid target");
   }
   const auto rlwe_params = Take(pm::RlweParams<uint64_t>::Create(
-      2048, 1ULL << 52, 1ULL << 29, 1ULL << 18, 40));
+      2048, 1ULL << 52, 1ULL << 25, 1ULL << 18, 40));
   const pm::GadgetParams pack_gadget{19, 2}, eval_gadget{19, 3};
   auto Params = [&](int m, size_t cols) {
     return Take(pm::PirParams<uint64_t>::Create(rlwe_params, 65536, pack_gadget,
@@ -340,7 +417,7 @@ int Run(int argc, char** argv) {
     const double client_key_generation_ms = Ms(client_begin);
     auto t_pack = Clock::now();
     std::string upload;
-    for (const auto& key : keys) Encode(key, 52, upload);
+    for (const auto& key : keys) PackCoeffsAppend(key.Coeffs(), 52, upload);
     const size_t key_bytes = upload.size();
     double client_request_pack_ms = Ms(t_pack), client_selector_ms = 0;
     for (size_t slot = 0; slot < p; ++slot) {
@@ -351,7 +428,10 @@ int Run(int argc, char** argv) {
       selector.resize(rows[slot]);
       client_selector_ms += Ms(t);
       t = Clock::now();
-      Encode(Take(Poly::Create(std::move(selector))), 52, upload);
+      for (uint64_t& y : selector) {
+        y = ((y + (1ULL << 11)) >> 12) & ((1ULL << 40) - 1);
+      }
+      PackCoeffsAppend(selector, 40, upload);
       client_request_pack_ms += Ms(t);
     }
     const double client_query_ms = Ms(client_begin);
@@ -361,14 +441,17 @@ int Run(int argc, char** argv) {
     // read by the tasks.
     pm::PirRequest<uint64_t> request;
     for (int k = 0; k < 4; ++k)
-      request.packing_key.push_back(Decode(upload, off, 2048, 52));
+      request.packing_key.push_back(
+          Take(Poly::Create(UnpackCoeffs(upload, off, 2048, 52))));
     std::vector<std::vector<uint64_t>> queries(p);
-    for (size_t slot = 0; slot < p; ++slot)
-      queries[slot] = Decode(upload, off, rows[slot], 52).Coeffs();
+    for (size_t slot = 0; slot < p; ++slot) {
+      queries[slot] = UnpackCoeffs(upload, off, rows[slot], 40);
+      for (uint64_t& y : queries[slot]) y <<= 12;
+    }
     Check(off == upload.size(), "Unconsumed request bytes");
     const double ingest_ms = Ms(server_begin);
-    // The key's y_vec_h is transformed once, not once per color; the
-    // transform counts towards the packing finalize phase.
+    // The key's y_vec_h is transformed once, not once per color; the transform
+    // counts towards packing finalize.
     const std::vector<Poly> y_vec_h(
         request.packing_key.begin() + pack_gadget.num_digits,
         request.packing_key.end());
@@ -393,8 +476,8 @@ int Run(int argc, char** argv) {
                    finalize_before = server->GetFinalizeTime();
         const auto modswitch_before = server->GetModswitchTime(),
                    eval_before = server->GetPolyEvalTime();
-        auto response =
-            Take(server->ProcessResponse(task_request, &y_vec_h_fft));
+        auto response = Take(server->ProcessResponse(
+            task_request, &y_vec_h_fft, /*skip_a_t1=*/true));
         ms.matrix += absl::ToDoubleMilliseconds(server->GetPackMatrixTime() -
                                                 matrix_before);
         ms.finalize += absl::ToDoubleMilliseconds(server->GetFinalizeTime() -
@@ -409,9 +492,10 @@ int Run(int argc, char** argv) {
             absl::ToDoubleMilliseconds(server->GetPackingTime() - pack_before);
         const auto encode_begin = Clock::now();
         std::string wire;
-        for (const auto& ct : response.ciphertexts) {
-          Encode(ct.a, 29, wire);
-          Encode(ct.b, 18, wire);
+        wire.reserve(response.ciphertexts.size() * (6400 + 4608));
+        for (size_t k = 0; k < response.ciphertexts.size(); ++k) {
+          wire.append(server->GetPrepackedAModSwitched(k));
+          PackCoeffsAppend(response.ciphertexts[k].b.Coeffs(), 18, wire);
         }
         wires[slot * column_groups + w % column_groups] = std::move(wire);
         ms.encode += Ms(encode_begin);
@@ -448,8 +532,8 @@ int Run(int argc, char** argv) {
       auto t = Clock::now();
       pm::PirResponse<uint64_t> response;
       for (size_t col = 0; col < c; ++col) {
-        auto a = Decode(download, off, 2048, 29);
-        auto b = Decode(download, off, 2048, 18);
+        auto a = Take(Poly::Create(UnpackCoeffs(download, off, 2048, 25)));
+        auto b = Take(Poly::Create(UnpackCoeffs(download, off, 2048, 18)));
         response.ciphertexts.push_back({std::move(a), std::move(b)});
       }
       client_response_unpack_ms += Ms(t);
