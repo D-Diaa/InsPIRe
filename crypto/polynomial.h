@@ -15,13 +15,19 @@
 #ifndef CRYPTO_POLYNOMIAL_H_
 #define CRYPTO_POLYNOMIAL_H_
 
+#include <cstddef>
 #include <cstdint>
+#include <cstring>
 #include <memory>
+#include <string>
+#include <type_traits>
 #include <vector>
 
 #include "crypto/proto/rlwe.pb.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/strings/string_view.h"
+#include "absl/types/span.h"
 #include "shell_encryption/int256.h"
 #include "shell_encryption/montgomery.h"
 #include "shell_encryption/ntt_parameters.h"
@@ -34,6 +40,121 @@ namespace v2 {
 struct FftContext;
 struct ChunkedFft;
 class FftPolynomial;
+
+// Packs the lowest `bit_width` bits of each integer in `values` into a tightly
+// packed little-endian bitstream and appends the resulting bytes to `out`.
+template <typename IntType>
+inline void PackIntegersAppend(absl::Span<const IntType> values, int bit_width,
+                               std::string& out) {
+  if (values.empty() || bit_width <= 0) return;
+  using UnsignedType = std::make_unsigned_t<IntType>;
+  const size_t total_bits = values.size() * static_cast<size_t>(bit_width);
+  const size_t expected_bytes = (total_bits + 7) / 8;
+  const size_t base = out.size();
+  out.resize(base + expected_bytes, '\0');
+  uint8_t* out_ptr = reinterpret_cast<uint8_t*>(&out[base]);
+  const uint64_t mask = (bit_width >= 64)
+                            ? ~uint64_t{0}
+                            : ((uint64_t{1} << bit_width) - 1);
+
+  unsigned __int128 bit_buf = 0;
+  int bits_in_buf = 0;
+  size_t byte_idx = 0;
+
+  for (IntType val : values) {
+    bit_buf |= static_cast<unsigned __int128>(
+                   static_cast<uint64_t>(static_cast<UnsignedType>(val)) & mask)
+               << bits_in_buf;
+    bits_in_buf += bit_width;
+    if (bits_in_buf >= 64) {
+      uint64_t word = static_cast<uint64_t>(bit_buf);
+      std::memcpy(out_ptr + byte_idx, &word, sizeof(uint64_t));
+      bit_buf >>= 64;
+      bits_in_buf -= 64;
+      byte_idx += 8;
+    }
+  }
+  while (bits_in_buf > 0) {
+    out_ptr[byte_idx++] = static_cast<uint8_t>(bit_buf & 0xFF);
+    bit_buf >>= 8;
+    bits_in_buf -= 8;
+  }
+}
+
+template <typename IntType>
+inline std::string PackIntegers(absl::Span<const IntType> values,
+                                int bit_width) {
+  std::string out;
+  PackIntegersAppend(values, bit_width, out);
+  return out;
+}
+
+// Unpacks `count` integers of `bit_width` bits each from a little-endian
+// bitstream `packed`. If `IntType` is signed, sign-extends from bit
+// `bit_width - 1`.
+template <typename IntType>
+inline absl::StatusOr<std::vector<IntType>> UnpackIntegers(
+    absl::string_view packed, int count, int bit_width) {
+  if (count < 0) {
+    return absl::InvalidArgumentError("Invalid length.");
+  }
+  if (bit_width <= 0 || bit_width > static_cast<int>(8 * sizeof(IntType))) {
+    return absl::InvalidArgumentError("Invalid bit_width.");
+  }
+  const size_t expected_bits =
+      static_cast<size_t>(count) * static_cast<size_t>(bit_width);
+  const size_t expected_bytes = (expected_bits + 7) / 8;
+  if (packed.size() != expected_bytes) {
+    return absl::InvalidArgumentError("Unexpected serialized size.");
+  }
+
+  std::vector<IntType> values(count);
+  if (count == 0) return values;
+
+  using UnsignedType = std::make_unsigned_t<IntType>;
+  const uint8_t* raw = reinterpret_cast<const uint8_t*>(packed.data());
+  const uint64_t mask = (bit_width >= 64)
+                            ? ~uint64_t{0}
+                            : ((uint64_t{1} << bit_width) - 1);
+  const uint64_t sign_bit =
+      (std::is_signed_v<IntType> &&
+       bit_width < static_cast<int>(8 * sizeof(IntType)))
+          ? (uint64_t{1} << (bit_width - 1))
+          : 0;
+  const uint64_t sign_extend = ~mask;
+
+  unsigned __int128 bit_buf = 0;
+  int bits_in_buf = 0;
+  size_t byte_idx = 0;
+
+  for (int j = 0; j < count; ++j) {
+    if (bits_in_buf < bit_width) {
+      if (byte_idx + 8 <= expected_bytes) {
+        uint64_t word = 0;
+        std::memcpy(&word, raw + byte_idx, sizeof(uint64_t));
+        bit_buf |= static_cast<unsigned __int128>(word) << bits_in_buf;
+        bits_in_buf += 64;
+        byte_idx += 8;
+      } else {
+        while (byte_idx < expected_bytes && bits_in_buf <= 120) {
+          bit_buf |= static_cast<unsigned __int128>(raw[byte_idx++])
+                     << bits_in_buf;
+          bits_in_buf += 8;
+        }
+      }
+    }
+    uint64_t uval = static_cast<uint64_t>(bit_buf) & mask;
+    if constexpr (std::is_signed_v<IntType>) {
+      if (uval & sign_bit) {
+        uval |= sign_extend;
+      }
+    }
+    values[j] = static_cast<IntType>(static_cast<UnsignedType>(uval));
+    bit_buf >>= bit_width;
+    bits_in_buf -= bit_width;
+  }
+  return values;
+}
 
 // Context holds the precomputed NTT parameters and constants needed for
 // polynomial multiplication. It is independent of the coefficient type and
@@ -241,6 +362,21 @@ class Polynomial {
   // Serializes the polynomial by packing the lowest `log_modulus` bits of each
   // coefficient into a sequence of bits represented as a byte string.
   absl::StatusOr<proto::Polynomial> ToProto(int log_modulus) const;
+
+  // Bit-packs the lowest `log_modulus` bits of each coefficient into a
+  // little-endian bitstream.
+  static void PackCoefficientsAppend(absl::Span<const CoeffType> coeffs,
+                                     int log_modulus, std::string& out) {
+    PackIntegersAppend(coeffs, log_modulus, out);
+  }
+  static std::string PackCoefficients(absl::Span<const CoeffType> coeffs,
+                                      int log_modulus) {
+    return PackIntegers(coeffs, log_modulus);
+  }
+  static absl::StatusOr<std::vector<CoeffType>> UnpackCoefficients(
+      absl::string_view packed, int len, int log_modulus) {
+    return UnpackIntegers<CoeffType>(packed, len, log_modulus);
+  }
 
  private:
   explicit Polynomial(std::vector<CoeffType> coeffs)

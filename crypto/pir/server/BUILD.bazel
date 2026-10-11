@@ -61,7 +61,10 @@ cc_library(
 
 cc_library(
     name = "pir_server",
-    srcs = ["pir_server.cc"],
+    srcs = [
+        "pir_server.cc",
+        "pir_server_persistence.cc",
+    ],
     hdrs = ["pir_server.h"],
     deps = [
         ":pir_preprocessed_data",

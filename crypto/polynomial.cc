@@ -218,44 +218,9 @@ absl::StatusOr<Polynomial<CoeffType>> Polynomial<CoeffType>::CreateFromProto(
   if (proto.encoded_coeffs().empty()) {
     return absl::InvalidArgumentError("Empty serialized polynomial.");
   }
-
-  absl::string_view bytes = proto.encoded_coeffs();
-  size_t expected_bits = static_cast<size_t>(len) * log_modulus;
-  size_t expected_bytes = (expected_bits + 7) / 8;
-  if (bytes.size() != expected_bytes) {
-    return absl::InvalidArgumentError("Unexpected serialized size.");
-  }
-
-  std::vector<CoeffType> coeffs(len);
-  const uint8_t* raw = reinterpret_cast<const uint8_t*>(bytes.data());
-  const uint64_t mask = (log_modulus == 64)
-                            ? ~uint64_t{0}
-                            : ((uint64_t{1} << log_modulus) - 1);
-
-  unsigned __int128 bit_buf = 0;
-  int bits_in_buf = 0;
-  size_t byte_idx = 0;
-
-  for (int j = 0; j < len; ++j) {
-    if (bits_in_buf < log_modulus) {
-      if (byte_idx + 8 <= expected_bytes) {
-        uint64_t word = 0;
-        std::memcpy(&word, raw + byte_idx, sizeof(uint64_t));
-        bit_buf |= static_cast<unsigned __int128>(word) << bits_in_buf;
-        bits_in_buf += 64;
-        byte_idx += 8;
-      } else {
-        while (byte_idx < expected_bytes && bits_in_buf <= 120) {
-          bit_buf |= static_cast<unsigned __int128>(raw[byte_idx++])
-                     << bits_in_buf;
-          bits_in_buf += 8;
-        }
-      }
-    }
-    coeffs[j] = static_cast<CoeffType>(static_cast<uint64_t>(bit_buf) & mask);
-    bit_buf >>= log_modulus;
-    bits_in_buf -= log_modulus;
-  }
+  ASSIGN_OR_RETURN(
+      std::vector<CoeffType> coeffs,
+      UnpackCoefficients(proto.encoded_coeffs(), len, log_modulus));
   return Polynomial::Create(std::move(coeffs));
 }
 
@@ -576,39 +541,8 @@ absl::StatusOr<proto::Polynomial> Polynomial<CoeffType>::ToProto(
   if (log_modulus <= 0 || log_modulus > 8 * sizeof(CoeffType)) {
     return absl::InvalidArgumentError("Invalid log_modulus.");
   }
-  const size_t total_bits = coeffs_.size() * static_cast<size_t>(log_modulus);
-  const size_t expected_bytes = (total_bits + 7) / 8;
-  std::string bytes(expected_bytes, '\0');
-  uint8_t* out_ptr = reinterpret_cast<uint8_t*>(&bytes[0]);
-  const uint64_t mask = (log_modulus == 64)
-                            ? ~uint64_t{0}
-                            : ((uint64_t{1} << log_modulus) - 1);
-
-  unsigned __int128 bit_buf = 0;
-  int bits_in_buf = 0;
-  size_t byte_idx = 0;
-
-  for (CoeffType coeff : coeffs_) {
-    bit_buf |= static_cast<unsigned __int128>(static_cast<uint64_t>(coeff) &
-                                              mask)
-               << bits_in_buf;
-    bits_in_buf += log_modulus;
-    if (bits_in_buf >= 64) {
-      uint64_t word = static_cast<uint64_t>(bit_buf);
-      std::memcpy(out_ptr + byte_idx, &word, sizeof(uint64_t));
-      bit_buf >>= 64;
-      bits_in_buf -= 64;
-      byte_idx += 8;
-    }
-  }
-  while (bits_in_buf > 0) {
-    out_ptr[byte_idx++] = static_cast<uint8_t>(bit_buf & 0xFF);
-    bit_buf >>= 8;
-    bits_in_buf -= 8;
-  }
-
   proto::Polynomial result;
-  result.set_encoded_coeffs(std::move(bytes));
+  result.set_encoded_coeffs(PackCoefficients(coeffs_, log_modulus));
   return result;
 }
 

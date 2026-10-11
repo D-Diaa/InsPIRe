@@ -112,6 +112,16 @@ class PirServer {
         packing_time_(absl::ZeroDuration()),
         poly_eval_time_(absl::ZeroDuration()) {}
 
+  static absl::StatusOr<
+      std::unique_ptr<PirServer<DbDataType, CoeffType, MatCoeffType>>>
+  CreateFromComponents(
+      const PirParams<CoeffType>& params, Matrix<DbDataType> combined_db_matrix,
+      Matrix<MatCoeffType> combined_pack_matrix,
+      std::vector<
+          std::vector<PreprocessMatrixPackOutput<CoeffType, MatCoeffType>>>
+          preprocessed_outputs,
+      std::vector<Polynomial<CoeffType>> second_dim_query_a);
+
   // Forward FFTs of every preprocessed t_vec_h, indexed like
   // `preprocessed_outputs`, computed once so that ProcessResponse does not
   // transform them per request.

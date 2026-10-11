@@ -133,6 +133,15 @@ absl::StatusOr<RlweCiphertext<CoeffType>> FinalizeMatrixPack(
     const ChunkedFft& t_vec_h_fft, const Polynomial<CoeffType>& a_tilde_agg,
     FftContext& ctx);
 
+template <typename CoeffType>
+absl::StatusOr<RlweCiphertext<CoeffType>> FinalizeMatrixPack(
+    const RlweParams<CoeffType>& params, const std::vector<CoeffType>& b,
+    const std::vector<CoeffType>& b_agg_partial,
+    const std::vector<Polynomial<CoeffType>>& y_vec_h,
+    const std::vector<Polynomial<CoeffType>>& t_vec_h,
+    const Polynomial<CoeffType>& a_tilde_agg, const GadgetParams& gadget_params,
+    FftContext& ctx);
+
 // MatrixPack uses the `PreprocessMatrixPackOutput` matrix to
 // efficiently compute the aggregation over `y_vec_g` through matrix-vector
 // multiplication, aggregating that result with the remainder parts.

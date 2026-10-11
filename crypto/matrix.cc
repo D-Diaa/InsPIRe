@@ -321,131 +321,103 @@ HWY_INLINE void PackQueryDigitsUint16(absl::Span<const uint64_t> vec,
   }
 }
 
-template <int kRows, int kNumDigits, int kShift>
-HWY_INLINE void CondensedMultiplyUint16Rows(
-    const uint64_t* const* m_rows, int condensed_cols,
-    const int16_t* HWY_RESTRICT y_packed, uint64_t y_bias,
-    uint64_t* HWY_RESTRICT result) {
 #if defined(__AVX2__)
-  const size_t next_block = static_cast<size_t>(kRows) * condensed_cols;
-  __m256i acc64[kRows][kNumDigits];
-  for (int r = 0; r < kRows; ++r) {
-    for (int d = 0; d < kNumDigits; ++d) {
-      acc64[r][d] = _mm256_setzero_si256();
-    }
+template <int kNumDigits>
+HWY_INLINE void WidenAndAccumulate32To64(const __m256i (&acc32)[kNumDigits],
+                                         __m256i (&acc64)[kNumDigits]) {
+  HWY_UNROLL(kNumDigits)
+  for (int d = 0; d < kNumDigits; ++d) {
+    const __m256i lo64 =
+        _mm256_cvtepi32_epi64(_mm256_castsi256_si128(acc32[d]));
+    const __m256i hi64 =
+        _mm256_cvtepi32_epi64(_mm256_extracti128_si256(acc32[d], 1));
+    acc64[d] = _mm256_add_epi64(acc64[d], _mm256_add_epi64(lo64, hi64));
+  }
+}
+#endif
+
+template <int kNumDigits, int kShift>
+HWY_INLINE uint64_t CondensedMultiplyUint16Row(
+    const uint64_t* HWY_RESTRICT m_row, int condensed_cols,
+    const int16_t* HWY_RESTRICT y_packed, uint64_t y_bias) {
+#if defined(__AVX2__)
+  const size_t next_row = static_cast<size_t>(condensed_cols);
+  __m256i acc64[kNumDigits];
+  for (int d = 0; d < kNumDigits; ++d) {
+    acc64[d] = _mm256_setzero_si256();
   }
 
   const int16_t* HWY_RESTRICT yp = y_packed;
   size_t c = 0;
   for (; c + 16 <= static_cast<size_t>(condensed_cols);
        c += 16, yp += 4 * kNumDigits * 16) {
-    __m256i acc32[kRows][kNumDigits];
+    __m256i acc32[kNumDigits];
     HWY_UNROLL(4)
     for (int s = 0; s < 4; ++s) {
-      __m256i vm[kRows];
-      HWY_UNROLL(kRows)
-      for (int r = 0; r < kRows; ++r) {
-        if (s == 0 || s == 2) {
-          hwy::Prefetch(m_rows[r] + c + 4 * s + next_block);
-        }
-        vm[r] = _mm256_loadu_si256(
-            reinterpret_cast<const __m256i*>(m_rows[r] + c + 4 * s));
+      if (s == 0 || s == 2) {
+        hwy::Prefetch(m_row + c + 4 * s + next_row);
       }
+      const __m256i vm = _mm256_loadu_si256(
+          reinterpret_cast<const __m256i*>(m_row + c + 4 * s));
       HWY_UNROLL(kNumDigits)
       for (int d = 0; d < kNumDigits; ++d) {
         const __m256i vy = _mm256_loadu_si256(
             reinterpret_cast<const __m256i*>(yp + (s * kNumDigits + d) * 16));
-        HWY_UNROLL(kRows)
-        for (int r = 0; r < kRows; ++r) {
-          const __m256i prod = _mm256_madd_epi16(vm[r], vy);
-          acc32[r][d] = (s == 0) ? prod : _mm256_add_epi32(acc32[r][d], prod);
-        }
+        const __m256i prod = _mm256_madd_epi16(vm, vy);
+        acc32[d] = (s == 0) ? prod : _mm256_add_epi32(acc32[d], prod);
       }
     }
-    HWY_UNROLL(kRows)
-    for (int r = 0; r < kRows; ++r) {
-      HWY_UNROLL(kNumDigits)
-      for (int d = 0; d < kNumDigits; ++d) {
-        const __m256i lo64 =
-            _mm256_cvtepi32_epi64(_mm256_castsi256_si128(acc32[r][d]));
-        const __m256i hi64 =
-            _mm256_cvtepi32_epi64(_mm256_extracti128_si256(acc32[r][d], 1));
-        acc64[r][d] =
-            _mm256_add_epi64(acc64[r][d], _mm256_add_epi64(lo64, hi64));
-      }
-    }
+    WidenAndAccumulate32To64<kNumDigits>(acc32, acc64);
   }
 
   const size_t rem_vecs = (static_cast<size_t>(condensed_cols) - c) / 4;
   if (rem_vecs > 0) {
-    __m256i acc32[kRows][kNumDigits];
+    __m256i acc32[kNumDigits];
     for (size_t s = 0; s < rem_vecs; ++s) {
-      __m256i vm[kRows];
-      HWY_UNROLL(kRows)
-      for (int r = 0; r < kRows; ++r) {
-        vm[r] = _mm256_loadu_si256(
-            reinterpret_cast<const __m256i*>(m_rows[r] + c + 4 * s));
-      }
+      const __m256i vm = _mm256_loadu_si256(
+          reinterpret_cast<const __m256i*>(m_row + c + 4 * s));
       HWY_UNROLL(kNumDigits)
       for (int d = 0; d < kNumDigits; ++d) {
         const __m256i vy = _mm256_loadu_si256(
             reinterpret_cast<const __m256i*>(yp + (s * kNumDigits + d) * 16));
-        HWY_UNROLL(kRows)
-        for (int r = 0; r < kRows; ++r) {
-          const __m256i prod = _mm256_madd_epi16(vm[r], vy);
-          acc32[r][d] = (s == 0) ? prod : _mm256_add_epi32(acc32[r][d], prod);
-        }
+        const __m256i prod = _mm256_madd_epi16(vm, vy);
+        acc32[d] = (s == 0) ? prod : _mm256_add_epi32(acc32[d], prod);
       }
     }
-    HWY_UNROLL(kRows)
-    for (int r = 0; r < kRows; ++r) {
-      HWY_UNROLL(kNumDigits)
-      for (int d = 0; d < kNumDigits; ++d) {
-        const __m256i lo64 =
-            _mm256_cvtepi32_epi64(_mm256_castsi256_si128(acc32[r][d]));
-        const __m256i hi64 =
-            _mm256_cvtepi32_epi64(_mm256_extracti128_si256(acc32[r][d], 1));
-        acc64[r][d] =
-            _mm256_add_epi64(acc64[r][d], _mm256_add_epi64(lo64, hi64));
-      }
-    }
+    WidenAndAccumulate32To64<kNumDigits>(acc32, acc64);
   }
 
-  for (int r = 0; r < kRows; ++r) {
-    __m256i total64 = (kShift == 0) ? acc64[r][0]
-                                    : _mm256_slli_epi64(acc64[r][0], kShift);
-    for (int d = 1; d < kNumDigits; ++d) {
-      total64 = _mm256_add_epi64(
-          total64, _mm256_slli_epi64(acc64[r][d], kShift + 14 * d));
-    }
-    const __m128i sum128 = _mm_add_epi64(_mm256_castsi256_si128(total64),
-                                         _mm256_extracti128_si256(total64, 1));
-    const __m128i hi64 = _mm_unpackhi_epi64(sum128, sum128);
-    const uint64_t row_sum =
-        static_cast<uint64_t>(_mm_cvtsi128_si64(_mm_add_epi64(sum128, hi64)));
-    result[r] = row_sum + y_bias;
+  __m256i total64 =
+      (kShift == 0) ? acc64[0] : _mm256_slli_epi64(acc64[0], kShift);
+  for (int d = 1; d < kNumDigits; ++d) {
+    total64 = _mm256_add_epi64(total64,
+                               _mm256_slli_epi64(acc64[d], kShift + 14 * d));
   }
+  const __m128i sum128 = _mm_add_epi64(_mm256_castsi256_si128(total64),
+                                       _mm256_extracti128_si256(total64, 1));
+  const __m128i hi64 = _mm_unpackhi_epi64(sum128, sum128);
+  const uint64_t row_sum =
+      static_cast<uint64_t>(_mm_cvtsi128_si64(_mm_add_epi64(sum128, hi64)));
+  return row_sum + y_bias;
 #else
-  for (int r = 0; r < kRows; ++r) {
-    uint64_t total = y_bias;
-    const int16_t* m_i16 = reinterpret_cast<const int16_t*>(m_rows[r]);
-    for (int v_idx = 0; v_idx < condensed_cols / 4; ++v_idx) {
-      const int16_t* yp = y_packed + v_idx * kNumDigits * 16;
-      for (int d = 0; d < kNumDigits; ++d) {
-        int64_t sum_d = 0;
-        for (int lane = 0; lane < 16; ++lane) {
-          sum_d += static_cast<int64_t>(m_i16[v_idx * 16 + lane]) *
-                   static_cast<int64_t>(yp[d * 16 + lane]);
-        }
-        total += static_cast<uint64_t>(sum_d) << (kShift + 14 * d);
+  uint64_t total = y_bias;
+  const int16_t* m_i16 = reinterpret_cast<const int16_t*>(m_row);
+  for (int v_idx = 0; v_idx < condensed_cols / 4; ++v_idx) {
+    const int16_t* yp = y_packed + v_idx * kNumDigits * 16;
+    for (int d = 0; d < kNumDigits; ++d) {
+      int64_t sum_d = 0;
+      for (int lane = 0; lane < 16; ++lane) {
+        sum_d += static_cast<int64_t>(m_i16[v_idx * 16 + lane]) *
+                 static_cast<int64_t>(yp[d * 16 + lane]);
       }
+      total += static_cast<uint64_t>(sum_d) << (kShift + 14 * d);
     }
-    result[r] = total;
   }
+  return total;
 #endif
 }
 
-template <int kRowBlock, int kNumDigits, int kShift>
+template <int kNumDigits, int kShift>
 HWY_INLINE void RunCondensedMultiplyUint16(const uint64_t* data, int rows,
                                            int condensed_cols,
                                            absl::Span<const uint64_t> vec,
@@ -460,21 +432,10 @@ HWY_INLINE void RunCondensedMultiplyUint16(const uint64_t* data, int rows,
   }
   PackQueryDigitsUint16<kNumDigits, kShift>(vec, y_packed);
 
-  int i = 0;
-  if constexpr (kRowBlock > 1) {
-    for (; i + kRowBlock <= rows; i += kRowBlock) {
-      const uint64_t* m_rows[kRowBlock];
-      for (int r = 0; r < kRowBlock; ++r) {
-        m_rows[r] = &data[static_cast<size_t>(i + r) * condensed_cols];
-      }
-      CondensedMultiplyUint16Rows<kRowBlock, kNumDigits, kShift>(
-          m_rows, condensed_cols, y_packed, y_bias, &result[i]);
-    }
-  }
-  for (; i < rows; ++i) {
+  for (int i = 0; i < rows; ++i) {
     const uint64_t* m_row = &data[static_cast<size_t>(i) * condensed_cols];
-    CondensedMultiplyUint16Rows<1, kNumDigits, kShift>(
-        &m_row, condensed_cols, y_packed, y_bias, &result[i]);
+    result[i] = CondensedMultiplyUint16Row<kNumDigits, kShift>(
+        m_row, condensed_cols, y_packed, y_bias);
   }
 }
 
@@ -508,16 +469,16 @@ absl::StatusOr<std::vector<uint64_t>> CondensedMultiply<uint16_t>(
   std::vector<uint64_t> result(rows, 0);
   if (((or_all & 0xFFFULL) == 0) && ((or_all >> 52) == 0)) {
     // 40-bit modulus-switched selector in bits [12, 52): 3 signed 14-bit digits.
-    RunCondensedMultiplyUint16<1, 3, 12>(data.data(), rows, condensed_cols, vec,
-                                         y_bias, result.data());
+    RunCondensedMultiplyUint16<3, 12>(data.data(), rows, condensed_cols, vec,
+                                      y_bias, result.data());
   } else if ((or_all >> 55) == 0) {
     // Up to 55-bit query (including 52-bit RLWE modulus): 4 signed 14-bit digits.
-    RunCondensedMultiplyUint16<1, 4, 0>(data.data(), rows, condensed_cols, vec,
-                                        y_bias, result.data());
+    RunCondensedMultiplyUint16<4, 0>(data.data(), rows, condensed_cols, vec,
+                                     y_bias, result.data());
   } else {
     // General 64-bit vector: 5 signed 14-bit digits.
-    RunCondensedMultiplyUint16<1, 5, 0>(data.data(), rows, condensed_cols, vec,
-                                        y_bias, result.data());
+    RunCondensedMultiplyUint16<5, 0>(data.data(), rows, condensed_cols, vec,
+                                     y_bias, result.data());
   }
   return result;
 }

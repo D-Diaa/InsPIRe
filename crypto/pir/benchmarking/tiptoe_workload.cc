@@ -106,69 +106,16 @@ std::unique_ptr<::rlwe::SecurePrng> Prng(const std::string& seed) {
 }
 void PackCoeffsAppend(const std::vector<uint64_t>& coeffs, int bits,
                       std::string& wire) {
-  const size_t n = coeffs.size();
-  const size_t num_bytes = (n * static_cast<size_t>(bits) + 7) / 8;
-  const size_t old_size = wire.size();
-  wire.resize(old_size + num_bytes);
-  uint8_t* __restrict out_ptr =
-      reinterpret_cast<uint8_t*>(wire.data() + old_size);
-  const uint64_t mask =
-      (bits >= 64) ? ~uint64_t{0} : ((uint64_t{1} << bits) - 1);
-  unsigned __int128 bit_buf = 0;
-  int bits_in_buf = 0;
-  size_t byte_idx = 0;
-  for (size_t i = 0; i < n; ++i) {
-    bit_buf |= static_cast<unsigned __int128>(coeffs[i] & mask) << bits_in_buf;
-    bits_in_buf += bits;
-    if (bits_in_buf >= 64) {
-      uint64_t word = static_cast<uint64_t>(bit_buf);
-      std::memcpy(out_ptr + byte_idx, &word, sizeof(uint64_t));
-      bit_buf >>= 64;
-      bits_in_buf -= 64;
-      byte_idx += 8;
-    }
-  }
-  while (bits_in_buf > 0) {
-    out_ptr[byte_idx++] = static_cast<uint8_t>(bit_buf & 0xFF);
-    bit_buf >>= 8;
-    bits_in_buf -= 8;
-  }
+  Poly::PackCoefficientsAppend(coeffs, bits, wire);
 }
 
 std::vector<uint64_t> UnpackCoeffs(const std::string& wire, size_t& off,
                                    int degree, int bits) {
   const size_t num_bytes = (static_cast<size_t>(degree) * bits + 7) / 8;
   Check(num_bytes <= wire.size() - off, "Invalid polynomial payload");
-  const uint8_t* __restrict raw =
-      reinterpret_cast<const uint8_t*>(wire.data() + off);
+  absl::string_view slice(wire.data() + off, num_bytes);
   off += num_bytes;
-  std::vector<uint64_t> coeffs(degree);
-  const uint64_t mask =
-      (bits >= 64) ? ~uint64_t{0} : ((uint64_t{1} << bits) - 1);
-  unsigned __int128 bit_buf = 0;
-  int bits_in_buf = 0;
-  size_t byte_idx = 0;
-  for (int j = 0; j < degree; ++j) {
-    if (bits_in_buf < bits) {
-      if (byte_idx + 8 <= num_bytes) {
-        uint64_t word = 0;
-        std::memcpy(&word, raw + byte_idx, sizeof(uint64_t));
-        bit_buf |= static_cast<unsigned __int128>(word) << bits_in_buf;
-        bits_in_buf += 64;
-        byte_idx += 8;
-      } else {
-        while (byte_idx < num_bytes && bits_in_buf <= 120) {
-          bit_buf |= static_cast<unsigned __int128>(raw[byte_idx++])
-                     << bits_in_buf;
-          bits_in_buf += 8;
-        }
-      }
-    }
-    coeffs[j] = static_cast<uint64_t>(bit_buf) & mask;
-    bit_buf >>= bits;
-    bits_in_buf -= bits;
-  }
-  return coeffs;
+  return Take(Poly::UnpackCoefficients(slice, degree, bits));
 }
 void Pin(int cpu, const char* error) {
   cpu_set_t mask;

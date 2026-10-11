@@ -516,6 +516,21 @@ absl::StatusOr<RlweCiphertext<CoeffType>> FinalizeMatrixPack(
   return RlweCiphertext<CoeffType>{a_tilde_agg, std::move(b_agg)};
 }
 
+template <typename CoeffType>
+absl::StatusOr<RlweCiphertext<CoeffType>> FinalizeMatrixPack(
+    const RlweParams<CoeffType>& params, const std::vector<CoeffType>& b,
+    const std::vector<CoeffType>& b_agg_partial,
+    const std::vector<Polynomial<CoeffType>>& y_vec_h,
+    const std::vector<Polynomial<CoeffType>>& t_vec_h,
+    const Polynomial<CoeffType>& a_tilde_agg, const GadgetParams& gadget_params,
+    FftContext& ctx) {
+  ASSIGN_OR_RETURN(ChunkedFft y_vec_h_fft, YVecHFft(params, y_vec_h, ctx));
+  ASSIGN_OR_RETURN(ChunkedFft t_vec_h_fft,
+                   TVecHFft(t_vec_h, gadget_params, ctx));
+  return FinalizeMatrixPack(params, b, b_agg_partial, y_vec_h_fft, t_vec_h_fft,
+                            a_tilde_agg, ctx);
+}
+
 template <typename CoeffType, typename MatCoeffType>
 absl::StatusOr<RlweCiphertext<CoeffType>> MatrixPack(
     const RlweParams<CoeffType>& params, const std::vector<CoeffType>& b,
@@ -540,11 +555,9 @@ absl::StatusOr<RlweCiphertext<CoeffType>> MatrixPack(
       std::vector<CoeffType> b_agg_partial,
       preprocess_output.matrix.template Multiply<CoeffType>(y_vec_g_vec));
 
-  ASSIGN_OR_RETURN(ChunkedFft y_vec_h_fft, YVecHFft(params, y_vec_h, ctx));
-  ASSIGN_OR_RETURN(ChunkedFft t_vec_h_fft,
-                   TVecHFft(preprocess_output.t_vec_h, gadget_params, ctx));
-  return FinalizeMatrixPack(params, b, b_agg_partial, y_vec_h_fft,
-                            t_vec_h_fft, preprocess_output.a_tilde_agg, ctx);
+  return FinalizeMatrixPack(params, b, b_agg_partial, y_vec_h,
+                            preprocess_output.t_vec_h,
+                            preprocess_output.a_tilde_agg, gadget_params, ctx);
 }
 
 template absl::StatusOr<PreprocessPackOutput<uint32_t>> PreprocessPack(
@@ -636,6 +649,18 @@ template absl::StatusOr<RlweCiphertext<uint64_t>> FinalizeMatrixPack(
     const RlweParams<uint64_t>&, const std::vector<uint64_t>&,
     const std::vector<uint64_t>&, const ChunkedFft&, const ChunkedFft&,
     const Polynomial<uint64_t>&, FftContext&);
+
+template absl::StatusOr<RlweCiphertext<uint32_t>> FinalizeMatrixPack(
+    const RlweParams<uint32_t>&, const std::vector<uint32_t>&,
+    const std::vector<uint32_t>&, const std::vector<Polynomial<uint32_t>>&,
+    const std::vector<Polynomial<uint32_t>>&, const Polynomial<uint32_t>&,
+    const GadgetParams&, FftContext&);
+
+template absl::StatusOr<RlweCiphertext<uint64_t>> FinalizeMatrixPack(
+    const RlweParams<uint64_t>&, const std::vector<uint64_t>&,
+    const std::vector<uint64_t>&, const std::vector<Polynomial<uint64_t>>&,
+    const std::vector<Polynomial<uint64_t>>&, const Polynomial<uint64_t>&,
+    const GadgetParams&, FftContext&);
 
 // Instantiations for MatrixPack
 template absl::StatusOr<RlweCiphertext<uint32_t>> MatrixPack(

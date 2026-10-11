@@ -39,17 +39,7 @@ namespace v2 {
 template <typename CoeffType>
 absl::StatusOr<RlweParams<CoeffType>> RlweParams<CoeffType>::Create(
     int degree, CoeffType modulus, int variance) {
-  if (!absl::has_single_bit(static_cast<uint64_t>(degree))) {
-    return absl::InvalidArgumentError("Ring degree must be a power of 2.");
-  }
-  if (modulus != 0 && !absl::has_single_bit(modulus)) {
-    return absl::InvalidArgumentError(
-        "Coefficient modulus must be a power of 2 or 0.");
-  }
-  if (variance <= 0) {
-    return absl::InvalidArgumentError("variance must be positive.");
-  }
-  return RlweParams(degree, modulus, variance);
+  return Create(degree, modulus, modulus, modulus, variance);
 }
 
 template <typename CoeffType>
@@ -346,9 +336,6 @@ absl::StatusOr<RlweCiphertext<CoeffType>> EncryptFromRlweSample(
     return absl::InvalidArgumentError("message length must match degree.");
   }
 
-  absl::uint128 q_128 = absl::uint128{1} << params.LogModulus();
-  absl::uint128 p_128 = plaintext_modulus;
-
   std::vector<CoeffType> b_coeffs = rlwe_sample.b.Coeffs();
   if (absl::has_single_bit(static_cast<uint64_t>(plaintext_modulus)) &&
       params.LogModulus() >=
@@ -400,6 +387,44 @@ absl::StatusOr<RlweCiphertext<CoeffType>> EncryptRlwe(
                                message);
 }
 
+namespace {
+
+template <typename CoeffType>
+std::vector<CoeffType> DecodeNoisyPlaintext(
+    const Polynomial<CoeffType>& noisy_m, int log_q,
+    CoeffType plaintext_modulus) {
+  const int d = noisy_m.Len();
+  const CoeffType q_mask =
+      (log_q <= 0 || log_q >= static_cast<int>(8 * sizeof(CoeffType)))
+          ? ~CoeffType{0}
+          : ((CoeffType{1} << log_q) - 1);
+  std::vector<CoeffType> m_coeffs(d);
+  if (absl::has_single_bit(static_cast<uint64_t>(plaintext_modulus)) &&
+      log_q >= absl::bit_width(static_cast<uint64_t>(plaintext_modulus)) - 1) {
+    const int log_p =
+        absl::bit_width(static_cast<uint64_t>(plaintext_modulus)) - 1;
+    const int shift = log_q - log_p;
+    const CoeffType half = shift > 0 ? (CoeffType{1} << (shift - 1)) : 0;
+    const CoeffType p_mask = plaintext_modulus - 1;
+    for (int i = 0; i < d; ++i) {
+      CoeffType val = noisy_m.Coeffs()[i] & q_mask;
+      m_coeffs[i] = ((val + half) >> shift) & p_mask;
+    }
+  } else {
+    absl::uint128 q_128 = absl::uint128{1} << log_q;
+    absl::uint128 p_128 = plaintext_modulus;
+    for (int i = 0; i < d; ++i) {
+      CoeffType val = noisy_m.Coeffs()[i] & q_mask;
+      absl::uint128 v_128 = val;
+      m_coeffs[i] = static_cast<CoeffType>((v_128 * p_128 + q_128 / 2) / q_128 %
+                                           plaintext_modulus);
+    }
+  }
+  return m_coeffs;
+}
+
+}  // namespace
+
 template <typename CoeffType>
 absl::StatusOr<std::vector<CoeffType>> Decrypt(
     const RlweParams<CoeffType>& params, const CoeffType plaintext_modulus,
@@ -407,7 +432,6 @@ absl::StatusOr<std::vector<CoeffType>> Decrypt(
     const NttPolynomial& secret_key_ntt,
     const Context& ctx) {
   const int d = params.Degree();
-  const CoeffType q = params.Modulus();
   const int log_q = params.LogModulus();
   if (plaintext_modulus <= 0) {
     return absl::InvalidArgumentError("Plaintext modulus must be positive.");
@@ -420,31 +444,7 @@ absl::StatusOr<std::vector<CoeffType>> Decrypt(
   ASSIGN_OR_RETURN(auto noisy_m, ciphertext.b.Add(as));
   ASSIGN_OR_RETURN(noisy_m, noisy_m.LowBits(log_q));
 
-  std::vector<CoeffType> m_coeffs(d);
-  if (absl::has_single_bit(static_cast<uint64_t>(plaintext_modulus)) &&
-      log_q >= absl::bit_width(static_cast<uint64_t>(plaintext_modulus)) - 1) {
-    const int log_p =
-        absl::bit_width(static_cast<uint64_t>(plaintext_modulus)) - 1;
-    const int shift = log_q - log_p;
-    const CoeffType half = shift > 0 ? (CoeffType{1} << (shift - 1)) : 0;
-    const CoeffType p_mask = plaintext_modulus - 1;
-    for (int i = 0; i < d; ++i) {
-      CoeffType val = noisy_m.Coeffs()[i] & (q - 1);
-      m_coeffs[i] = ((val + half) >> shift) & p_mask;
-    }
-  } else {
-    absl::uint128 q_128 = absl::uint128{1} << log_q;
-    absl::uint128 p_128 = plaintext_modulus;
-    for (int i = 0; i < d; ++i) {
-      CoeffType val = noisy_m.Coeffs()[i] & (q - 1);
-      // Decode with exact fraction round(c * P / Q)
-      absl::uint128 v_128 = val;
-      m_coeffs[i] = static_cast<CoeffType>((v_128 * p_128 + q_128 / 2) / q_128 %
-                                           plaintext_modulus);
-    }
-  }
-
-  return m_coeffs;
+  return DecodeNoisyPlaintext(noisy_m, log_q, plaintext_modulus);
 }
 
 template <typename CoeffType>
@@ -517,39 +517,7 @@ absl::StatusOr<std::vector<CoeffType>> DecryptAfterModulusSwitchImpl(
   // mod by q2
   ASSIGN_OR_RETURN(noisy_m, noisy_m.LowBits(log_q2));
 
-  CoeffType modulus2 = 1;
-  if (params.LogModulus2AfterSwitch() < 8 * sizeof(CoeffType)) {
-    modulus2 = CoeffType{1} << params.LogModulus2AfterSwitch();
-  } else {
-    modulus2 = 0;
-  }
-
-  std::vector<CoeffType> m_coeffs(d);
-  if (absl::has_single_bit(static_cast<uint64_t>(plaintext_modulus)) &&
-      log_q2 >= absl::bit_width(static_cast<uint64_t>(plaintext_modulus)) - 1) {
-    const int log_p =
-        absl::bit_width(static_cast<uint64_t>(plaintext_modulus)) - 1;
-    const int shift = log_q2 - log_p;
-    const CoeffType half = shift > 0 ? (CoeffType{1} << (shift - 1)) : 0;
-    const CoeffType p_mask = plaintext_modulus - 1;
-    const CoeffType q2_mask = modulus2 - 1;
-    for (int i = 0; i < d; ++i) {
-      CoeffType val = noisy_m.Coeffs()[i] & q2_mask;
-      m_coeffs[i] = ((val + half) >> shift) & p_mask;
-    }
-  } else {
-    absl::uint128 q_128 = absl::uint128{1} << log_q2;
-    absl::uint128 p_128 = plaintext_modulus;
-
-    for (int i = 0; i < d; ++i) {
-      CoeffType val = noisy_m.Coeffs()[i] & (modulus2 - 1);
-      absl::uint128 v_128 = val;
-      m_coeffs[i] = static_cast<CoeffType>((v_128 * p_128 + q_128 / 2) / q_128 %
-                                           plaintext_modulus);
-    }
-  }
-
-  return m_coeffs;
+  return DecodeNoisyPlaintext(noisy_m, log_q2, plaintext_modulus);
 }
 
 }  // namespace

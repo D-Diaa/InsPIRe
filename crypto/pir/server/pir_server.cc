@@ -17,76 +17,31 @@
 #include <algorithm>
 #include <cstddef>
 #include <cstdint>
-#include <cstring>
-#include <fstream>
-#include <ios>
 #include <memory>
 #include <string>
-#include <type_traits>
 #include <utility>
 #include <vector>
 
 #include "crypto/encryption.h"
 #include "crypto/external_product.h"
-#include "crypto/file_util.h"
 #include "crypto/lwes_to_rlwe.h"
 #include "crypto/matrix.h"
 #include "crypto/pir/pir_params.h"
 #include "crypto/pir/server/pir_preprocessed_data.h"
 #include "crypto/polynomial.h"
 #include "crypto/polynomial_fft.h"
+#include "crypto/status_macros.h"
 #include "absl/memory/memory.h"
 #include "absl/numeric/bits.h"
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
 #include "absl/strings/str_cat.h"
-#include "absl/strings/string_view.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
-#include "crypto/status_macros.h"
 
 namespace private_membership {
 namespace rlwe {
 namespace v2 {
-
-namespace {
-
-template <typename CoeffType>
-std::string PackCoefficientsToString(const std::vector<CoeffType>& coeffs,
-                                     int log_modulus) {
-  if (coeffs.empty() || log_modulus <= 0) return {};
-  const size_t total_bits = coeffs.size() * static_cast<size_t>(log_modulus);
-  const size_t expected_bytes = (total_bits + 7) / 8;
-  std::string bytes(expected_bytes, '\0');
-  uint8_t* __restrict out_ptr = reinterpret_cast<uint8_t*>(bytes.data());
-  const uint64_t mask = (log_modulus >= 64)
-                            ? ~uint64_t{0}
-                            : ((uint64_t{1} << log_modulus) - 1);
-  unsigned __int128 bit_buf = 0;
-  int bits_in_buf = 0;
-  size_t byte_idx = 0;
-  for (CoeffType coeff : coeffs) {
-    bit_buf |= static_cast<unsigned __int128>(static_cast<uint64_t>(coeff) &
-                                              mask)
-               << bits_in_buf;
-    bits_in_buf += log_modulus;
-    if (bits_in_buf >= 64) {
-      uint64_t word = static_cast<uint64_t>(bit_buf);
-      std::memcpy(out_ptr + byte_idx, &word, sizeof(uint64_t));
-      bit_buf >>= 64;
-      bits_in_buf -= 64;
-      byte_idx += 8;
-    }
-  }
-  while (bits_in_buf > 0) {
-    out_ptr[byte_idx++] = static_cast<uint8_t>(bit_buf & 0xFF);
-    bit_buf >>= 8;
-    bits_in_buf -= 8;
-  }
-  return bytes;
-}
-
-}  // namespace
 
 template <typename DbDataType, typename CoeffType, typename MatCoeffType>
 absl::StatusOr<std::unique_ptr<PirServer<DbDataType, CoeffType, MatCoeffType>>>
@@ -132,9 +87,6 @@ PirServer<DbDataType, CoeffType, MatCoeffType>::Create(
         "second_dim_query_a must have length 2 * "
         "PolyEvalGadgetParams().num_digits.");
   }
-  ASSIGN_OR_RETURN(
-      auto fft_ctx,
-      FftContext::Create(absl::bit_width(static_cast<uint32_t>(d)) - 1));
 
   // Combine db_matrices
   ASSIGN_OR_RETURN(
@@ -156,34 +108,50 @@ PirServer<DbDataType, CoeffType, MatCoeffType>::Create(
   ASSIGN_OR_RETURN(auto combined_pack_matrix,
                    Matrix<MatCoeffType>::VerticalConcatenate(pack_matrices));
 
+  return CreateFromComponents(params, std::move(combined_db_matrix),
+                              std::move(combined_pack_matrix),
+                              std::move(preprocessed_data.preprocessed_outputs),
+                              std::move(preprocessed_data.second_dim_a));
+}
+
+template <typename DbDataType, typename CoeffType, typename MatCoeffType>
+absl::StatusOr<std::unique_ptr<PirServer<DbDataType, CoeffType, MatCoeffType>>>
+PirServer<DbDataType, CoeffType, MatCoeffType>::CreateFromComponents(
+    const PirParams<CoeffType>& params, Matrix<DbDataType> combined_db_matrix,
+    Matrix<MatCoeffType> combined_pack_matrix,
+    std::vector<
+        std::vector<PreprocessMatrixPackOutput<CoeffType, MatCoeffType>>>
+        preprocessed_outputs,
+    std::vector<Polynomial<CoeffType>> second_dim_query_a) {
+  const int d = params.RlweParameters().Degree();
   ASSIGN_OR_RETURN(
-      auto t_vec_h_ffts,
-      PrecomputeTVecHFfts(params, preprocessed_data.preprocessed_outputs,
-                          *fft_ctx));
+      auto fft_ctx,
+      FftContext::Create(absl::bit_width(static_cast<uint32_t>(d)) - 1));
+  ASSIGN_OR_RETURN(auto t_vec_h_ffts,
+                   PrecomputeTVecHFfts(params, preprocessed_outputs, *fft_ctx));
 
   std::vector<Polynomial<CoeffType>> a_mod_switched_t1;
   std::vector<std::string> a_mod_switched_t1_packed;
-  if (t == 1) {
-    a_mod_switched_t1.reserve(entry_size_multiple);
-    a_mod_switched_t1_packed.reserve(entry_size_multiple);
+  if (params.InterpolationDegree() == 1) {
+    a_mod_switched_t1.reserve(preprocessed_outputs.size());
+    a_mod_switched_t1_packed.reserve(preprocessed_outputs.size());
     const int log_q1 = params.RlweParameters().LogModulus1AfterSwitch();
-    for (int k = 0; k < entry_size_multiple; ++k) {
+    for (size_t k = 0; k < preprocessed_outputs.size(); ++k) {
       ASSIGN_OR_RETURN(
           auto a_ms,
-          preprocessed_data.preprocessed_outputs[k][0].a_tilde_agg.Rescale(
+          preprocessed_outputs[k][0].a_tilde_agg.Rescale(
               params.RlweParameters().LogModulus(), log_q1));
       a_mod_switched_t1_packed.push_back(
-          PackCoefficientsToString(a_ms.Coeffs(), log_q1));
+          Polynomial<CoeffType>::PackCoefficients(a_ms.Coeffs(), log_q1));
       a_mod_switched_t1.push_back(std::move(a_ms));
     }
   }
 
   return absl::WrapUnique(new PirServer<DbDataType, CoeffType, MatCoeffType>(
       params, std::move(combined_db_matrix), std::move(combined_pack_matrix),
-      std::move(preprocessed_data.preprocessed_outputs),
-      std::move(t_vec_h_ffts), std::move(a_mod_switched_t1),
-      std::move(a_mod_switched_t1_packed),
-      std::move(preprocessed_data.second_dim_a), std::move(fft_ctx)));
+      std::move(preprocessed_outputs), std::move(t_vec_h_ffts),
+      std::move(a_mod_switched_t1), std::move(a_mod_switched_t1_packed),
+      std::move(second_dim_query_a), std::move(fft_ctx)));
 }
 
 template <typename DbDataType, typename CoeffType, typename MatCoeffType>
@@ -268,9 +236,6 @@ PirServer<DbDataType, CoeffType, MatCoeffType>::ProcessResponse(
 
   // Stage 3 (setup): Second dimension query processing via polynomial
   // evaluation.
-
-  // Construct the full RGSW ciphertext (the evaluation point) from the given a
-  // component and the second dimension query sent by the client, if applicable.
   RgswCiphertext<CoeffType> rgsw_ct;
   if (t > 1) {
     const int eval_num_digits = params_.PolyEvalGadgetParams().num_digits;
@@ -336,7 +301,7 @@ PirServer<DbDataType, CoeffType, MatCoeffType>::ProcessResponse(
     return absl::InternalError(
         "Packing multiplication resulted in incorrect vector size.");
   }
-  const auto matrix_elapsed=absl::Now()-start_pack;
+  const auto matrix_elapsed = absl::Now() - start_pack;
   packing_time_ += matrix_elapsed;
   pack_matrix_time_ += matrix_elapsed;
 
@@ -353,6 +318,7 @@ PirServer<DbDataType, CoeffType, MatCoeffType>::ProcessResponse(
   }
 
   const int log_q = params_.RlweParameters().LogModulus();
+  const int log_q1 = params_.RlweParameters().LogModulus1AfterSwitch();
   const int log_q2 = params_.RlweParameters().LogModulus2AfterSwitch();
   const CoeffType q_mask =
       (log_q <= 0 || log_q >= static_cast<int>(8 * sizeof(CoeffType)))
@@ -360,12 +326,14 @@ PirServer<DbDataType, CoeffType, MatCoeffType>::ProcessResponse(
           : ((CoeffType{1} << log_q) - 1);
 
   for (int k = 0; k < entry_size_multiple; ++k) {
-    if (t == 1) {
-      start_pack = absl::Now();
-      const size_t offset = static_cast<size_t>(k) * d;
+    start_pack = absl::Now();
+    std::vector<RlweCiphertext<CoeffType>> packed_ciphertexts;
+    packed_ciphertexts.reserve(t);
+    for (int i = 0; i < t; ++i) {
+      const size_t offset = static_cast<size_t>(k * t + i) * d;
       ASSIGN_OR_RETURN(
           Polynomial<CoeffType> b_agg,
-          Polynomial<CoeffType>::InnerProductFft(t_vec_h_ffts_[k][0],
+          Polynomial<CoeffType>::InnerProductFft(t_vec_h_ffts_[k][i],
                                                  *y_vec_h_fft, *fft_ctx));
       CoeffType* __restrict b_ptr = b_agg.MutableCoeffs().data();
       const CoeffType* __restrict bp_ptr = b_prime_all.data() + offset;
@@ -373,611 +341,58 @@ PirServer<DbDataType, CoeffType, MatCoeffType>::ProcessResponse(
       for (int m = 0; m < d; ++m) {
         b_ptr[m] = (b_ptr[m] + bp_ptr[m] + ba_ptr[m]) & q_mask;
       }
-      const auto finalize_elapsed = absl::Now() - start_pack;
-      packing_time_ += finalize_elapsed;
-      finalize_time_ += finalize_elapsed;
-
-      const auto start_modswitch = absl::Now();
-      if (log_q > log_q2) {
-        const int shift = log_q - log_q2;
-        const CoeffType half = CoeffType{1} << (shift - 1);
-        for (int m = 0; m < d; ++m) {
-          b_ptr[m] = static_cast<CoeffType>(
-              (static_cast<absl::uint128>(b_ptr[m]) + half) >> shift);
-        }
-      } else if (log_q < log_q2) {
-        const int shift = log_q2 - log_q;
-        for (int m = 0; m < d; ++m) {
-          b_ptr[m] <<= shift;
-        }
+      Polynomial<CoeffType> a_tilde;
+      if (t > 1) {
+        a_tilde = preprocessed_outputs_[k][i].a_tilde_agg;
       }
-      Polynomial<CoeffType> a_mod_switched;
-      if (!skip_a_t1 && static_cast<size_t>(k) < a_mod_switched_t1_.size()) {
-        a_mod_switched = a_mod_switched_t1_[k];
-      }
-      shard_responses.push_back(
-          {std::move(a_mod_switched), std::move(b_agg)});
-      modswitch_time_ += absl::Now() - start_modswitch;
-      continue;
+      packed_ciphertexts.push_back({std::move(a_tilde), std::move(b_agg)});
     }
-
-    start_pack = absl::Now();
-    // Stage 2: Packing
-    std::vector<RlweCiphertext<CoeffType>> packed_ciphertexts;
-    packed_ciphertexts.reserve(t);
-    for (int i = 0; i < t; ++i) {
-      const size_t offset = k * t * d + i * d;
-      // Extract d consecutive elements from b'
-      std::vector<CoeffType> chunk(b_prime_all.begin() + offset,
-                                   b_prime_all.begin() + offset + d);
-
-      // Extract d consecutive elements from b_agg_partial_all
-      std::vector<CoeffType> b_agg_partial(
-          b_agg_partial_all.begin() + offset,
-          b_agg_partial_all.begin() + offset + d);
-
-      // Call FinalizeMatrixPack for this chunk.
-      ASSIGN_OR_RETURN(
-          RlweCiphertext<CoeffType> pack_result,
-          FinalizeMatrixPack(params_.RlweParameters(), chunk, b_agg_partial,
-                             *y_vec_h_fft, t_vec_h_ffts_[k][i],
-                             preprocessed_outputs_[k][i].a_tilde_agg,
-                             *fft_ctx));
-      packed_ciphertexts.push_back(std::move(pack_result));
-    }
-    const auto finalize_elapsed=absl::Now()-start_pack;
+    const auto finalize_elapsed = absl::Now() - start_pack;
     packing_time_ += finalize_elapsed;
     finalize_time_ += finalize_elapsed;
 
-    auto start_eval = absl::Now();
-    ASSIGN_OR_RETURN(RlweCiphertext<CoeffType> final_ciphertext,
-                     EvalPoly(packed_ciphertexts, rgsw_ct, *fft_ctx));
-    poly_eval_time_ += (absl::Now() - start_eval);
-
-    const auto start_modswitch=absl::Now();
-    Polynomial<CoeffType> a_mod_switched;
-    if (t == 1 && static_cast<size_t>(k) < a_mod_switched_t1_.size()) {
-      a_mod_switched = a_mod_switched_t1_[k];
+    RlweCiphertext<CoeffType> final_ciphertext;
+    if (t == 1) {
+      final_ciphertext = std::move(packed_ciphertexts[0]);
     } else {
-      // mod switch the first component of the ciphertext to q1
-      ASSIGN_OR_RETURN(a_mod_switched,
-                       final_ciphertext.a.Rescale(
-                           params_.RlweParameters().LogModulus(),
-                           params_.RlweParameters().LogModulus1AfterSwitch()));
+      auto start_eval = absl::Now();
+      ASSIGN_OR_RETURN(final_ciphertext,
+                       EvalPoly(packed_ciphertexts, rgsw_ct, *fft_ctx));
+      poly_eval_time_ += (absl::Now() - start_eval);
     }
 
-    // mod switch the second component of the ciphertext to q2
-    ASSIGN_OR_RETURN(auto b_mod_switched,
-                     final_ciphertext.b.Rescale(
-                         params_.RlweParameters().LogModulus(),
-                         params_.RlweParameters().LogModulus2AfterSwitch()));
+    const auto start_modswitch = absl::Now();
+    Polynomial<CoeffType> a_mod_switched;
+    if (t == 1) {
+      if (!skip_a_t1 && static_cast<size_t>(k) < a_mod_switched_t1_.size()) {
+        a_mod_switched = a_mod_switched_t1_[k];
+      }
+    } else {
+      ASSIGN_OR_RETURN(a_mod_switched,
+                       final_ciphertext.a.Rescale(log_q, log_q1));
+    }
 
-    RlweCiphertext<CoeffType> final_ciphertext_mod_switched = {
-        std::move(a_mod_switched), std::move(b_mod_switched)};
+    CoeffType* __restrict b_ptr = final_ciphertext.b.MutableCoeffs().data();
+    if (log_q > log_q2) {
+      const int shift = log_q - log_q2;
+      const CoeffType half = CoeffType{1} << (shift - 1);
+      for (int m = 0; m < d; ++m) {
+        b_ptr[m] = static_cast<CoeffType>(
+            (static_cast<absl::uint128>(b_ptr[m]) + half) >> shift);
+      }
+    } else if (log_q < log_q2) {
+      const int shift = log_q2 - log_q;
+      for (int m = 0; m < d; ++m) {
+        b_ptr[m] <<= shift;
+      }
+    }
 
-    shard_responses.push_back(std::move(final_ciphertext_mod_switched));
-    modswitch_time_ += absl::Now()-start_modswitch;
+    shard_responses.push_back(
+        {std::move(a_mod_switched), std::move(final_ciphertext.b)});
+    modswitch_time_ += absl::Now() - start_modswitch;
   }
 
   return PirResponse<CoeffType>{std::move(shard_responses)};
-}
-
-namespace {
-
-template <typename SignedType>
-std::vector<uint8_t> BitPackSigned(const std::vector<SignedType>& values,
-                                   int num_bits) {
-  if (values.empty() || num_bits <= 0) return {};
-  size_t total_bits = values.size() * num_bits;
-  size_t total_bytes = (total_bits + 7) / 8;
-  std::vector<uint8_t> out(total_bytes, 0);
-
-  uint64_t mask = (num_bits == 64) ? ~0ULL : ((1ULL << num_bits) - 1);
-  uint64_t bit_pos = 0;
-  for (SignedType val : values) {
-    uint64_t v = static_cast<uint64_t>(
-                     static_cast<std::make_unsigned_t<SignedType>>(val)) &
-                 mask;
-    int bits_left = num_bits;
-    while (bits_left > 0) {
-      size_t byte_idx = bit_pos / 8;
-      int bit_offset = bit_pos % 8;
-      int take = std::min(bits_left, 8 - bit_offset);
-      uint8_t m = (1 << take) - 1;
-      out[byte_idx] |= static_cast<uint8_t>((v & m) << bit_offset);
-      v >>= take;
-      bit_pos += take;
-      bits_left -= take;
-    }
-  }
-  return out;
-}
-
-template <typename SignedType>
-std::vector<SignedType> BitUnpackSigned(const uint8_t* data, size_t num_values,
-                                        int num_bits) {
-  std::vector<SignedType> out(num_values, 0);
-  if (num_values == 0 || num_bits <= 0) return out;
-
-  uint64_t bit_pos = 0;
-  for (size_t i = 0; i < num_values; ++i) {
-    uint64_t val = 0;
-    int bits_left = num_bits;
-    int shift = 0;
-    while (bits_left > 0) {
-      size_t byte_idx = bit_pos / 8;
-      int bit_offset = bit_pos % 8;
-      int take = std::min(bits_left, 8 - bit_offset);
-      uint8_t chunk = (data[byte_idx] >> bit_offset) & ((1 << take) - 1);
-      val |= (static_cast<uint64_t>(chunk) << shift);
-      shift += take;
-      bit_pos += take;
-      bits_left -= take;
-    }
-    // Sign-extend if negative
-    if (num_bits < 64 && (val & (1ULL << (num_bits - 1)))) {
-      val |= ~((1ULL << num_bits) - 1);
-    }
-    out[i] = static_cast<SignedType>(val);
-  }
-  return out;
-}
-
-template <typename CoeffType>
-std::vector<uint8_t> BitPackCoefficients(const std::vector<CoeffType>& values,
-                                         int bits_per_val) {
-  if (values.empty() || bits_per_val <= 0) return {};
-  if (bits_per_val >= static_cast<int>(sizeof(CoeffType) * 8)) {
-    std::vector<uint8_t> out(values.size() * sizeof(CoeffType));
-    std::memcpy(out.data(), values.data(), out.size());
-    return out;
-  }
-  size_t total_bits = values.size() * bits_per_val;
-  size_t total_bytes = (total_bits + 7) / 8;
-  std::vector<uint8_t> out(total_bytes, 0);
-
-  uint64_t bit_pos = 0;
-  for (CoeffType val : values) {
-    uint64_t v = static_cast<uint64_t>(val) &
-                 ((bits_per_val == 64) ? ~0ULL : ((1ULL << bits_per_val) - 1));
-    int bits_left = bits_per_val;
-    while (bits_left > 0) {
-      size_t byte_idx = bit_pos / 8;
-      int bit_offset = bit_pos % 8;
-      int take = std::min(bits_left, 8 - bit_offset);
-      uint8_t mask = (1 << take) - 1;
-      out[byte_idx] |= static_cast<uint8_t>((v & mask) << bit_offset);
-      v >>= take;
-      bit_pos += take;
-      bits_left -= take;
-    }
-  }
-  return out;
-}
-
-template <typename CoeffType>
-std::vector<CoeffType> BitUnpackCoefficients(const uint8_t* data,
-                                             size_t num_values,
-                                             int bits_per_val) {
-  std::vector<CoeffType> out(num_values, 0);
-  if (num_values == 0 || bits_per_val <= 0) return out;
-  if (bits_per_val >= static_cast<int>(sizeof(CoeffType) * 8)) {
-    std::memcpy(out.data(), data, num_values * sizeof(CoeffType));
-    return out;
-  }
-  uint64_t bit_pos = 0;
-  for (size_t i = 0; i < num_values; ++i) {
-    uint64_t val = 0;
-    int bits_left = bits_per_val;
-    int shift = 0;
-    while (bits_left > 0) {
-      size_t byte_idx = bit_pos / 8;
-      int bit_offset = bit_pos % 8;
-      int take = std::min(bits_left, 8 - bit_offset);
-      uint8_t chunk = (data[byte_idx] >> bit_offset) & ((1 << take) - 1);
-      val |= (static_cast<uint64_t>(chunk) << shift);
-      shift += take;
-      bit_pos += take;
-      bits_left -= take;
-    }
-    out[i] = static_cast<CoeffType>(val);
-  }
-  return out;
-}
-
-}  // namespace
-
-template <typename DbDataType, typename CoeffType, typename MatCoeffType>
-absl::Status PirServer<DbDataType, CoeffType, MatCoeffType>::SaveToFile(
-    absl::string_view file_path) const {
-  std::ofstream out(std::string(file_path), std::ios::binary);
-  if (!out.is_open()) {
-    return absl::InternalError(
-        absl::StrCat("Failed to open file for writing: ", file_path));
-  }
-
-  // 1. Write combined_db_matrix_
-  int32_t db_rows = combined_db_matrix_.Rows();
-  int32_t db_cols = combined_db_matrix_.PhysicalCols();
-  uint8_t db_condensed = combined_db_matrix_.IsCondensed() ? 1 : 0;
-  int32_t db_orig_cols = combined_db_matrix_.OriginalCols();
-  out.write(reinterpret_cast<const char*>(&db_rows), sizeof(db_rows));
-  out.write(reinterpret_cast<const char*>(&db_cols), sizeof(db_cols));
-  out.write(reinterpret_cast<const char*>(&db_condensed), sizeof(db_condensed));
-  out.write(reinterpret_cast<const char*>(&db_orig_cols), sizeof(db_orig_cols));
-
-  if (combined_db_matrix_.IsCondensed()) {
-    const auto& cdata = combined_db_matrix_.CondensedData();
-    uint64_t num_elems = cdata.size();
-    out.write(reinterpret_cast<const char*>(&num_elems), sizeof(num_elems));
-    if (num_elems > 0) {
-      out.write(reinterpret_cast<const char*>(cdata.data()),
-                num_elems * sizeof(uint64_t));
-    }
-  } else {
-    const auto& data = combined_db_matrix_.Data();
-    uint64_t num_elems = data.size();
-    out.write(reinterpret_cast<const char*>(&num_elems), sizeof(num_elems));
-    if (num_elems > 0) {
-      out.write(reinterpret_cast<const char*>(data.data()),
-                num_elems * sizeof(DbDataType));
-    }
-  }
-
-  // 2. Write combined_pack_matrix_ in bit-packed format (pack_log_digit +
-  // log2(d) bits per value).
-  int32_t pack_rows = combined_pack_matrix_.Rows();
-  int32_t pack_cols = combined_pack_matrix_.Cols();
-  int32_t pack_phys_cols = combined_pack_matrix_.PhysicalCols();
-  uint8_t pack_condensed = combined_pack_matrix_.IsCondensed() ? 1 : 0;
-  int32_t pack_orig_cols = combined_pack_matrix_.OriginalCols();
-  int32_t log2_d = absl::bit_width(
-      static_cast<uint32_t>(params_.RlweParameters().Degree() - 1));
-  int32_t pack_bits_per_entry = params_.PackGadgetParams().log_digit + log2_d;
-
-  out.write(reinterpret_cast<const char*>(&pack_rows), sizeof(pack_rows));
-  out.write(reinterpret_cast<const char*>(&pack_cols), sizeof(pack_cols));
-  out.write(reinterpret_cast<const char*>(&pack_phys_cols),
-            sizeof(pack_phys_cols));
-  out.write(reinterpret_cast<const char*>(&pack_condensed),
-            sizeof(pack_condensed));
-  out.write(reinterpret_cast<const char*>(&pack_orig_cols),
-            sizeof(pack_orig_cols));
-  out.write(reinterpret_cast<const char*>(&pack_bits_per_entry),
-            sizeof(pack_bits_per_entry));
-
-  std::vector<MatCoeffType> pack_entries;
-  pack_entries.reserve(static_cast<size_t>(pack_rows) * pack_cols);
-  if (combined_pack_matrix_.IsCondensed()) {
-    const auto& cdata = combined_pack_matrix_.CondensedData();
-    for (int r = 0; r < pack_rows; ++r) {
-      for (int c = 0; c < pack_cols; ++c) {
-        if constexpr (std::is_same_v<MatCoeffType, int32_t>) {
-          uint64_t w = cdata[static_cast<size_t>(r) * pack_phys_cols + (c / 2)];
-          int32_t val = (c % 2 == 0)
-                            ? static_cast<int32_t>(w & 0xFFFFFFFFULL)
-                            : static_cast<int32_t>((w >> 32) & 0xFFFFFFFFULL);
-          pack_entries.push_back(val);
-        } else if constexpr (std::is_same_v<MatCoeffType, int16_t>) {
-          uint64_t w = cdata[static_cast<size_t>(r) * pack_phys_cols + (c / 4)];
-          int16_t val = static_cast<int16_t>((w >> ((c % 4) * 16)) & 0xFFFFULL);
-          pack_entries.push_back(val);
-        } else {
-          pack_entries.push_back(0);
-        }
-      }
-    }
-  } else {
-    pack_entries = combined_pack_matrix_.Data();
-  }
-
-  auto packed_matrix_bytes = BitPackSigned(pack_entries, pack_bits_per_entry);
-  uint64_t packed_matrix_len = packed_matrix_bytes.size();
-  out.write(reinterpret_cast<const char*>(&packed_matrix_len),
-            sizeof(packed_matrix_len));
-  if (packed_matrix_len > 0) {
-    out.write(reinterpret_cast<const char*>(packed_matrix_bytes.data()),
-              packed_matrix_len);
-  }
-
-  // 3. Write preprocessed_outputs_ in bit-packed format.
-  int32_t log_modulus = params_.RlweParameters().LogModulus();
-  out.write(reinterpret_cast<const char*>(&log_modulus), sizeof(log_modulus));
-
-  int32_t num_shards = static_cast<int32_t>(preprocessed_outputs_.size());
-  out.write(reinterpret_cast<const char*>(&num_shards), sizeof(num_shards));
-  for (int32_t k = 0; k < num_shards; ++k) {
-    int32_t num_slices = static_cast<int32_t>(preprocessed_outputs_[k].size());
-    out.write(reinterpret_cast<const char*>(&num_slices), sizeof(num_slices));
-    for (int32_t i = 0; i < num_slices; ++i) {
-      // a_tilde_agg (bit-packed)
-      const auto& a_coeffs = preprocessed_outputs_[k][i].a_tilde_agg.Coeffs();
-      uint64_t a_len = a_coeffs.size();
-      out.write(reinterpret_cast<const char*>(&a_len), sizeof(a_len));
-      auto packed_a = BitPackCoefficients(a_coeffs, log_modulus);
-      uint64_t packed_a_len = packed_a.size();
-      out.write(reinterpret_cast<const char*>(&packed_a_len),
-                sizeof(packed_a_len));
-      if (packed_a_len > 0) {
-        out.write(reinterpret_cast<const char*>(packed_a.data()), packed_a_len);
-      }
-
-      // t_vec_h (bit-packed)
-      const auto& t_vec = preprocessed_outputs_[k][i].t_vec_h;
-      uint64_t t_vec_len = t_vec.size();
-      out.write(reinterpret_cast<const char*>(&t_vec_len), sizeof(t_vec_len));
-      for (const auto& poly : t_vec) {
-        const auto& p_coeffs = poly.Coeffs();
-        uint64_t p_len = p_coeffs.size();
-        out.write(reinterpret_cast<const char*>(&p_len), sizeof(p_len));
-        auto packed_p = BitPackCoefficients(p_coeffs, log_modulus);
-        uint64_t packed_p_len = packed_p.size();
-        out.write(reinterpret_cast<const char*>(&packed_p_len),
-                  sizeof(packed_p_len));
-        if (packed_p_len > 0) {
-          out.write(reinterpret_cast<const char*>(packed_p.data()),
-                    packed_p_len);
-        }
-      }
-    }
-  }
-
-  // 4. Write second_dim_query_a_ (bit-packed)
-  uint64_t num_second_dim_a = second_dim_query_a_.size();
-  out.write(reinterpret_cast<const char*>(&num_second_dim_a),
-            sizeof(num_second_dim_a));
-  for (const auto& poly : second_dim_query_a_) {
-    const auto& p_coeffs = poly.Coeffs();
-    uint64_t p_len = p_coeffs.size();
-    out.write(reinterpret_cast<const char*>(&p_len), sizeof(p_len));
-    auto packed_p = BitPackCoefficients(p_coeffs, log_modulus);
-    uint64_t packed_p_len = packed_p.size();
-    out.write(reinterpret_cast<const char*>(&packed_p_len),
-              sizeof(packed_p_len));
-    if (packed_p_len > 0) {
-      out.write(reinterpret_cast<const char*>(packed_p.data()), packed_p_len);
-    }
-  }
-
-  out.flush();
-  if (!out.good()) {
-    return absl::InternalError(
-        absl::StrCat("Error writing to file: ", file_path));
-  }
-  return absl::OkStatus();
-}
-
-template <typename DbDataType, typename CoeffType, typename MatCoeffType>
-absl::StatusOr<std::unique_ptr<PirServer<DbDataType, CoeffType, MatCoeffType>>>
-PirServer<DbDataType, CoeffType, MatCoeffType>::LoadFromBuffer(
-    const PirParams<CoeffType>& params, const uint8_t* buffer, size_t size) {
-  class BufferReader {
-   public:
-    BufferReader(const uint8_t* buffer, size_t size)
-        : buffer_(buffer), size_(size), offset_(0) {}
-    void read(char* dest, size_t n) {
-      if (offset_ + n > size_) {
-        ok_ = false;
-        return;
-      }
-      memcpy(dest, buffer_ + offset_, n);
-      offset_ += n;
-    }
-    bool is_open() const { return ok_; }
-    bool good() const { return ok_; }
-    bool eof() const { return offset_ >= size_; }
-
-   private:
-    const uint8_t* buffer_;
-    size_t size_;
-    size_t offset_;
-    bool ok_ = true;
-  };
-
-  BufferReader in(buffer, size);
-  if (!in.is_open()) {
-    return absl::InternalError("Failed to read buffer");
-  }
-
-  // 1. Read combined_db_matrix_
-  int32_t db_rows = 0, db_cols = 0, db_orig_cols = 0;
-  uint8_t db_condensed = 0;
-  in.read(reinterpret_cast<char*>(&db_rows), sizeof(db_rows));
-  in.read(reinterpret_cast<char*>(&db_cols), sizeof(db_cols));
-  in.read(reinterpret_cast<char*>(&db_condensed), sizeof(db_condensed));
-  in.read(reinterpret_cast<char*>(&db_orig_cols), sizeof(db_orig_cols));
-
-  uint64_t db_num_elems = 0;
-  in.read(reinterpret_cast<char*>(&db_num_elems), sizeof(db_num_elems));
-
-  Matrix<DbDataType> combined_db_matrix;
-  if (db_condensed != 0) {
-    std::vector<uint64_t> cdata(db_num_elems);
-    if (db_num_elems > 0) {
-      in.read(reinterpret_cast<char*>(cdata.data()),
-              db_num_elems * sizeof(uint64_t));
-    }
-    combined_db_matrix = Matrix<DbDataType>(
-        std::vector<DbDataType>(), std::move(cdata), db_rows, db_cols,
-        /*is_condensed=*/true, db_orig_cols);
-  } else {
-    std::vector<DbDataType> data(db_num_elems);
-    if (db_num_elems > 0) {
-      in.read(reinterpret_cast<char*>(data.data()),
-              db_num_elems * sizeof(DbDataType));
-    }
-    combined_db_matrix = Matrix<DbDataType>(
-        std::move(data), std::vector<uint64_t>(), db_rows, db_cols,
-        /*is_condensed=*/false, db_orig_cols);
-  }
-
-  // 2. Read combined_pack_matrix_ from bit-packed format.
-  int32_t pack_rows = 0, pack_cols = 0, pack_phys_cols = 0, pack_orig_cols = 0;
-  uint8_t pack_condensed = 0;
-  int32_t pack_bits_per_entry = 0;
-  in.read(reinterpret_cast<char*>(&pack_rows), sizeof(pack_rows));
-  in.read(reinterpret_cast<char*>(&pack_cols), sizeof(pack_cols));
-  in.read(reinterpret_cast<char*>(&pack_phys_cols), sizeof(pack_phys_cols));
-  in.read(reinterpret_cast<char*>(&pack_condensed), sizeof(pack_condensed));
-  in.read(reinterpret_cast<char*>(&pack_orig_cols), sizeof(pack_orig_cols));
-  in.read(reinterpret_cast<char*>(&pack_bits_per_entry),
-          sizeof(pack_bits_per_entry));
-
-  uint64_t packed_matrix_len = 0;
-  in.read(reinterpret_cast<char*>(&packed_matrix_len),
-          sizeof(packed_matrix_len));
-  std::vector<uint8_t> packed_matrix_bytes(packed_matrix_len);
-  if (packed_matrix_len > 0) {
-    in.read(reinterpret_cast<char*>(packed_matrix_bytes.data()),
-            packed_matrix_len);
-  }
-
-  size_t total_pack_entries = static_cast<size_t>(pack_rows) * pack_cols;
-  auto pack_entries = BitUnpackSigned<MatCoeffType>(
-      packed_matrix_bytes.data(), total_pack_entries, pack_bits_per_entry);
-
-  Matrix<MatCoeffType> combined_pack_matrix;
-  if (pack_condensed != 0) {
-    std::vector<uint64_t> cdata(static_cast<size_t>(pack_rows) * pack_phys_cols,
-                                0);
-    for (int r = 0; r < pack_rows; ++r) {
-      for (int c = 0; c < pack_cols; ++c) {
-        MatCoeffType val = pack_entries[static_cast<size_t>(r) * pack_cols + c];
-        if constexpr (std::is_same_v<MatCoeffType, int32_t>) {
-          if (c % 2 == 0) {
-            cdata[static_cast<size_t>(r) * pack_phys_cols + (c / 2)] |=
-                static_cast<uint64_t>(static_cast<uint32_t>(val));
-          } else {
-            cdata[static_cast<size_t>(r) * pack_phys_cols + (c / 2)] |=
-                (static_cast<uint64_t>(static_cast<uint32_t>(val)) << 32);
-          }
-        } else if constexpr (std::is_same_v<MatCoeffType, int16_t>) {
-          cdata[static_cast<size_t>(r) * pack_phys_cols + (c / 4)] |=
-              (static_cast<uint64_t>(static_cast<uint16_t>(val))
-               << ((c % 4) * 16));
-        }
-      }
-    }
-    combined_pack_matrix = Matrix<MatCoeffType>(
-        std::vector<MatCoeffType>(), std::move(cdata), pack_rows, pack_cols,
-        /*is_condensed=*/true, pack_orig_cols);
-  } else {
-    combined_pack_matrix = Matrix<MatCoeffType>(
-        std::move(pack_entries), std::vector<uint64_t>(), pack_rows, pack_cols,
-        /*is_condensed=*/false, pack_orig_cols);
-  }
-  // 3. Read preprocessed_outputs_ in bit-packed format.
-  int32_t log_modulus = 0;
-  in.read(reinterpret_cast<char*>(&log_modulus), sizeof(log_modulus));
-
-  int32_t num_shards = 0;
-  in.read(reinterpret_cast<char*>(&num_shards), sizeof(num_shards));
-  std::vector<std::vector<PreprocessMatrixPackOutput<CoeffType, MatCoeffType>>>
-      preprocessed_outputs(num_shards);
-  for (int32_t k = 0; k < num_shards; ++k) {
-    int32_t num_slices = 0;
-    in.read(reinterpret_cast<char*>(&num_slices), sizeof(num_slices));
-    preprocessed_outputs[k].resize(num_slices);
-    for (int32_t i = 0; i < num_slices; ++i) {
-      // a_tilde_agg (bit-unpacked)
-      uint64_t a_len = 0;
-      in.read(reinterpret_cast<char*>(&a_len), sizeof(a_len));
-      uint64_t packed_a_len = 0;
-      in.read(reinterpret_cast<char*>(&packed_a_len), sizeof(packed_a_len));
-      std::vector<uint8_t> packed_a(packed_a_len);
-      if (packed_a_len > 0) {
-        in.read(reinterpret_cast<char*>(packed_a.data()), packed_a_len);
-      }
-      auto a_coeffs =
-          BitUnpackCoefficients<CoeffType>(packed_a.data(), a_len, log_modulus);
-      ASSIGN_OR_RETURN(preprocessed_outputs[k][i].a_tilde_agg,
-                       Polynomial<CoeffType>::Create(std::move(a_coeffs)));
-
-      // t_vec_h (bit-unpacked)
-      uint64_t t_vec_len = 0;
-      in.read(reinterpret_cast<char*>(&t_vec_len), sizeof(t_vec_len));
-      preprocessed_outputs[k][i].t_vec_h.resize(t_vec_len);
-      for (uint64_t j = 0; j < t_vec_len; ++j) {
-        uint64_t p_len = 0;
-        in.read(reinterpret_cast<char*>(&p_len), sizeof(p_len));
-        uint64_t packed_p_len = 0;
-        in.read(reinterpret_cast<char*>(&packed_p_len), sizeof(packed_p_len));
-        std::vector<uint8_t> packed_p(packed_p_len);
-        if (packed_p_len > 0) {
-          in.read(reinterpret_cast<char*>(packed_p.data()), packed_p_len);
-        }
-        auto p_coeffs = BitUnpackCoefficients<CoeffType>(packed_p.data(), p_len,
-                                                         log_modulus);
-        ASSIGN_OR_RETURN(preprocessed_outputs[k][i].t_vec_h[j],
-                         Polynomial<CoeffType>::Create(std::move(p_coeffs)));
-      }
-    }
-  }
-
-  // 4. Read second_dim_query_a_ (bit-unpacked)
-  uint64_t num_second_dim_a = 0;
-  in.read(reinterpret_cast<char*>(&num_second_dim_a), sizeof(num_second_dim_a));
-  std::vector<Polynomial<CoeffType>> second_dim_query_a(num_second_dim_a);
-  for (uint64_t j = 0; j < num_second_dim_a; ++j) {
-    uint64_t p_len = 0;
-    in.read(reinterpret_cast<char*>(&p_len), sizeof(p_len));
-    uint64_t packed_p_len = 0;
-    in.read(reinterpret_cast<char*>(&packed_p_len), sizeof(packed_p_len));
-    std::vector<uint8_t> packed_p(packed_p_len);
-    if (packed_p_len > 0) {
-      in.read(reinterpret_cast<char*>(packed_p.data()), packed_p_len);
-    }
-    auto p_coeffs =
-        BitUnpackCoefficients<CoeffType>(packed_p.data(), p_len, log_modulus);
-    ASSIGN_OR_RETURN(second_dim_query_a[j],
-                     Polynomial<CoeffType>::Create(std::move(p_coeffs)));
-  }
-
-  if (!in.good() && !in.eof()) {
-    return absl::InternalError("Error reading from buffer");
-  }
-
-  const int d = params.RlweParameters().Degree();
-  ASSIGN_OR_RETURN(
-      auto fft_ctx,
-      FftContext::Create(absl::bit_width(static_cast<uint32_t>(d)) - 1));
-  ASSIGN_OR_RETURN(auto t_vec_h_ffts,
-                   PrecomputeTVecHFfts(params, preprocessed_outputs, *fft_ctx));
-
-  std::vector<Polynomial<CoeffType>> a_mod_switched_t1;
-  std::vector<std::string> a_mod_switched_t1_packed;
-  if (params.InterpolationDegree() == 1) {
-    a_mod_switched_t1.reserve(preprocessed_outputs.size());
-    a_mod_switched_t1_packed.reserve(preprocessed_outputs.size());
-    const int log_q1 = params.RlweParameters().LogModulus1AfterSwitch();
-    for (size_t k = 0; k < preprocessed_outputs.size(); ++k) {
-      ASSIGN_OR_RETURN(
-          auto a_ms,
-          preprocessed_outputs[k][0].a_tilde_agg.Rescale(
-              params.RlweParameters().LogModulus(), log_q1));
-      a_mod_switched_t1_packed.push_back(
-          PackCoefficientsToString(a_ms.Coeffs(), log_q1));
-      a_mod_switched_t1.push_back(std::move(a_ms));
-    }
-  }
-
-  return absl::WrapUnique(new PirServer<DbDataType, CoeffType, MatCoeffType>(
-      params, std::move(combined_db_matrix), std::move(combined_pack_matrix),
-      std::move(preprocessed_outputs), std::move(t_vec_h_ffts),
-      std::move(a_mod_switched_t1), std::move(a_mod_switched_t1_packed),
-      std::move(second_dim_query_a), std::move(fft_ctx)));
-}
-
-template <typename DbDataType, typename CoeffType, typename MatCoeffType>
-absl::StatusOr<std::unique_ptr<PirServer<DbDataType, CoeffType, MatCoeffType>>>
-PirServer<DbDataType, CoeffType, MatCoeffType>::LoadFromFile(
-    const PirParams<CoeffType>& params, absl::string_view file_path) {
-  std::string buffer;
-  if (!file_util::GetFileContents(file_path, &buffer).ok()) {
-    return absl::InternalError("Failed to read file.");
-  }
-  return LoadFromBuffer(
-      params, reinterpret_cast<const uint8_t*>(buffer.data()), buffer.size());
 }
 
 template class PirServer<uint16_t, uint32_t, uint32_t>;

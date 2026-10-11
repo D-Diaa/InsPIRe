@@ -52,19 +52,15 @@ struct FftContext {
   FftContext& operator=(const FftContext&) = delete;
 
   int d;
-  // Scratch buffers, 2d long; MultFft(const FftPolynomial&, ...) uses their
-  // first d entries.
+  // Scratch buffers of length d for negacyclic FFT products.
   std::vector<std::complex<double>> forward_in;
   std::vector<std::complex<double>> forward_out;
   std::vector<std::complex<double>> backward_in;
   std::vector<std::complex<double>> backward_out;
 
-  // 2d-point plan for the zero-padded products of InnerProductFft.
-  std::unique_ptr<::security::fft::FftPlan<double, 1>> plan;
-
   // d-point plan and twist tables w^j = exp(i*pi*j/d), j < d, for the
-  // negacyclic products of MultFft(const FftPolynomial&, ...): the cyclic
-  // convolution of x_j w^j and y_j w^j equals w^k (x * y mod X^d + 1)_k.
+  // negacyclic products: the cyclic convolution of x_j w^j and y_j w^j equals
+  // w^k (x * y mod X^d + 1)_k.
   std::unique_ptr<::security::fft::FftPlan<double, 1>> negacyclic_plan;
   std::vector<std::complex<double>> twist;
   std::vector<std::complex<double>> untwist;
