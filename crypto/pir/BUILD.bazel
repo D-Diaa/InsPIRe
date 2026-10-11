@@ -53,6 +53,9 @@ cc_test(
     srcs = ["pir_end_to_end_real_params_test.cc"],
     deps = [
         ":pir_params",
+        "//crypto:lwes_to_rlwe",
+        "//crypto:polynomial",
+        "//crypto:polynomial_fft",
         "//crypto:status_macros",
         "//crypto/pir/client:pir_client",
         "//crypto/pir/server:pir_server",

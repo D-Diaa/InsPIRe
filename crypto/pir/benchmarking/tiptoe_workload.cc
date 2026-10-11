@@ -234,7 +234,7 @@ int Run(int argc, char** argv) {
   std::vector<int> rows(p);
   for (auto& m : rows) {
     m = Read64(input);
-    Check(m > 0 && m <= 2048 && !(m & (m - 1)), "Unsupported M");
+    Check(m > 0 && m <= 2048, "Unsupported M");
   }
   std::vector<size_t> targets(p * q);
   for (size_t i = 0; i < targets.size(); ++i) {

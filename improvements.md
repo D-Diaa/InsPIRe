@@ -81,9 +81,34 @@ All online, offline, and wire optimizations across **Gen 1** (`I5, I3a, I3b, I4`
 - **Records**: the setup record adds `online_threads` (T), `online_cpus`, `color_groups`, `column_groups` and `tasks` (`worker`, `cpu`, half-open `colors` and `columns` ranges). In threaded mode `offline_threads` is the number of tasks. In query records, `server_ms` is the main thread's wall time from request decode to serialized response. The `server_*_ms` phase fields follow the critical path: the serial phases (ingest; the shared FFT within finalize and packing; joining the buffers within encode) plus the phases of the slowest task. The threaded mode adds `server_cpu_ms`, the busy server time summed over all workers.
 - **Placement**: one thread per physical core (SMT siblings slow requests down), spread over both NUMA nodes (`pack_matrix` streams 32 MiB per (color, column), so DRAM bandwidth per node is the limit), and preferably not CPU 0.
 
+### Non-Power-of-Two Colour Tables (Tiptoe adapter)
+
+- **Change (`crypto/pir/benchmarking/tiptoe_workload.cc:237`)**: Relaxed the workload header check from `Check(m > 0 && m <= 2048 && !(m & (m - 1)), "Unsupported M")` to `Check(m > 0 && m <= 2048, "Unsupported M")`. The core ReInsPIRe library already accepts any $1 \le R_i \le 2048$ when $t = 1$ (`pir_params.cc:35-55` only requires $t \mid \text{num\_entries}$).
+- **Wire & work formulas ($R_i$ = real rows of colour $i$, vs padded $M_i = 2^{\lceil \log_2 R_i \rceil}$)**:
+  | Quantity | Formula ($R_i$ = real rows) |
+  |---|---|
+  | **Upload** | $53{,}248 + 5 \sum_{i=0}^{P-1} R_i$ bytes (was $53{,}248 + 5 \sum M_i$; wire granularity is **1 row = 5 B**) |
+  | **Download** | $11{,}008 \cdot P \cdot C$ bytes (**unchanged**) |
+  | **Online DB MACs** | $2048 \cdot C \cdot \sum_{i=0}^{P-1} \text{round\_up}(R_i, 32)$ (**32-row server granularity**) |
+  | **Packing & offline hint** | $2 \cdot 2048^2 \cdot P \cdot C$ online packing MACs; offline hint pads to $2048$ (**unchanged**) |
+- **32-row server granularity**: `PreprocessingServer` zero-pads database matrix columns to a multiple of 32 for the 16-lane AVX2 `uint16_t`/`int16_t` contraction kernel (`preprocessing_server.h:135-154`), and `PirServer::ProcessResponse` zero-pads the unpacked $R_i$-coefficient query vector to match (`pir_server.cc:266-277`), while the offline hint always zero-pads columns to $d = 2048$ (`preprocessing_server.h:232-246`).
+- **Measured effect**:
+  | Geometry | `T=1` Server | `T=32` Server | Upload Bytes |
+  |---|---|---|---|
+  | `2×1311, C=29` | **−15%** | noise | `73,728 → 66,358 B` (`-10.0%`, DB MACs `-35.9%`) |
+  | `38×1300, C=1` | **−14%** | **−11%** | `442,368 → 300,248 B` (`-32.1%`) |
+  | `11×239` and `38×2000` | noise | noise | small drop (`5 B` per unpadded row) |
+  Because LWE-to-RLWE packing dominates online server time and is independent of $R_i$, the server latency speedup is modest while upload decreases by $5(M_i - R_i)$ bytes per colour.
+- **Unchanged correctness, noise & security**:
+  - **Correctness**: Verified across $R_i \in \{1, 2, 17, 31, 32, 33, 63, 64, 65, 96, 97, 239, 874, 1000, 1311, 2016, 2017, 2047, 2048\}$, mixed heights, $C \in \{1, 2, 3, 5, 29\}$, $T \in \{1, 4, 8, 16, 32\}$, boundary targets $0$ and $R_i - 1$, a 100-query stress run, and clean rejection of $M = 0$ and $M = 2049$.
+  - **Noise (bit-identical download)**: With the client seed fixed, the serialized download for real-row tables ($R_i$) is **100% bit-for-bit identical** to the power-of-two padded tables ($M_i$) across both single-threaded and multi-threaded execution (padding rows are zero and contribute $0 \bmod 2^{64}$, and the hint is identical). Covered by `PirEndToEndTest::TiptoeNonPowerOfTwoDownloadIsBitIdenticalToPaddedAndThreaded` in `crypto/pir/pir_end_to_end_real_params_test.cc`.
+  - **Security**: The uploaded selector is the first $R_i$ coefficients of the same 2048-coefficient RLWE ciphertext under the unchanged `SelectorSeed(slot)` CRS, packing key bundle, packing seed, and hint—a public projection of the padded upload. Revealing $R_i$ via upload length (`5·R_i`) leaks nothing new because table populations are already public layout metadata.
+
 ---
 
 ## Assumptions, Caveats & Tradeoffs
+
+- **Arbitrary table row counts ($1 \le R_i \le 2048$)**: Colour table row counts $R_i$ do **not** need to be powers of two or multiples of the ring degree ($t = 1$ requires only $1 \le R_i \le 2048$, and general `PirParams` requires only $t \mid \text{num\_entries}$). Upload scales at 1-row granularity (`5 B/row`), while online DB contraction scales at 32-row granularity (`round_up(R_i, 32)`).
 
 - **Precomputed FFT & mask memory (`Gen 1 I3a`, `Gen 2 I1b`, `Gen 3 S4b/c`)**: With length-$d$ negacyclic FFTs (`S4c`), `PrecomputeTVecHFfts` uses `256 KiB` per column (`50%` less than Gen 2), `a_mod_switched_t1_` uses `16 KiB` per column, and `a_mod_switched_t1_packed_` uses `6.25 KiB` per column. Note: Under glibc's default arena allocator, long-lived allocations after multi-threaded preprocessing can retain freed thread arenas in RSS; `tcmalloc`/`jemalloc` avoids this.
 - **Exactness budget (`Gen 1 I4`, `Gen 2 I2b`, `Gen 3 S4c`)**: `kFftExactProductBits = 44` is a conservative analytic bound ($53 - 8 - 1$) that holds with zero extra chunking at $d=2048$; `allow_paired_ifft` is guarded by $\log_2(N_{\text{polys}}) + \log_2 d + u_{\text{mag}} + v_{\text{mag}} \le 50.0$ (RMS error $\sim 0.0055 \ll 0.5$).

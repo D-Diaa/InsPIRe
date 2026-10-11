@@ -79,7 +79,7 @@ bazel run -c opt //crypto/pir/benchmarking:pir_metrics_tool -- \
 ```
 
 **Common Flags:**
-- `--num_entries` ($n$): Number of records in the database (e.g. `4096`, `65536`, `262144`, `1048576`). Note: `num_entries / interpolation_degree` must be divisible by `degree`.
+- `--num_entries` ($n$): Number of records in the database (e.g. `4096`, `65536`, `262144`, `1048576`). Note: `num_entries` must be divisible by `interpolation_degree` (it does not need to be a power of two or a multiple of `degree`).
 - `--degree` ($d$): RLWE polynomial ring degree (e.g. `2048`, `4096`, `8192`).
 - `--entry_size_multiple` ($\ell$): Size of each record in multiples of ring dimension.
 - `--interpolation_degree` ($t$): Degree of polynomial interpolation (e.g. `2`, `4`, `8`).
