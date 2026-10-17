@@ -49,6 +49,17 @@ class PirServer {
          PirPreprocessedData<DbDataType, CoeffType, MatCoeffType>
              preprocessed_data);
 
+  // Creates a t=1 PirServer instance that packs LWE outputs concatenated
+  // across multiple color slices `db_slices` into `pack_outputs.size()` RLWE
+  // response ciphertexts.
+  static absl::StatusOr<
+      std::unique_ptr<PirServer<DbDataType, CoeffType, MatCoeffType>>>
+  CreateCrossColor(
+      const PirParams<CoeffType>& params,
+      std::vector<CrossColorDbSlice<DbDataType>> db_slices,
+      std::vector<PreprocessMatrixPackOutput<CoeffType, MatCoeffType>>
+          pack_outputs);
+
   // Serializes the server's preprocessed data and database to a binary file on
   // disk.
   absl::Status SaveToFile(absl::string_view file_path) const;
@@ -98,7 +109,8 @@ class PirServer {
       std::vector<Polynomial<CoeffType>> a_mod_switched_t1,
       std::vector<std::string> a_mod_switched_t1_packed,
       std::vector<Polynomial<CoeffType>> second_dim_query_a,
-      std::unique_ptr<FftContext> fft_ctx)
+      std::unique_ptr<FftContext> fft_ctx,
+      std::vector<CrossColorDbSlice<DbDataType>> db_slices = {})
       : params_(params),
         combined_db_matrix_(std::move(combined_db_matrix)),
         combined_pack_matrix_(std::move(combined_pack_matrix)),
@@ -108,6 +120,7 @@ class PirServer {
         a_mod_switched_t1_packed_(std::move(a_mod_switched_t1_packed)),
         second_dim_query_a_(std::move(second_dim_query_a)),
         fft_ctx_(std::move(fft_ctx)),
+        db_slices_(std::move(db_slices)),
         db_mult_time_(absl::ZeroDuration()),
         packing_time_(absl::ZeroDuration()),
         poly_eval_time_(absl::ZeroDuration()) {}
@@ -120,7 +133,8 @@ class PirServer {
       std::vector<
           std::vector<PreprocessMatrixPackOutput<CoeffType, MatCoeffType>>>
           preprocessed_outputs,
-      std::vector<Polynomial<CoeffType>> second_dim_query_a);
+      std::vector<Polynomial<CoeffType>> second_dim_query_a,
+      std::vector<CrossColorDbSlice<DbDataType>> db_slices = {});
 
   // Forward FFTs of every preprocessed t_vec_h, indexed like
   // `preprocessed_outputs`, computed once so that ProcessResponse does not
@@ -151,6 +165,7 @@ class PirServer {
   const std::vector<std::string> a_mod_switched_t1_packed_;
   const std::vector<Polynomial<CoeffType>> second_dim_query_a_;
   std::unique_ptr<FftContext> fft_ctx_;
+  const std::vector<CrossColorDbSlice<DbDataType>> db_slices_;
 
   mutable absl::Duration pack_matrix_time_ = absl::ZeroDuration();
   mutable absl::Duration finalize_time_ = absl::ZeroDuration();

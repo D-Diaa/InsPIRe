@@ -49,6 +49,16 @@ struct PirPreprocessedData {
   std::vector<Polynomial<CoeffType>> second_dim_a;
 };
 
+// One contiguous Stage 1 database slice (rows [u0, u1) of color `color`)
+// owned by a cross-color response worker.
+template <typename DbValueType>
+struct CrossColorDbSlice {
+  size_t color = 0;
+  int padded_cols = 0;
+  int rows = 0;
+  Matrix<DbValueType> db_submatrix;
+};
+
 template <typename DbValueType, typename CoeffType, typename MatCoeffType>
 absl::StatusOr<proto::PirPreprocessedData> SerializePirPreprocessedData(
     const PirPreprocessedData<DbValueType, CoeffType, MatCoeffType>&

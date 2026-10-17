@@ -16,6 +16,8 @@ All online, offline, and wire optimizations across **Gen 1** (`I5, I3a, I3b, I4`
 | **3. Wire, Modulus Switching & Sampling** | **Gen 2 `I1a/c`, `I2d`, `I4c`** | Bit-packing, `Rescale`, `FftContext`, offline `Transpose` | 128-bit word-stream bit-packer/unpacker; divisionless shift `Rescale`; persistent `fft_ctx_`; direct `CreateCondensed<int32_t>` | Wire pack/unpack: `43.0 → 3.6 ms` (**12.1×**); Offline setup: `117.7 → 51.8 s` (**2.27×**) |
 | **3. Wire, Modulus Switching & Sampling** | **Gen 3 `S3a` + `S4a/b`** | Selector upload & response download wire | 40-bit selector modulus switching (`5 B/coeff` vs `6.5 B/coeff`, **-23.1%**) + single-rounding $q_1=2^{25}$ decrypt (**-1,024 B/ct** download, **-21%** noise std) + headerless wire & offline pre-packed `a_mod_switched_t1_packed_` | Total comm: **-8.5% to -15.3%** (`-65 KiB` to `-421 KiB`); `server_encode_ms`: **-45% to -56%** |
 | **3. Wire, Modulus Switching & Sampling** | **Gen 3 `S5a`** | Client `SampleSecretKey` & `GenerateRlweSamples` | Bit-sliced `absl::popcount` centered binomial ($\sigma^2=40$, `2.5` `Rand64` words/coeff) & ternary samplers + lock-free `FastChaChaPrng` | `client_query_ms`: **3.2×–3.5× faster** (`110.5 → 31.6 ms` at $P=297$); `T=32` roundtrip **1.65×–1.73× faster** |
+| **1. Algorithmic & Transform-Domain** | **Grouped Selectors** | Client `CreateGroupedSelector`, Offline `RotateGroupMaskForInterval` | Greedy whole-colour bin-packing ($\sum_{i \in g} R_i \le 2048$) into $G_{\text{sel}}$ RLWE encryptions + offline signed negacyclic mask rotation $X^{-\text{offset}_i} a_g(X) \bmod (X^d + 1)$ | Selector encryptions: $P \to G_{\text{sel}}$ (**up to 16× fewer** at $R_i \le 128$); zero wire or online server change |
+| **1. Algorithmic & Transform-Domain** | **Cross-Colour Response Packing** | Server `PreprocessCrossColorBlock`, `CreateCrossColor` & Client unpack | When $C=1$ and $d_{\text{row}} \le 1024$, contract only $d_{\text{row}}$ active Stage 1 rows per colour and pack $P \cdot d_{\text{row}}$ LWE outputs across colours into $N_{\text{resp}} = \lceil P \cdot d_{\text{row}} / 2048 \rceil$ RLWE blocks | Download, online `pack_matrix`, `pack_finalize`, and client decrypt scale by $N_{\text{resp}} / P$ (**-50% to -75%**) |
 
 ---
 
@@ -103,6 +105,42 @@ All online, offline, and wire optimizations across **Gen 1** (`I5, I3a, I3b, I4`
   - **Correctness**: Verified across $R_i \in \{1, 2, 17, 31, 32, 33, 63, 64, 65, 96, 97, 239, 874, 1000, 1311, 2016, 2017, 2047, 2048\}$, mixed heights, $C \in \{1, 2, 3, 5, 29\}$, $T \in \{1, 4, 8, 16, 32\}$, boundary targets $0$ and $R_i - 1$, a 100-query stress run, and clean rejection of $M = 0$ and $M = 2049$.
   - **Noise (bit-identical download)**: With the client seed fixed, the serialized download for real-row tables ($R_i$) is **100% bit-for-bit identical** to the power-of-two padded tables ($M_i$) across both single-threaded and multi-threaded execution (padding rows are zero and contribute $0 \bmod 2^{64}$, and the hint is identical). Covered by `PirEndToEndTest::TiptoeNonPowerOfTwoDownloadIsBitIdenticalToPaddedAndThreaded` in `crypto/pir/pir_end_to_end_real_params_test.cc`.
   - **Security**: The uploaded selector is the first $R_i$ coefficients of the same 2048-coefficient RLWE ciphertext under the unchanged `SelectorSeed(slot)` CRS, packing key bundle, packing seed, and hint—a public projection of the padded upload. Revealing $R_i$ via upload length (`5·R_i`) leaks nothing new because table populations are already public layout metadata.
+
+### Whole-Colour Grouped Selector Encryption (`CreateGroupedSelector`, `BuildSelectorGroupPlans`, `RotateGroupMaskForInterval`)
+
+When colour table heights satisfy $R_i < d = 2048$, encrypting a separate degree-2048 RLWE selector per colour wastes $d - R_i$ coefficients of each RLWE sample. Whole-colour grouped selector encryption packs multiple consecutive colours into a single degree-$d$ RLWE encryption on the client while leaving the wire format and online server completely unchanged:
+
+- **Greedy whole-colour bin-packing (`BuildSelectorGroupPlans` in `crypto/pir/pir_params.h`)**:
+  - Consecutive colours $i \in g$ with $\sum_{i \in g} R_i \le d = 2048$ are assigned disjoint contiguous coefficient intervals $[\text{offset}_i, \text{offset}_i + R_i) \subset [0, d)$, reducing client selector RLWE encryptions from $P$ to $G_{\text{sel}} \ge \lceil \sum_i R_i / 2048 \rceil$.
+  - For each group $g$, `PirClient::CreateGroupedSelector` (`crypto/pir/client/pir_client.cc`) constructs a single multi-hot plaintext $m_g(X) = \sum_{i \in g} X^{\text{offset}_i + r_i^*}$ ($r_i^* \in [0, R_i)$), samples one group CRS mask $a_g(X)$ from `GroupSelectorSeed(g)`, and encrypts $m_g(X)$ under one RLWE sample $(a_g(X), b_g(X))$.
+  - The client slices each colour's interval $b_g[\text{offset}_i : \text{offset}_i + R_i)$, applies the 40-bit modulus switch, and appends the `5·R_i`-byte slice to the upload stream in colour order.
+- **Offline signed negacyclic mask rotation (`RotateGroupMaskForInterval` in `crypto/pir/pir_params.h`, `PreprocessingServer::Preprocess` in `crypto/pir/server/preprocessing_server.h`)**:
+  - In `ComputeHintMatrix`, column $r \in [0, R_i)$ of colour $i$'s database multiplies row $\text{offset}_i + r$ of the negacyclic matrix $\text{Negacyclic}(a_g)$.
+  - For any $\text{offset}_i + r < d$, row $\text{offset}_i + r$ of $\text{Negacyclic}(a_g)$ is identically row $r$ of $\text{Negacyclic}(\tilde{a}_i)$, where
+    $$\tilde{a}_i(X) = X^{-\text{offset}_i} a_g(X) \bmod (X^d + 1), \qquad \tilde{a}_i[k] = \begin{cases} a_g[k + \text{offset}_i] & 0 \le k < d - \text{offset}_i, \\ -a_g[k + \text{offset}_i - d] \bmod q & d - \text{offset}_i \le k < d. \end{cases}$$
+  - Rotating $a_g(X)$ by $X^{-\text{offset}_i} \bmod (X^d + 1)$ once during offline `Preprocess` allows every colour server to keep its standard $[0, R_i)$ database layout and online contraction with zero online server changes.
+- **Zero cross-colour contamination & RLWE security**:
+  - Because each coefficient of $b_g(X) = \Delta m_g(X) - a_g(X)s(X) + e_g(X) \bmod q$ is rounded to 40 bits independently and colour $i$'s server contracts only $b_g[\text{offset}_i : \text{offset}_i + R_i)$, entries of $m_g$ outside $[\text{offset}_i, \text{offset}_i + R_i)$ have **zero** effect on colour $i$'s query slice or response noise.
+
+### Sub-Tile Cross-Colour LWE Response Packing (`PreprocessCrossColorBlock`, `PirServer::CreateCrossColor`)
+
+When $C = 1$ and each colour row occupies only $d_{\text{row}} \le 1024$ active `uint16_t` coefficients ($g = \lfloor 2048 / d_{\text{row}} \rfloor \ge 2$, e.g. $H = 41, M_{\text{sub}} = 24, b = 8 \implies d_{\text{row}} = 984$), the trailing $2048 - d_{\text{row}}$ coefficients of each 2048-coefficient table row are zero padding. Sub-tile cross-colour response packing contracts only the $d_{\text{row}}$ active rows per colour and packs the resulting $P \cdot d_{\text{row}}$ LWE outputs across colours into $N_{\text{resp}} = \lceil P \cdot d_{\text{row}} / 2048 \rceil$ RLWE response ciphertexts:
+
+- **Offline cross-colour block preprocessing (`PreprocessingServer::PreprocessCrossColorBlock` in `crypto/pir/server/preprocessing_server.h`)**:
+  - Response block $b \in [0, N_{\text{resp}})$ covers global LWE indices $[b \cdot 2048, \min((b + 1) \cdot 2048, P \cdot d_{\text{row}}))$, decomposing that range into contiguous colour slices `(color = s, u0, take)` (including slices that straddle a 2048-coefficient block boundary when $d_{\text{row}} \nmid 2048$).
+  - For each slice, `PreprocessCrossColorBlock` extracts only rows `[u0, u0 + take)` of colour $s$, computes their `take` LWE hint polynomials under colour $s$'s rotated selector mask $\tilde{a}_s(X)$, and condenses the `take × round_up(R_s, 32)` `int16_t` Stage 1 submatrix `CrossColorDbSlice`.
+  - The assembled 2048-row hint block is passed once to `PreprocessMatrixPack` under the shared `packing_seed`, producing a single `PreprocessMatrixPackOutput` for response block $b$.
+- **Online cross-colour server & client unpack (`PirServer::CreateCrossColor` in `crypto/pir/server/pir_server.cc`, `tiptoe_workload.cc`)**:
+  - Online, each cross-colour response server multiplies its `db_slices_` against the corresponding colour query vectors `(*request.color_queries)[sl.color]` to populate `b_prime_all` ($2048$ coefficients total across slices), then runs a single $2048 \times 4096$ `pack_matrix` multiply, a single `FinalizeMatrixPack`, and a single modulus switch.
+  - The client decrypts the $N_{\text{resp}}$ RLWE response ciphertexts and scatters each slice `(s, off_in_row, take)` back into `recovered[s][off_in_row : off_in_row + take)`.
+- **Wire & work formulas ($C = 1, d_{\text{row}} \le 1024, N_{\text{resp}} = \lceil P \cdot d_{\text{row}} / 2048 \rceil$)**:
+  | Quantity | Per-Colour Response ($P$ blocks) | Cross-Colour Response ($N_{\text{resp}}$ blocks) |
+  |---|---|---|
+  | **Upload** | $53{,}248 + 5 \sum_{i=0}^{P-1} R_i$ B | $53{,}248 + 5 \sum_{i=0}^{P-1} R_i$ B (**unchanged**) |
+  | **Download** | $11{,}008 \cdot P$ B | $11{,}008 \cdot N_{\text{resp}}$ B (**reduced by $N_{\text{resp}} / P$**) |
+  | **Online Stage 1 DB MACs** | $2048 \sum_{i=0}^{P-1} \text{round\_up}(R_i, 32)$ | $d_{\text{row}} \sum_{i=0}^{P-1} \text{round\_up}(R_i, 32)$ (**reduced by $d_{\text{row}} / 2048$**) |
+  | **Online Stage 2 Packing MACs** | $2 \cdot 2048^2 \cdot P$ | $2 \cdot 2048^2 \cdot N_{\text{resp}}$ (**reduced by $N_{\text{resp}} / P$**) |
+  | **Client Decryptions** | $P$ RLWE decryptions | $N_{\text{resp}}$ RLWE decryptions (**reduced by $N_{\text{resp}} / P$**) |
 
 ---
 

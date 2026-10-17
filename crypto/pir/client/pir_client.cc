@@ -167,6 +167,41 @@ PirClient<CoeffType>::CreateFirstDimensionQuery(const int index, ::rlwe::SecureP
 }
 
 template <typename CoeffType>
+absl::StatusOr<std::vector<CoeffType>>
+PirClient<CoeffType>::CreateGroupedSelector(
+    const std::vector<SelectorSliceSpec>& slices,
+    const std::vector<int>& target_indices,
+    ::rlwe::SecurePrng* mask_prng) const {
+  if (params_.InterpolationDegree() != 1 || mask_prng == nullptr ||
+      slices.empty() || slices.size() != target_indices.size()) {
+    return absl::InvalidArgumentError("Invalid grouped t=1 selector arguments.");
+  }
+  const auto& rlwe_params = params_.RlweParameters();
+  const size_t d = static_cast<size_t>(rlwe_params.Degree());
+  std::vector<CoeffType> message(d, 0);
+  for (size_t k = 0; k < slices.size(); ++k) {
+    const auto& s = slices[k];
+    const int target = target_indices[k];
+    if (s.rows == 0 || target < 0 || static_cast<size_t>(target) >= s.rows ||
+        s.offset + s.rows > d ||
+        (k > 0 && s.offset < slices[k - 1].offset + slices[k - 1].rows)) {
+      return absl::InvalidArgumentError(
+          "Grouped selector slices must be non-empty, disjoint, and fit in d.");
+    }
+    message[s.offset + static_cast<size_t>(target)] = 1;
+  }
+  ASSIGN_OR_RETURN(auto a_group,
+                   SampleAComponents(rlwe_params, /*num_samples=*/1, *mask_prng));
+  ASSIGN_OR_RETURN(auto rlwe_samples,
+                   GenerateRlweSamples(rlwe_params, secret_key_fft_, a_group,
+                                       *prng_, *fft_ctx_));
+  ASSIGN_OR_RETURN(
+      auto ct, EncryptFromRlweSample(rlwe_params, params_.PlaintextModulus(),
+                                     rlwe_samples[0], message));
+  return ct.b.Coeffs();
+}
+
+template <typename CoeffType>
 absl::StatusOr<std::vector<Polynomial<CoeffType>>>
 PirClient<CoeffType>::CreateSecondDimensionQuery(const int index) const {
   const auto& rlwe_params = params_.RlweParameters();

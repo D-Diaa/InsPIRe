@@ -61,6 +61,51 @@ std::string SelectorSeed(uint64_t slot) {
   for (int i = 0; i < 8; ++i) seed[24 + i] = char(slot >> (8 * i));
   return seed;
 }
+std::string GroupSelectorSeed(uint64_t group) {
+  std::string seed(32, 'G');
+  for (int i = 0; i < 8; ++i) seed[24 + i] = char(group >> (8 * i));
+  return seed;
+}
+size_t ResolveRowU16(const std::string& workload_path, size_t c,
+                     const std::vector<int>& rows,
+                     const std::vector<std::vector<uint16_t>>& raw) {
+  if (c != 1) return c * 2048;
+  const char* env = std::getenv("PIR_ROW_U16");
+  if (env && *env) {
+    const size_t v = std::stoul(env);
+    Check(v > 0 && v <= 2048, "Invalid PIR_ROW_U16");
+    return v;
+  }
+  const size_t slash = workload_path.find_last_of('/');
+  const std::string dir =
+      slash == std::string::npos ? "." : workload_path.substr(0, slash);
+  std::ifstream cf(dir + "/client.pal", std::ios::binary);
+  if (cf) {
+    char cmagic[8];
+    cf.read(cmagic, 8);
+    if (cf && std::memcmp(cmagic, "PALETTE\0", 8) == 0) {
+      uint64_t hdr[10];
+      for (int i = 0; i < 10; ++i) hdr[i] = Read64(cf);
+      const uint64_t msub = hdr[1], nbits = hdr[2], h = hdr[9];
+      const size_t row_bytes = static_cast<size_t>((h * msub * nbits + 7) / 8);
+      const size_t row_u16 = (row_bytes + 1) / 2;
+      if (row_u16 > 0 && row_u16 <= 2048) return row_u16;
+    }
+  }
+  size_t max_u16 = 0;
+  for (size_t s = 0; s < raw.size(); ++s) {
+    for (int r = 0; r < rows[s]; ++r) {
+      const uint16_t* row_ptr = raw[s].data() + static_cast<size_t>(r) * 2048;
+      for (size_t u = 2048; u > max_u16; --u) {
+        if (row_ptr[u - 1] != 0) {
+          max_u16 = u;
+          break;
+        }
+      }
+    }
+  }
+  return max_u16 > 0 ? max_u16 : 2048;
+}
 // Lock-free single-threaded ChaCha20 PRNG producing the exact same byte stream
 // as ::rlwe::ChaChaPrng without per-call mutex locking or byte-by-byte loops.
 class FastChaChaPrng final : public ::rlwe::SecurePrng {
@@ -224,7 +269,8 @@ int Run(int argc, char** argv) {
   const std::vector<int> cpus = ThreadCpus();
   const int warmups = std::stoi(argv[2]), repeats = std::stoi(argv[3]);
   Check(warmups >= 0 && repeats > 0, "Invalid repetitions");
-  std::ifstream input(argv[1], std::ios::binary);
+  const std::string workload_path = argv[1];
+  std::ifstream input(workload_path, std::ios::binary);
   char magic[8];
   input.read(magic, 8);
   Check(std::string(magic, 8) == "TPIRv001", "Invalid workload version");
@@ -249,6 +295,15 @@ int Run(int argc, char** argv) {
                                                 eval_gadget, m, 1, cols));
   };
   const std::string packing_seed(32, 'K');
+  const auto selector_groups = Take(pm::BuildSelectorGroupPlans(rows, 2048));
+  std::vector<size_t> slot_offset(p);
+  std::vector<std::string> slot_seeds(p);
+  for (const auto& grp : selector_groups) {
+    for (const auto& sl : grp.slices) {
+      slot_offset[sl.slot] = sl.offset;
+      slot_seeds[sl.slot] = GroupSelectorSeed(grp.group_index);
+    }
+  }
   std::vector<std::vector<uint16_t>> raw(p);
   for (size_t slot = 0; slot < p; ++slot) {
     raw[slot].resize(size_t(rows[slot]) * c * 2048);
@@ -259,10 +314,25 @@ int Run(int argc, char** argv) {
     for (size_t i = 0; i < raw[slot].size(); ++i)
       raw[slot][i] = uint16_t(bytes[2 * i]) | (uint16_t(bytes[2 * i + 1]) << 8);
   }
+  const size_t d_row = ResolveRowU16(workload_path, c, rows, raw);
+  const bool cross_color_resp = (c == 1) && ((2048 / d_row) >= 2);
+  const size_t n_resp =
+      cross_color_resp ? ((p * d_row + 2047) / 2048) : (p * c);
+  const size_t eff_c = cross_color_resp ? 1 : c;
+  const size_t eff_p = cross_color_resp ? n_resp : p;
   // The server for columns [k0, k1) of table `slot`. A column is one
   // 2048-coefficient plaintext of every row; per-column preprocessing does not
   // depend on the other columns, so its responses match the full table's.
   auto Build = [&](size_t slot, size_t k0, size_t k1) {
+    if (cross_color_resp) {
+      auto block = Take(Prep::PreprocessCrossColorBlock(
+          rlwe_params, pack_gadget, rows, raw, slot_seeds, slot_offset,
+          packing_seed, d_row, slot));
+      std::vector<pm::PreprocessMatrixPackOutput<uint64_t, int32_t>> outputs;
+      outputs.push_back(std::move(block.pack_output));
+      return Take(Server::CreateCrossColor(
+          Params(2048, 1), std::move(block.db_slices), std::move(outputs)));
+    }
     std::vector<uint16_t> slice;
     if (k1 - k0 < c) {
       for (size_t row = 0; row < size_t(rows[slot]); ++row)
@@ -270,21 +340,22 @@ int Run(int argc, char** argv) {
                      raw[slot].begin() + (row * c + k1) * 2048);
     }
     auto params = Params(rows[slot], k1 - k0);
-    auto prep = Take(Prep::Create(&params, SelectorSeed(slot)));
-    auto data =
-        Take(prep->Preprocess(k1 - k0 < c ? slice : raw[slot], packing_seed));
+    auto prep = Take(Prep::Create(&params, slot_seeds[slot]));
+    auto data = Take(prep->Preprocess(k1 - k0 < c ? slice : raw[slot],
+                                      packing_seed, slot_offset[slot]));
     return Take(Server::Create(params, std::move(data)));
   };
   // Task (g, h) covers color group g x column group h, both balanced
   // contiguous splits, and runs on worker w = g * H + h.
   const size_t threads = std::max<size_t>(cpus.size(), 1);
-  const size_t color_groups = std::min(p, threads);
-  const size_t column_groups = std::min(c, threads / color_groups);
+  const size_t color_groups = std::min(eff_p, threads);
+  const size_t column_groups = std::min(eff_c, threads / color_groups);
   std::vector<Task> tasks;
   for (size_t g = 0; g < color_groups; ++g)
     for (size_t h = 0; h < column_groups; ++h)
-      tasks.push_back({g * p / color_groups, (g + 1) * p / color_groups,
-                       h * c / column_groups, (h + 1) * c / column_groups});
+      tasks.push_back({g * eff_p / color_groups, (g + 1) * eff_p / color_groups,
+                       h * eff_c / column_groups,
+                       (h + 1) * eff_c / column_groups});
   Workers workers(tasks.size());
   size_t offline_threads = tasks.size();
   const auto offline_begin = Clock::now();
@@ -302,14 +373,14 @@ int Run(int argc, char** argv) {
     const int requested_threads = prep_env ? std::stoi(prep_env) : 8;
     Check(requested_threads > 0 && requested_threads <= 64,
           "PIR_PREPROCESS_THREADS must be in [1,64]");
-    offline_threads = std::min(size_t(requested_threads), p);
-    tasks[0].servers.resize(p);
-    for (size_t first = 0; first < p; first += offline_threads) {
+    offline_threads = std::min(size_t(requested_threads), eff_p);
+    tasks[0].servers.resize(eff_p);
+    for (size_t first = 0; first < eff_p; first += offline_threads) {
       std::vector<std::future<void>> jobs;
-      for (size_t slot = first; slot < std::min(p, first + offline_threads);
-           ++slot) {
+      for (size_t slot = first;
+           slot < std::min(eff_p, first + offline_threads); ++slot) {
         jobs.push_back(std::async(std::launch::async, [&, slot] {
-          tasks[0].servers[slot] = Build(slot, 0, c);
+          tasks[0].servers[slot] = Build(slot, 0, eff_c);
         }));
       }
       for (auto& job : jobs) job.get();
@@ -356,7 +427,7 @@ int Run(int argc, char** argv) {
     const int rep = warmup ? -1 : (trial - warmups) % repeats;
     const auto client_begin = Clock::now();
     auto client = Take(pm::PirClient<uint64_t>::Create(
-        Params(2048, c), Prng(SelectorSeed(0)),
+        Params(2048, eff_c), Prng(SelectorSeed(0)),
         Prng(Take(::rlwe::ChaChaPrng::GenerateSeed()))));
     auto key_prng = Prng(packing_seed);
     auto keys = Take(client->CreatePackingKey(key_prng.get()));
@@ -367,18 +438,27 @@ int Run(int argc, char** argv) {
     for (const auto& key : keys) PackCoeffsAppend(key.Coeffs(), 52, upload);
     const size_t key_bytes = upload.size();
     double client_request_pack_ms = Ms(t_pack), client_selector_ms = 0;
-    for (size_t slot = 0; slot < p; ++slot) {
+    for (const auto& grp : selector_groups) {
       auto t = Clock::now();
-      auto mask = Prng(SelectorSeed(slot));
-      auto selector =
-          Take(client->CreateSelector(targets[qi * p + slot], mask.get()));
-      selector.resize(rows[slot]);
+      auto mask = Prng(slot_seeds[grp.slices[0].slot]);
+      std::vector<int> group_targets;
+      group_targets.reserve(grp.slices.size());
+      for (const auto& sl : grp.slices) {
+        group_targets.push_back(static_cast<int>(targets[qi * p + sl.slot]));
+      }
+      auto grouped_selector = Take(
+          client->CreateGroupedSelector(grp.slices, group_targets, mask.get()));
       client_selector_ms += Ms(t);
       t = Clock::now();
-      for (uint64_t& y : selector) {
-        y = ((y + (1ULL << 11)) >> 12) & ((1ULL << 40) - 1);
+      for (const auto& sl : grp.slices) {
+        std::vector<uint64_t> selector(
+            grouped_selector.begin() + sl.offset,
+            grouped_selector.begin() + sl.offset + sl.rows);
+        for (uint64_t& y : selector) {
+          y = ((y + (1ULL << 11)) >> 12) & ((1ULL << 40) - 1);
+        }
+        PackCoeffsAppend(selector, 40, upload);
       }
-      PackCoeffsAppend(selector, 40, upload);
       client_request_pack_ms += Ms(t);
     }
     const double client_query_ms = Ms(client_begin);
@@ -395,6 +475,7 @@ int Run(int argc, char** argv) {
       queries[slot] = UnpackCoeffs(upload, off, rows[slot], 40);
       for (uint64_t& y : queries[slot]) y <<= 12;
     }
+    request.color_queries = &queries;
     Check(off == upload.size(), "Unconsumed request bytes");
     const double ingest_ms = Ms(server_begin);
     // The key's y_vec_h is transformed once, not once per color; the transform
@@ -407,7 +488,7 @@ int Run(int argc, char** argv) {
     const double fft_ms = Ms(fft_begin);
     // Task w encodes color slot's responses for column group w % H into
     // wires[slot * H + w % H].
-    std::vector<std::string> wires(p * column_groups);
+    std::vector<std::string> wires(eff_p * column_groups);
     std::vector<Phases> phases(tasks.size());
     const auto tasks_begin = Clock::now();
     workers.Run([&](size_t w) {
@@ -415,7 +496,8 @@ int Run(int argc, char** argv) {
       Phases ms;
       auto task_request = request;
       for (size_t slot = tasks[w].p0; slot < tasks[w].p1; ++slot) {
-        task_request.first_dimension_query = queries[slot];
+        if (!cross_color_resp)
+          task_request.first_dimension_query = queries[slot];
         auto& server = tasks[w].servers[slot - tasks[w].p0];
         auto db_before = server->GetDbMultiplyTime(),
              pack_before = server->GetPackingTime();
@@ -475,18 +557,45 @@ int Run(int argc, char** argv) {
     off = 0;
     std::vector<std::vector<uint64_t>> recovered;
     double client_response_unpack_ms = 0, client_decrypt_ms = 0;
-    for (size_t slot = 0; slot < p; ++slot) {
-      auto t = Clock::now();
-      pm::PirResponse<uint64_t> response;
-      for (size_t col = 0; col < c; ++col) {
+    if (cross_color_resp) {
+      recovered.reserve(p);
+      for (size_t b_idx = 0; b_idx < n_resp; ++b_idx) {
+        auto t = Clock::now();
+        pm::PirResponse<uint64_t> response;
         auto a = Take(Poly::Create(UnpackCoeffs(download, off, 2048, 25)));
         auto b = Take(Poly::Create(UnpackCoeffs(download, off, 2048, 18)));
         response.ciphertexts.push_back({std::move(a), std::move(b)});
+        client_response_unpack_ms += Ms(t);
+        t = Clock::now();
+        auto blk = Take(client->ProcessResponse(response));
+        const size_t base = b_idx * 2048;
+        const size_t end = std::min(base + 2048, p * d_row);
+        for (size_t idx = base; idx < end;) {
+          const size_t slot = idx / d_row;
+          const size_t off_in_row = idx % d_row;
+          const size_t take = std::min(d_row - off_in_row, end - idx);
+          if (recovered.size() <= slot)
+            recovered.emplace_back(c * 2048, 0);
+          std::copy_n(blk.begin() + (idx - base), take,
+                      recovered[slot].begin() + off_in_row);
+          idx += take;
+        }
+        client_decrypt_ms += Ms(t);
       }
-      client_response_unpack_ms += Ms(t);
-      t = Clock::now();
-      recovered.push_back(Take(client->ProcessResponse(response)));
-      client_decrypt_ms += Ms(t);
+    } else {
+      for (size_t slot = 0; slot < p; ++slot) {
+        auto t = Clock::now();
+        pm::PirResponse<uint64_t> response;
+        for (size_t col = 0; col < c; ++col) {
+          auto a = Take(Poly::Create(UnpackCoeffs(download, off, 2048, 25)));
+          auto b = Take(Poly::Create(UnpackCoeffs(download, off, 2048, 18)));
+          response.ciphertexts.push_back({std::move(a), std::move(b)});
+        }
+        client_response_unpack_ms += Ms(t);
+        t = Clock::now();
+        recovered.push_back(Take(client->ProcessResponse(response)));
+        client_decrypt_ms += Ms(t);
+      }
     }
     Check(off == download.size(), "Unconsumed response bytes");
     const double client_decode_ms = Ms(decode_begin);

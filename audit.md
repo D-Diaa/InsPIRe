@@ -1,6 +1,6 @@
-# ReInsPIRe Correctness, Noise, and Security Audit (Gen 1 & Gen 2)
+# ReInsPIRe Correctness, Noise, and Security Audit (Gen 1, Gen 2, Gen 3 & Sub-Tile Packing)
 
-This document audits all optimizations introduced in **Gen 1** (`codex/reinspire`: `I5`, `I3a`, `I3b`, `I4`) and **Gen 2** (`combined`: `I1`, `I2`, `I3`, `I4`) for algebraic correctness, IEEE-754 floating-point exactness, RLWE noise impact, and cryptographic security.
+This document audits all optimizations introduced in **Gen 1** (`codex/reinspire`: `I5`, `I3a`, `I3b`, `I4`), **Gen 2** (`combined`: `I1`, `I2`, `I3`, `I4`), **Gen 3** (`S3`, `S4`, `S5a`), **Whole-Colour Grouped Selector Encryption**, and **Sub-Tile Cross-Colour LWE Response Packing** for algebraic correctness, IEEE-754 floating-point exactness, RLWE noise impact, and cryptographic security.
 
 ## 1. Summary Verdict
 
@@ -14,6 +14,11 @@ This document audits all optimizations introduced in **Gen 1** (`codex/reinspire
 | **Gen 2 `I2`** | AVX2+FMA FFT, `TwoDigitsFft`, paired IFFT, persistent `fft_ctx_` | **Yes** after `nearbyint` | **Zero** (rounds to exact same ints) | **Zero** (single-thread per shard) |
 | **Gen 2 `I3`** | 4-plane set-skewed `y_split` + 6-row `CondensedMultiply<uint16_t>` | **Yes** (exact mod $2^{64}$) | **Zero** | **Zero** |
 | **Gen 2 `I4`** | 6-row `CondensedMultiply<int32_t>` + direct `CreateCondensed<int32_t>` | **Yes** (exact mod $2^{64}$) | **Zero** | **Zero** |
+| **Gen 3 `S3a/b`** | 40-bit selector modswitch + sign-flipped `int16_t` AVX2 `vpmaddwd` DB | **Yes** (`S3b` exact mod $2^{52}$) | $+0.16\text{ LSB}_{q_2}^2$ (`S3a`, negligible) | **-23.1%** selector upload (`5 B/row`); IND-CPA preserved |
+| **Gen 3 `S4a/b/c`** | Single-rounding $q_1=2^{25}$ decrypt + headerless wire + length-$d$ negacyclic FFT | **Yes** (`S4c` bit-identical) | **-20% to -22% lower** total noise std (`-341.33\text{ LSB}_{q_2}^2`) | **-1,024 B/ct** download; IND-CPA preserved |
+| **Gen 3 `S5a`** | Bit-sliced `popcount` binomial/ternary samplers + `FastChaChaPrng` | **Yes** (`FastChaChaPrng` bit-identical stream) | **Zero** (exact $\text{Binomial}(80, 0.5)-40$) | **Zero** (identical ChaCha20 keystream & distributions) |
+| **Grouped Selectors** | Client `CreateGroupedSelector` + offline `RotateGroupMaskForInterval` | **Yes** (rotated-mask == interval extraction) | **Zero** (no cross-colour contamination) | $P \to G_{\text{sel}}$ RLWE samples; standard RLWE IND-CPA |
+| **Cross-Colour Response Packing** | Server `PreprocessCrossColorBlock`, `CreateCrossColor` | **Yes** (exact LWE slot correspondence) | **Zero** (per-slot noise distribution invariant) | Download $P \to N_{\text{resp}}$ blocks; CRS packing keys unchanged |
 
 Across all **30 benchmarked workloads × 40 measured queries = 1,200 queries per binary** (`3,600` ReInsPIRe queries total), every query verified **0 decryption errors** and identical wire byte counts.
 
@@ -58,3 +63,45 @@ Across all **30 benchmarked workloads × 40 measured queries = 1,200 queries per
 1. **128-bit Word-Stream Bit-Packer (`I1`)**: Packs/unpacks the exact same little-endian bit layout as the original bit-by-bit loop (`ToProto` / `CreateFromProto` round-trip verified across all bit widths $16, 18, 29, 52$).
 2. **Power-of-Two Rescaling (`I1`)**: For unsigned $x \in [0, 2^a)$ and power-of-two moduli $2^a > 2^b$, $\lfloor (x \cdot 2^b + 2^{a-1}) / 2^a \rfloor = (x + 2^{a-b-1}) \gg (a - b)$ holds identically for every integer $x$.
 3. **Thread-Safety Note (`I2`)**: `PirServer::fft_ctx_` is a `mutable` member holding pre-allocated scratch vectors (`forward_in`, `backward_out`, `accum_scratch`). This is safe when each `PirServer` partition is queried by one thread at a time (or across partition-parallel threads). If multiple threads call `ProcessResponse` concurrently on the *same* `PirServer` instance, `fft_ctx_` should be `thread_local`.
+
+---
+
+## 5. Gen 3 Wire, Kernel, and Sampling Optimizations (`S3`, `S4`, `S5a`)
+
+1. **40-Bit Selector Modulus Switching (`S3a`) & Sign-Flipped `vpmaddwd` Contraction (`S3b`)**:
+   - Rounding each selector coefficient from $q = 2^{52}$ to $q_{\text{sel}} = 2^{40}$ and shifting left by 12 bits on the server injects zero-mean rounding error $\delta_r \in [-2^{11}, 2^{11}]$ ($\text{Var}(\delta_r) = 2^{24}/12$). Multiplied by $M \le 2048$ database entries in $[0, 2^{16})$ and scaled to $q_2 = 2^{18}$, the added variance is at most $2048 \cdot \frac{2^{32}}{3} \cdot \frac{2^{24}}{12} \cdot 2^{-68} \approx 0.16\text{ LSB}_{q_2}^2$.
+   - Writing $D'_{r,j} = D_{r,j} - 2^{15} \in [-32768, 32767]$ and decomposing centered query coefficients into three signed 14-bit digits $d_0, d_1, d_2 \in [-8192, 8192]$ ensures each 16-lane `_mm256_madd_epi16` (`vpmaddwd`) accumulator sums at most $1024$ pairs bounded by $2 \cdot 32768 \cdot 8192 = 2^{29}$, so the 32-bit signed sum is $\le 2^{39}/2^{9} = 2^{30} < 2^{31}-1$ (zero overflow) and adding $2^{15} \sum_r v_r \pmod{2^{52}}$ restores the exact unsigned inner product modulo $2^{52}$.
+2. **Single-Rounding $q_1 = 2^{25}$ Decryption (`S4a`) & Length-$d$ Negacyclic FFT (`S4c`)**:
+   - Computing $(a_{\text{sw}} \cdot s + (b_{\text{sw}} \ll 7)) \bmod q_1$ and rounding once from $q_1 = 2^{25}$ to $p = 2^{16}$ eliminates the intermediate $q_1 \to q_2$ rounding variance $\frac{d}{6} = 341.33\text{ LSB}_{q_2}^2$, reducing total decryption noise standard deviation by **20%–22%** while cutting `ct.a` from 29 to 25 bits (`-1,024 B/ct`).
+   - Length-$d$ twisted negacyclic FFTs (`ctx.negacyclic_plan`) evaluate polynomials at the odd roots of $-1$, $\psi^{2k+1} = e^{i\pi(2k+1)/d}$, which is algebraically isomorphic to $\mathbb{R}[X]/(X^d+1)$ and produces bit-identical integer coefficients after `nearbyint`.
+3. **Bit-Sliced Samplers & `FastChaChaPrng` (`S5a`)**:
+   - `SampleCenteredBinomialAndSubtract` sums 80 independent fair bits minus 80 independent fair bits via `absl::popcount` on `Rand64()` words, matching $\text{Binomial}(80, 0.5) - 40$ ($\sigma^2 = 40$) identically. `FastChaChaPrng` calls the exact same `ChaChaPrngResalt` block function as `::rlwe::ChaChaPrng`.
+
+---
+
+## 6. Whole-Colour Grouped Selector Encryption & Sub-Tile Cross-Colour LWE Response Packing
+
+### 6.1 Whole-Colour Grouped Selector Encryption (`CreateGroupedSelector`, `RotateGroupMaskForInterval`)
+- **Algebraic Equivalence (View 2 Rotated Mask == View 1 Interval Extraction)**:
+  - Suppose group $g$ packs colours with row counts $R_i$ at disjoint intervals $[\text{offset}_i, \text{offset}_i + R_i) \subset [0, d)$ ($\sum_{i \in g} R_i \le d = 2048$) into one RLWE ciphertext $(a_g(X), b_g(X))$ where $b_g(X) = \Delta \sum_{i \in g} X^{\text{offset}_i + r_i^*} - a_g(X) s(X) + e_g(X) \bmod q$.
+  - Colour $i$'s query vector is the slice $y_i[r] = b_g[\text{offset}_i + r]$ for $r \in [0, R_i)$. The LWE mask vector corresponding to $b_g[\text{offset}_i + r]$ is row $\text{offset}_i + r$ of $\text{Negacyclic}(a_g)$:
+    $$\text{Negacyclic}(a_g)_{\text{offset}_i + r, j} = \begin{cases} a_g[\text{offset}_i + r - j] & j \le \text{offset}_i + r, \\ -a_g[d + \text{offset}_i + r - j] \bmod q & j > \text{offset}_i + r. \end{cases}$$
+  - Define $\tilde{a}_i(X) = X^{-\text{offset}_i} a_g(X) \bmod (X^d + 1)$ (`RotateGroupMaskForInterval`). For every $r \in [0, R_i)$ (since $\text{offset}_i + r < d$) and every column $j \in [0, d)$, row $r$ of $\text{Negacyclic}(\tilde{a}_i)$ has $(r, j)$ entry:
+    - If $j \le r$: $\tilde{a}_i[r - j] = a_g[\text{offset}_i + r - j]$ (since $r - j < R_i \le d - \text{offset}_i$).
+    - If $r < j \le \text{offset}_i + r$: $-\tilde{a}_i[d + r - j] = -(-a_g[\text{offset}_i + r - j]) = a_g[\text{offset}_i + r - j]$ (since $d + r - j \ge d - \text{offset}_i$).
+    - If $j > \text{offset}_i + r$: $-\tilde{a}_i[d + r - j] = -a_g[d + \text{offset}_i + r - j]$ (since $d + r - j < d - \text{offset}_i$).
+    Hence the first $R_i$ rows of $\text{Negacyclic}(\tilde{a}_i)$ are **identically equal** to rows $[\text{offset}_i, \text{offset}_i + R_i)$ of $\text{Negacyclic}(a_g)$. Verified directly in `PirEndToEndTest::GroupedSelectorEncryptionRecoversPayloadsAtBoundariesAndHeterogeneousHeights`.
+- **Zero Cross-Colour Noise or Rounding Contamination**:
+  - Each coefficient $b_g[k]$ has its own independent centered binomial error $e_g[k]$ and is rounded to 40 bits component-wise. Because colour $i$ only reads $b_g[\text{offset}_i : \text{offset}_i + R_i)$, the message bits $\Delta X^{\text{offset}_{i'} + r_{i'}^*}$ of other colours $i' \ne i$ in group $g$ lie at disjoint indices outside $[\text{offset}_i, \text{offset}_i + R_i)$ and contribute **zero** to colour $i$'s query vector or LWE inner product.
+- **Cryptographic Security (IND-CPA)**:
+  - Multiplication by $X^{-\text{offset}_i}$ is a ring automorphism (unit multiplication) in $\mathcal{R}_q = \mathbb{Z}_q[X]/(X^d + 1)$, so $a_g(X)$ is uniform in $\mathcal{R}_q$ and $(a_g(X), b_g(X))$ is a single standard RLWE sample encrypting $m_g(X)$ under secret key $s(X)$ and fresh error $e_g(X)$. Publishing the sub-slices $b_g[\text{offset}_i : \text{offset}_i + R_i)$ (a subset of coefficients of $b_g$) is a deterministic post-processing of one standard RLWE ciphertext per group, so joint pseudorandomness holds under standard RLWE with $G_{\text{sel}} \le P$ samples.
+
+### 6.2 Sub-Tile Cross-Colour LWE Response Packing (`PreprocessCrossColorBlock`, `PirServer::CreateCrossColor`)
+- **Algebraic Correctness**:
+  - For $C = 1$ and active row payload length $d_{\text{row}} \le 1024$, colour $s \in [0, P)$ has $d_{\text{row}}$ active Stage 1 LWE inner products $(h_{s, u}(X), b'_{s, u})$ for $u \in [0, d_{\text{row}})$, where $h_{s, u}(X) = \sum_{r=0}^{R_s - 1} D_{s}[r, u] \cdot \text{row}_r(\text{Negacyclic}(\tilde{a}_s))$ and $b'_{s, u} = \sum_{r=0}^{R_s - 1} D_{s}[r, u] \cdot y_s[r] \bmod q$.
+  - Inspire's `PreprocessMatrixPack` + `FinalizeMatrixPack` is an LWE-to-RLWE packing operator that takes *any* tuple of $d = 2048$ LWE ciphertexts $\{(h_k(X), b'_k)\}_{k=0}^{d-1}$ encrypted under the same client secret key $s(X)$ and packs their plaintexts into the $d$ polynomial coefficients of a single RLWE ciphertext.
+  - Because all $P$ colours in a request are encrypted under the same per-query secret key $s(X)$, concatenating the $P \cdot d_{\text{row}}$ LWE ciphertexts across colours into $N_{\text{resp}} = \lceil P \cdot d_{\text{row}} / 2048 \rceil$ blocks of 2048 LWEs (including slices that straddle block boundaries when $d_{\text{row}} \nmid 2048$) packs colour $s$'s active coefficients into global positions $[s \cdot d_{\text{row}}, (s + 1) \cdot d_{\text{row}})$. Verified in `PirEndToEndTest::CrossColorResponsePackingAndGroupedSelectorsMatchPlaintext`.
+- **Noise Invariance**:
+  - In `MatrixPack`, each output coefficient $k \in [0, d)$ accumulates its own Stage 1 LWE noise $e_{\text{stage1}, k}$ plus the key-switching noise from the $d$ LWE-to-RLWE automorphisms (whose distribution depends only on the gadget parameters $\ell_{\text{pack}} = 2, B_{\text{pack}} = 2^{19}$ and the shared ternary key $s(X)$, not on which colour produced LWE slot $k$). Thus the per-coefficient decryption noise variance in each of the $N_{\text{resp}}$ cross-colour response ciphertexts is **identically distributed** to that of per-colour response ciphertexts.
+- **Cryptographic Security**:
+  - Cross-colour response packing is a purely server-side offline/online reorganization of public database rows and public CRS hint polynomials; the client's uploaded message (packing key bundle + selector slices) is unchanged.

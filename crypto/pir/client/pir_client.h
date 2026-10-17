@@ -86,6 +86,14 @@ class PirClient {
     return CreateFirstDimensionQuery(index, mask_prng);
   }
 
+  // Encrypts a multi-hot selector polynomial for a group of colors occupying
+  // disjoint intervals [slices[k].offset, slices[k].offset + slices[k].rows)
+  // under a single degree-d RLWE sample drawn from `mask_prng`.
+  absl::StatusOr<std::vector<CoeffType>> CreateGroupedSelector(
+      const std::vector<SelectorSliceSpec>& slices,
+      const std::vector<int>& target_indices,
+      ::rlwe::SecurePrng* mask_prng) const;
+
   // Creates the key used for packing..
   absl::StatusOr<std::vector<Polynomial<CoeffType>>> CreatePackingKey(::rlwe::SecurePrng* mask_prng = nullptr) const;
 

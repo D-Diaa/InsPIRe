@@ -205,6 +205,10 @@ struct PirRequest {
 
   // The key used for packing..
   std::vector<Polynomial<CoeffType>> packing_key;
+
+  // Optional pointer to all colors' Stage 1 query vectors for cross-color
+  // response servers.
+  const std::vector<std::vector<CoeffType>>* color_queries = nullptr;
 };
 
 // A response object containing the result of the PIR query.
@@ -214,6 +218,84 @@ struct PirResponse {
   // client's secret key.
   std::vector<RlweCiphertext<CoeffType>> ciphertexts;
 };
+
+// One color's disjoint coefficient interval [offset, offset + rows) inside a
+// degree-d grouped selector encryption.
+struct SelectorSliceSpec {
+  size_t slot = 0;
+  size_t offset = 0;
+  size_t rows = 0;
+};
+
+// A group of whole colors packed into one degree-d selector encryption.
+struct SelectorGroupPlan {
+  size_t group_index = 0;
+  size_t total_rows = 0;
+  std::vector<SelectorSliceSpec> slices;
+};
+
+// Greedily partitions consecutive colors with row counts `rows_per_slot` into
+// whole-color groups of total height <= `ring_degree`.
+inline absl::StatusOr<std::vector<SelectorGroupPlan>> BuildSelectorGroupPlans(
+    const std::vector<int>& rows_per_slot, size_t ring_degree = 2048) {
+  if (rows_per_slot.empty() || ring_degree == 0) {
+    return absl::InvalidArgumentError(
+        "rows_per_slot and ring_degree must be positive.");
+  }
+  std::vector<SelectorGroupPlan> groups;
+  SelectorGroupPlan current;
+  size_t offset = 0;
+  for (size_t slot = 0; slot < rows_per_slot.size(); ++slot) {
+    if (rows_per_slot[slot] <= 0 ||
+        static_cast<size_t>(rows_per_slot[slot]) > ring_degree) {
+      return absl::InvalidArgumentError(
+          "Each slot row count must be in [1, ring_degree].");
+    }
+    const size_t r = static_cast<size_t>(rows_per_slot[slot]);
+    if (!current.slices.empty() && offset + r > ring_degree) {
+      current.group_index = groups.size();
+      current.total_rows = offset;
+      groups.push_back(std::move(current));
+      current = SelectorGroupPlan{};
+      offset = 0;
+    }
+    current.slices.push_back(SelectorSliceSpec{slot, offset, r});
+    offset += r;
+  }
+  if (!current.slices.empty()) {
+    current.group_index = groups.size();
+    current.total_rows = offset;
+    groups.push_back(std::move(current));
+  }
+  return groups;
+}
+
+// Computes the signed negacyclic rotation X^{-offset} * group_mask(X) mod
+// (X^d + 1), whose first R_i negacyclic-matrix rows (for offset + R_i <= d)
+// equal the extraction rows [offset, offset + R_i) of `group_mask`'s
+// negacyclic matrix.
+template <typename CoeffType>
+absl::StatusOr<Polynomial<CoeffType>> RotateGroupMaskForInterval(
+    const Polynomial<CoeffType>& group_mask, size_t offset,
+    CoeffType modulus) {
+  const auto& src = group_mask.Coeffs();
+  const size_t d = src.size();
+  if (offset >= d) {
+    return absl::InvalidArgumentError("Interval offset must be < ring degree.");
+  }
+  if (offset == 0) {
+    return group_mask;
+  }
+  std::vector<CoeffType> rotated(d, 0);
+  for (size_t r = 0; r < d - offset; ++r) {
+    rotated[r] = src[r + offset];
+  }
+  for (size_t r = d - offset; r < d; ++r) {
+    const CoeffType val = src[r + offset - d];
+    rotated[r] = (val == 0) ? 0 : (modulus - val);
+  }
+  return Polynomial<CoeffType>::Create(std::move(rotated));
+}
 
 }  // namespace v2
 }  // namespace rlwe

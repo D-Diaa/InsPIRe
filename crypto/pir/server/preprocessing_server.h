@@ -15,6 +15,7 @@
 #ifndef CRYPTO_PIR_SERVER_PREPROCESSING_SERVER_H_
 #define CRYPTO_PIR_SERVER_PREPROCESSING_SERVER_H_
 
+#include <algorithm>
 #include <cstddef>
 #include <cstdint>
 #include <memory>
@@ -52,6 +53,11 @@ namespace v2 {
 template <typename DbValueType, typename CoeffType, typename MatCoeffType>
 class PreprocessingServer {
  public:
+  struct CrossColorBlockPreprocessed {
+    std::vector<CrossColorDbSlice<DbValueType>> db_slices;
+    PreprocessMatrixPackOutput<CoeffType, MatCoeffType> pack_output;
+  };
+
   // Creates a new PreprocessingServer.
   static absl::StatusOr<std::unique_ptr<PreprocessingServer>> Create(
       const PirParams<CoeffType>* params) {
@@ -65,14 +71,151 @@ class PreprocessingServer {
         new PreprocessingServer(params, std::string(prng_seed)));
   }
 
+  // Preprocesses one cross-color response block `block_index` covering global
+  // LWE coefficients [block_index * d, min((block_index + 1) * d, P * d_row)),
+  // computing only the `d_row` useful Stage 1 rows and LWE hints per color.
+  static absl::StatusOr<CrossColorBlockPreprocessed> PreprocessCrossColorBlock(
+      const RlweParams<CoeffType>& rlwe_params,
+      const GadgetParams& pack_gadget_params,
+      const std::vector<int>& rows,
+      const std::vector<std::vector<DbValueType>>& raw,
+      const std::vector<std::string>& slot_selector_seeds,
+      const std::vector<size_t>& slot_offsets,
+      absl::string_view packing_seed,
+      size_t d_row,
+      size_t block_index) {
+    const size_t p = rows.size();
+    const size_t d = static_cast<size_t>(rlwe_params.Degree());
+    if (p == 0 || raw.size() != p || slot_selector_seeds.size() != p ||
+        slot_offsets.size() != p || d_row == 0 || d_row > d) {
+      return absl::InvalidArgumentError(
+          "Invalid arguments for PreprocessCrossColorBlock.");
+    }
+    const size_t total_u16 = p * d_row;
+    const size_t g0 = block_index * d;
+    const size_t g1 = std::min((block_index + 1) * d, total_u16);
+    if (g0 >= g1) {
+      return absl::InvalidArgumentError("Cross-color block_index out of range.");
+    }
+
+    ASSIGN_OR_RETURN(
+        auto fft_ctx,
+        FftContext::Create(absl::bit_width(static_cast<uint32_t>(d)) - 1));
+    std::vector<std::vector<CoeffType>> hint_block(
+        d, std::vector<CoeffType>(d, 0));
+    std::vector<CrossColorDbSlice<DbValueType>> db_slices;
+
+    size_t pos = g0;
+    while (pos < g1) {
+      const size_t slot = pos / d_row;
+      const size_t u0 = pos % d_row;
+      const size_t take = std::min(d_row - u0, g1 - pos);
+      const size_t coeff0 = pos - g0;
+      const int m_rows = rows[slot];
+      if (m_rows <= 0 || static_cast<size_t>(m_rows) > d ||
+          raw[slot].size() < static_cast<size_t>(m_rows) * d) {
+        return absl::InvalidArgumentError("Invalid slot database dimensions.");
+      }
+
+      std::vector<std::vector<DbValueType>> padded_for_hints(
+          take, std::vector<DbValueType>(d, 0));
+      for (size_t u = 0; u < take; ++u) {
+        for (int r = 0; r < m_rows; ++r) {
+          padded_for_hints[u][r] =
+              raw[slot][static_cast<size_t>(r) * d + (u0 + u)];
+        }
+      }
+      ASSIGN_OR_RETURN(
+          auto db_for_hints,
+          Matrix<DbValueType>::Create(std::move(padded_for_hints)));
+
+      ASSIGN_OR_RETURN(auto a_prng,
+                       ::rlwe::ChaChaPrng::Create(slot_selector_seeds[slot]));
+      ASSIGN_OR_RETURN(
+          auto first_dim_a,
+          SampleAComponents(rlwe_params, /*num_samples=*/1, *a_prng));
+      if (slot_offsets[slot] > 0) {
+        ASSIGN_OR_RETURN(
+            first_dim_a[0],
+            RotateGroupMaskForInterval(first_dim_a[0], slot_offsets[slot],
+                                       rlwe_params.Modulus()));
+      }
+      ASSIGN_OR_RETURN(
+          auto slice_hints,
+          (ComputeHintMatrix<CoeffType, DbValueType, CoeffType>(
+              db_for_hints, first_dim_a, *fft_ctx)));
+      for (size_t u = 0; u < take; ++u) {
+        auto row_start = slice_hints.Data().begin() + u * slice_hints.Cols();
+        std::copy(row_start, row_start + d, hint_block[coeff0 + u].begin());
+      }
+
+      const int simd_multiple = std::is_same_v<DbValueType, uint8_t> ? 64 : 32;
+      const int padded_simd_cols =
+          ((m_rows + simd_multiple - 1) / simd_multiple) * simd_multiple;
+      std::vector<std::vector<DbValueType>> simd_data(
+          take, std::vector<DbValueType>(padded_simd_cols, 0));
+      for (size_t u = 0; u < take; ++u) {
+        for (int r = 0; r < m_rows; ++r) {
+          simd_data[u][r] = raw[slot][static_cast<size_t>(r) * d + (u0 + u)];
+        }
+      }
+      ASSIGN_OR_RETURN(auto db_submatrix,
+                       Matrix<DbValueType>::Create(std::move(simd_data)));
+      if constexpr ((std::is_same_v<DbValueType, uint16_t> ||
+                     std::is_same_v<DbValueType, uint8_t>) &&
+                    std::is_same_v<CoeffType, uint64_t>) {
+        auto condensed_or = Matrix<DbValueType>::CreateCondensed(db_submatrix);
+        if (condensed_or.ok()) {
+          db_submatrix = std::move(*condensed_or);
+        }
+      }
+      db_slices.push_back(CrossColorDbSlice<DbValueType>{
+          .color = slot,
+          .padded_cols = padded_simd_cols,
+          .rows = static_cast<int>(take),
+          .db_submatrix = std::move(db_submatrix),
+      });
+      pos += take;
+    }
+
+    ASSIGN_OR_RETURN(auto pack_prng, ::rlwe::ChaChaPrng::Create(packing_seed));
+    const int pack_a_samples = 2 * pack_gadget_params.num_digits;
+    ASSIGN_OR_RETURN(
+        auto pack_a,
+        SampleAComponents(rlwe_params, pack_a_samples, *pack_prng));
+    std::vector<Polynomial<CoeffType>> w_vec_g(
+        pack_a.begin(), pack_a.begin() + pack_gadget_params.num_digits);
+    std::vector<Polynomial<CoeffType>> w_vec_h(
+        pack_a.begin() + pack_gadget_params.num_digits, pack_a.end());
+    ASSIGN_OR_RETURN(
+        auto pack_output,
+        (PreprocessMatrixPack<CoeffType, MatCoeffType>(
+            rlwe_params, hint_block, w_vec_g, w_vec_h, pack_gadget_params,
+            *fft_ctx)));
+
+    return CrossColorBlockPreprocessed{
+        .db_slices = std::move(db_slices),
+        .pack_output = std::move(pack_output),
+    };
+  }
+
   absl::StatusOr<PirPreprocessedData<DbValueType, CoeffType, MatCoeffType>>
   Preprocess(const std::vector<DbValueType>& db_raw,
-             absl::string_view packing_seed = "") const {
+             absl::string_view packing_seed = "",
+             size_t selector_offset = 0) const {
     ASSIGN_OR_RETURN(auto a_prng, ::rlwe::ChaChaPrng::Create(prng_seed_));
     const int d = params_->RlweParameters().Degree();
     const int t = params_->InterpolationDegree();
     const int n = params_->NumEntries();
     const int entry_size_multiple = params_->EntrySizeMultiple();
+
+    if (selector_offset > 0 &&
+        (t != 1 ||
+         selector_offset + static_cast<size_t>(n) > static_cast<size_t>(d))) {
+      return absl::InvalidArgumentError(
+          "Grouped selector interval [selector_offset, selector_offset + n) "
+          "must fit within ring degree d at t=1.");
+    }
 
     if (db_raw.size() != static_cast<size_t>(n) * d * entry_size_multiple) {
       return absl::InvalidArgumentError("Invalid raw database size.");
@@ -100,6 +243,12 @@ class PreprocessingServer {
     ASSIGN_OR_RETURN(auto first_dim_a,
                      SampleAComponents(params_->RlweParameters(),
                                        first_dim_a_samples, *a_prng));
+    if (selector_offset > 0) {
+      ASSIGN_OR_RETURN(
+          first_dim_a[0],
+          RotateGroupMaskForInterval(first_dim_a[0], selector_offset,
+                                     params_->RlweParameters().Modulus()));
+    }
     const int second_dim_a_samples =
         t > 1 ? 2 * params_->PolyEvalGadgetParams().num_digits : 0;
     std::vector<Polynomial<CoeffType>> second_dim_a;

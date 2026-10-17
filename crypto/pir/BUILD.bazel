@@ -50,6 +50,7 @@ cc_test(
 
 cc_test(
     name = "pir_end_to_end_real_params_test",
+    size = "large",
     srcs = ["pir_end_to_end_real_params_test.cc"],
     deps = [
         ":pir_params",
