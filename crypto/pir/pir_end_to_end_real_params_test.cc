@@ -222,8 +222,8 @@ TEST_F(PirEndToEndTest,
   }
 }
 
-std::string SelectorSeedForSlot(uint64_t slot) {
-  std::string seed(32, 'S');
+std::string SelectorSeedForSlot(uint64_t slot, char tag = 'S') {
+  std::string seed(32, tag);
   for (int i = 0; i < 8; ++i) seed[24 + i] = static_cast<char>(slot >> (8 * i));
   return seed;
 }
@@ -559,10 +559,7 @@ TEST_F(PirEndToEndTest,
 }
 
 std::string GroupSelectorSeedForGroup(uint64_t group) {
-  std::string seed(32, 'G');
-  for (int i = 0; i < 8; ++i)
-    seed[24 + i] = static_cast<char>(group >> (8 * i));
-  return seed;
+  return SelectorSeedForSlot(group, 'G');
 }
 
 TEST_F(

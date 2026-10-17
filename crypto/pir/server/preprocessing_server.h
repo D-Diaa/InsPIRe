@@ -117,12 +117,20 @@ class PreprocessingServer {
         return absl::InvalidArgumentError("Invalid slot database dimensions.");
       }
 
+      const int simd_multiple = std::is_same_v<DbValueType, uint8_t> ? 64 : 32;
+      const int padded_simd_cols =
+          ((m_rows + simd_multiple - 1) / simd_multiple) * simd_multiple;
       std::vector<std::vector<DbValueType>> padded_for_hints(
           take, std::vector<DbValueType>(d, 0));
-      for (size_t u = 0; u < take; ++u) {
-        for (int r = 0; r < m_rows; ++r) {
-          padded_for_hints[u][r] =
-              raw[slot][static_cast<size_t>(r) * d + (u0 + u)];
+      std::vector<std::vector<DbValueType>> simd_data(
+          take, std::vector<DbValueType>(padded_simd_cols, 0));
+      for (int r = 0; r < m_rows; ++r) {
+        const DbValueType* row_ptr =
+            raw[slot].data() + static_cast<size_t>(r) * d + u0;
+        for (size_t u = 0; u < take; ++u) {
+          const DbValueType v = row_ptr[u];
+          padded_for_hints[u][r] = v;
+          simd_data[u][r] = v;
         }
       }
       ASSIGN_OR_RETURN(
@@ -149,26 +157,9 @@ class PreprocessingServer {
         std::copy(row_start, row_start + d, hint_block[coeff0 + u].begin());
       }
 
-      const int simd_multiple = std::is_same_v<DbValueType, uint8_t> ? 64 : 32;
-      const int padded_simd_cols =
-          ((m_rows + simd_multiple - 1) / simd_multiple) * simd_multiple;
-      std::vector<std::vector<DbValueType>> simd_data(
-          take, std::vector<DbValueType>(padded_simd_cols, 0));
-      for (size_t u = 0; u < take; ++u) {
-        for (int r = 0; r < m_rows; ++r) {
-          simd_data[u][r] = raw[slot][static_cast<size_t>(r) * d + (u0 + u)];
-        }
-      }
       ASSIGN_OR_RETURN(auto db_submatrix,
                        Matrix<DbValueType>::Create(std::move(simd_data)));
-      if constexpr ((std::is_same_v<DbValueType, uint16_t> ||
-                     std::is_same_v<DbValueType, uint8_t>) &&
-                    std::is_same_v<CoeffType, uint64_t>) {
-        auto condensed_or = Matrix<DbValueType>::CreateCondensed(db_submatrix);
-        if (condensed_or.ok()) {
-          db_submatrix = std::move(*condensed_or);
-        }
-      }
+      RETURN_IF_ERROR(PadAndCondenseForSimd(db_submatrix));
       db_slices.push_back(CrossColorDbSlice<DbValueType>{
           .color = slot,
           .padded_cols = padded_simd_cols,
@@ -281,32 +272,8 @@ class PreprocessingServer {
       preprocessed_outputs.push_back(std::move(preprocessed_output));
     }
 
-    if constexpr ((std::is_same_v<DbValueType, uint16_t> ||
-                   std::is_same_v<DbValueType, uint8_t>) &&
-                  std::is_same_v<CoeffType, uint64_t>) {
-      for (size_t k = 0; k < entry_size_multiple; ++k) {
-        int cols = db_matrices[k].Cols();
-        int simd_multiple = std::is_same_v<DbValueType, uint8_t> ? 64 : 32;
-        if (cols % simd_multiple != 0) {
-          int padded_simd_cols =
-              ((cols + simd_multiple - 1) / simd_multiple) * simd_multiple;
-          std::vector<std::vector<DbValueType>> padded_data(
-              db_matrices[k].Rows(),
-              std::vector<DbValueType>(padded_simd_cols, 0));
-          for (int i = 0; i < db_matrices[k].Rows(); ++i) {
-            for (int j = 0; j < cols; ++j) {
-              padded_data[i][j] = db_matrices[k].Data()[i * cols + j];
-            }
-          }
-          ASSIGN_OR_RETURN(db_matrices[k],
-                           Matrix<DbValueType>::Create(std::move(padded_data)));
-        }
-        auto condensed_matrix_or =
-            Matrix<DbValueType>::CreateCondensed(db_matrices[k]);
-        if (condensed_matrix_or.ok()) {
-          db_matrices[k] = std::move(*condensed_matrix_or);
-        }
-      }
+    for (size_t k = 0; k < entry_size_multiple; ++k) {
+      RETURN_IF_ERROR(PadAndCondenseForSimd(db_matrices[k]));
     }
 
     return PirPreprocessedData<DbValueType, CoeffType, MatCoeffType>{
@@ -328,6 +295,33 @@ class PreprocessingServer {
   explicit PreprocessingServer(const PirParams<CoeffType>* params,
                                absl::string_view prng_seed)
       : params_(params), prng_seed_(prng_seed) {}
+
+  static absl::Status PadAndCondenseForSimd(Matrix<DbValueType>& matrix) {
+    if constexpr ((std::is_same_v<DbValueType, uint16_t> ||
+                   std::is_same_v<DbValueType, uint8_t>) &&
+                  std::is_same_v<CoeffType, uint64_t>) {
+      const int cols = matrix.Cols();
+      const int simd_multiple = std::is_same_v<DbValueType, uint8_t> ? 64 : 32;
+      if (cols % simd_multiple != 0) {
+        const int padded_simd_cols =
+            ((cols + simd_multiple - 1) / simd_multiple) * simd_multiple;
+        std::vector<std::vector<DbValueType>> padded_data(
+            matrix.Rows(), std::vector<DbValueType>(padded_simd_cols, 0));
+        for (int i = 0; i < matrix.Rows(); ++i) {
+          for (int j = 0; j < cols; ++j) {
+            padded_data[i][j] = matrix.Data()[i * cols + j];
+          }
+        }
+        ASSIGN_OR_RETURN(matrix,
+                         Matrix<DbValueType>::Create(std::move(padded_data)));
+      }
+      auto condensed_or = Matrix<DbValueType>::CreateCondensed(matrix);
+      if (condensed_or.ok()) {
+        matrix = std::move(*condensed_or);
+      }
+    }
+    return absl::OkStatus();
+  }
 
   // Stage 1: DB interpolation.
   absl::StatusOr<Matrix<DbValueType>> InterpolateAndTranspose(

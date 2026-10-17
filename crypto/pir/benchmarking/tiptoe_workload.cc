@@ -56,15 +56,13 @@ uint64_t Read64(std::istream& input) {
   for (int i = 0; i < 8; ++i) v |= uint64_t(b[i]) << (8 * i);
   return v;
 }
-std::string SelectorSeed(uint64_t slot) {
-  std::string seed(32, 'S');
+std::string SelectorSeed(uint64_t slot, char tag = 'S') {
+  std::string seed(32, tag);
   for (int i = 0; i < 8; ++i) seed[24 + i] = char(slot >> (8 * i));
   return seed;
 }
 std::string GroupSelectorSeed(uint64_t group) {
-  std::string seed(32, 'G');
-  for (int i = 0; i < 8; ++i) seed[24 + i] = char(group >> (8 * i));
-  return seed;
+  return SelectorSeed(group, 'G');
 }
 size_t ResolveRowU16(const std::string& workload_path, size_t c,
                      const std::vector<int>& rows,
