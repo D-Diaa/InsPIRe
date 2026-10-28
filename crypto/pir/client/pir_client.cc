@@ -313,7 +313,7 @@ PirClient<CoeffType>::CreatePackingKey(::rlwe::SecurePrng* mask_prng) const {
 
 template <typename CoeffType>
 absl::StatusOr<std::vector<CoeffType>> PirClient<CoeffType>::ProcessResponse(
-    const PirResponse<CoeffType>& response) const {
+    const PirResponse<CoeffType>& response, std::vector<int64_t>* noise) const {
   const int entry_size_multiple = params_.EntrySizeMultiple();
   if (response.ciphertexts.size() != entry_size_multiple) {
     return absl::InvalidArgumentError(
@@ -327,50 +327,12 @@ absl::StatusOr<std::vector<CoeffType>> PirClient<CoeffType>::ProcessResponse(
     ASSIGN_OR_RETURN(std::vector<CoeffType> shard_decrypted,
                      DecryptAfterModulusSwitch(
                          params_.RlweParameters(), params_.PlaintextModulus(),
-                         response.ciphertexts[k], secret_key_fft_, *fft_ctx_));
+                         response.ciphertexts[k], secret_key_fft_, *fft_ctx_,
+                         noise));
     decrypted_message.insert(decrypted_message.end(), shard_decrypted.begin(),
                              shard_decrypted.end());
   }
-  if (params_.CenteredDb()) {
-    const CoeffType p = params_.PlaintextModulus();
-    for (CoeffType& m : decrypted_message) m = (m + kCenteredDbOffset) % p;
-  }
   return decrypted_message;
-}
-
-template <typename CoeffType>
-absl::StatusOr<std::vector<int64_t>> PirClient<CoeffType>::DecryptionNoise(
-    const PirResponse<CoeffType>& response,
-    const std::vector<CoeffType>& expected) const {
-  const auto& rlwe_params = params_.RlweParameters();
-  const size_t d = rlwe_params.Degree();
-  const CoeffType p = params_.PlaintextModulus();
-  if (!absl::has_single_bit(static_cast<uint64_t>(p)) ||
-      expected.size() != response.ciphertexts.size() * d) {
-    return absl::InvalidArgumentError("Invalid DecryptionNoise arguments.");
-  }
-  const int log_q1 = rlwe_params.LogModulus1AfterSwitch();
-  const int b_shift = log_q1 - rlwe_params.LogModulus2AfterSwitch();
-  const int m_shift = log_q1 - (absl::bit_width(static_cast<uint64_t>(p)) - 1);
-  const uint64_t q1_mask = (uint64_t{1} << log_q1) - 1;
-  const CoeffType offset = params_.CenteredDb() ? kCenteredDbOffset % p : 0;
-  std::vector<int64_t> noise;
-  noise.reserve(expected.size());
-  for (size_t k = 0; k < response.ciphertexts.size(); ++k) {
-    const auto& ct = response.ciphertexts[k];
-    ASSIGN_OR_RETURN(auto as, ct.a.MultFft(secret_key_fft_, *fft_ctx_, log_q1));
-    for (size_t i = 0; i < d; ++i) {
-      const uint64_t m = (expected[k * d + i] + p - offset) % p;
-      const uint64_t err = (static_cast<uint64_t>(as.Coeffs()[i]) +
-                            (static_cast<uint64_t>(ct.b.Coeffs()[i]) << b_shift) -
-                            (m << m_shift)) &
-                           q1_mask;
-      noise.push_back(err > q1_mask / 2 ? static_cast<int64_t>(err) -
-                                              static_cast<int64_t>(q1_mask) - 1
-                                        : static_cast<int64_t>(err));
-    }
-  }
-  return noise;
 }
 
 template class PirClient<uint32_t>;

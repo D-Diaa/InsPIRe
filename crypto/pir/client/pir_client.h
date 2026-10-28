@@ -68,9 +68,11 @@ class PirClient {
   ::rlwe::SecurePrng* GetPrng() const { return prng_.get(); }
 
   // Processes a PirResponse to extract the resulting message using the inner
-  // secret key.
+  // secret key. If `noise` is given (power-of-two p only), appends every
+  // coefficient's signed decryption error in units of q1.
   absl::StatusOr<std::vector<CoeffType>> ProcessResponse(
-      const PirResponse<CoeffType>& response) const;
+      const PirResponse<CoeffType>& response,
+      std::vector<int64_t>* noise = nullptr) const;
 
   // Creates the part of PIR query corresponding to the second dimension of
   // database items.
@@ -101,13 +103,6 @@ class PirClient {
       const std::vector<SelectorSliceSpec>& slices,
       const std::vector<int>& target_indices,
       ::rlwe::SecurePrng* mask_prng) const;
-
-  // Returns the signed decryption error of every coefficient of `response`, in
-  // units of q1, against the `expected` plaintext (entry_size_multiple * d
-  // values). For empirical noise measurement; needs a power-of-two p.
-  absl::StatusOr<std::vector<int64_t>> DecryptionNoise(
-      const PirResponse<CoeffType>& response,
-      const std::vector<CoeffType>& expected) const;
 
   // Creates the key used for packing..
   absl::StatusOr<std::vector<Polynomial<CoeffType>>> CreatePackingKey(::rlwe::SecurePrng* mask_prng = nullptr) const;

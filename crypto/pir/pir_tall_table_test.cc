@@ -13,8 +13,8 @@
 // limitations under the License.
 
 // Tiptoe-parameter (d=2048, q=2^52, q1=2^25, q2=2^18, p=2^16, t=1) tests of
-// color tables taller than d: multi-sample selectors, centered databases,
-// 42-bit selectors and row-stripe Stage 1 servers.
+// color tables taller than d: multi-sample selectors, signed (centered)
+// entries, 42-bit selectors and row-stripe Stage 1 servers.
 
 #include <algorithm>
 #include <cstddef>
@@ -71,35 +71,57 @@ class TallTableTest : public ::testing::Test {
     ChunkedFft y_vec_h_fft;
     size_t upload_bytes = 0;
   };
+  // A cross-color response block: stripe 0's packing server, then the other
+  // stripes' Stage 1 servers.
+  using Block = std::vector<std::unique_ptr<Server>>;
 
-  void SetUp() override {
-    ASSERT_OK_AND_ASSIGN(fft_ctx_, FftContext::Create(11));
-  }
+  void SetUp() override { ASSERT_OK_AND_ASSIGN(fft_ctx_, FftContext::Create(11)); }
 
-  PirParams<CoeffType> Params(int rows, size_t cols, bool centered) const {
+  PirParams<CoeffType> Params(int rows, size_t cols) const {
     return PirParams<CoeffType>::Create(rlwe_, 65536, pack_gadget_,
-                                        eval_gadget_, rows, 1, cols, centered)
+                                        eval_gadget_, rows, 1, cols)
         .value();
   }
 
-  static std::vector<std::vector<uint16_t>> RandomTables(
-      const std::vector<int>& rows, size_t cols, uint64_t seed) {
+  // Tables of `row_words` uint16_t words per row: random, or the constant
+  // `fill`.
+  static std::vector<std::vector<uint16_t>> Tables(const std::vector<int>& rows,
+                                                   size_t row_words,
+                                                   uint64_t seed,
+                                                   int fill = -1) {
     auto prng = Prng(Seed(seed, 'D'));
     std::vector<std::vector<uint16_t>> raw(rows.size());
     for (size_t s = 0; s < rows.size(); ++s) {
-      raw[s].resize(rows[s] * cols * kD);
-      for (auto& v : raw[s]) v = static_cast<uint16_t>(prng->Rand64().value());
+      raw[s].resize(rows[s] * row_words);
+      for (auto& v : raw[s]) {
+        v = fill >= 0 ? fill : static_cast<uint16_t>(prng->Rand64().value());
+      }
     }
     return raw;
   }
 
+  // Seeds and offsets of each color's selector group.
+  static std::pair<std::vector<std::string>, std::vector<size_t>> GroupLayout(
+      const std::vector<int>& rows) {
+    std::vector<std::string> seeds(rows.size());
+    std::vector<size_t> offsets(rows.size());
+    const auto groups = BuildSelectorGroupPlans(rows, kD).value();
+    for (const auto& grp : groups) {
+      for (const auto& sl : grp.slices) {
+        seeds[sl.slot] = Seed(grp.group_index, 'G');
+        offsets[sl.slot] = sl.offset;
+      }
+    }
+    return {seeds, offsets};
+  }
+
   Request MakeRequest(const std::vector<int>& rows,
-                      const std::vector<int>& targets, size_t cols,
-                      bool centered, int selector_bits) {
+                      const std::vector<int>& targets, int selector_bits,
+                      size_t cols = 1, uint64_t client_seed = 7) {
     Request r;
-    r.client = PirClient<CoeffType>::Create(Params(kD, cols, centered),
+    r.client = PirClient<CoeffType>::Create(Params(kD, cols),
                                             Prng(Seed(0, 'S')),
-                                            Prng(Seed(7, 'C')))
+                                            Prng(Seed(client_seed, 'C')))
                    .value();
     auto key_prng = Prng(kPackingSeed);
     r.request.packing_key = r.client->CreatePackingKey(key_prng.get()).value();
@@ -133,84 +155,80 @@ class TallTableTest : public ::testing::Test {
     return r;
   }
 
-  // Seeds and offsets of each color's selector group.
-  static std::pair<std::vector<std::string>, std::vector<size_t>> GroupLayout(
-      const std::vector<int>& rows) {
-    std::vector<std::string> seeds(rows.size());
-    std::vector<size_t> offsets(rows.size());
-    const auto groups = BuildSelectorGroupPlans(rows, kD).value();
-    for (const auto& grp : groups) {
-      for (const auto& sl : grp.slices) {
-        seeds[sl.slot] = Seed(grp.group_index, 'G');
-        offsets[sl.slot] = sl.offset;
-      }
-    }
-    return {seeds, offsets};
-  }
-
-  // A color's server, preprocessed as `num_stripes` row stripes: stripe 0
-  // packs (returned first), the others only contract their rows.
-  std::vector<std::unique_ptr<Server>> StripedServers(
-      int rows, size_t cols, bool centered, const std::string& seed,
-      size_t offset, const std::vector<uint16_t>& raw, size_t num_stripes) {
-    auto params = Params(rows, cols, centered);
-    auto prep = Prep::Create(&params, seed).value();
-    std::vector<std::unique_ptr<Server>> servers;
-    Prep::Stage1Stripe first;
-    for (size_t s = 0; s < num_stripes; ++s) {
-      const auto [r0, r1] = RowStripe(rows, kD, s, num_stripes);
-      if (r0 == r1) continue;
-      auto part = prep->PreprocessStripe(raw, r0, r1, offset).value();
-      if (s == 0) {
-        first = std::move(part);
-        servers.push_back(nullptr);
-        continue;
-      }
-      for (size_t k = 0; k < cols; ++k)
+  // Every response block of the colors' rows of `d_row` words, preprocessed
+  // as `num_stripes` row stripes whose hints are summed for stripe 0.
+  std::vector<Block> Blocks(const std::vector<int>& rows,
+                            const std::vector<std::vector<uint16_t>>& raw,
+                            size_t d_row, bool centered, size_t num_stripes) {
+    const auto [seeds, offsets] = GroupLayout(rows);
+    std::vector<Block> blocks;
+    for (size_t b = 0; b * kD < rows.size() * d_row; ++b) {
+      Block block(1);
+      Prep::CrossColorStripe first;
+      for (size_t s = 0; s < num_stripes; ++s) {
+        auto part = Prep::PreprocessCrossColorStripe(rlwe_, rows, raw, seeds,
+                                                     offsets, d_row, b, s,
+                                                     num_stripes, centered)
+                        .value();
+        if (s == 0) {
+          first = std::move(part);
+          continue;
+        }
         for (size_t u = 0; u < kD; ++u)
-          for (size_t j = 0; j < kD; ++j)
-            first.hints[k][u][j] += part.hints[k][u][j];
-      servers.push_back(
-          Server::CreateStage1Only(params, std::move(part.db_matrices), r0)
-              .value());
-    }
-    auto outputs = Prep::PreprocessPacking(rlwe_, pack_gadget_, kPackingSeed,
-                                           first.hints)
-                       .value();
-    std::vector<std::vector<PreprocessMatrixPackOutput<CoeffType, int32_t>>>
-        per_column(outputs.size());
-    for (size_t k = 0; k < outputs.size(); ++k)
-      per_column[k].push_back(std::move(outputs[k]));
-    servers[0] = Server::Create(params, {std::move(first.db_matrices),
-                                         std::move(per_column), {}})
+          for (size_t j = 0; j < kD; ++j) first.hint[u][j] += part.hint[u][j];
+        if (!part.db_slices.empty()) {
+          block.push_back(Server::CreateCrossColor(Params(kD, 1),
+                                                   std::move(part.db_slices), {})
+                              .value());
+        }
+      }
+      std::vector<PreprocessMatrixPackOutput<CoeffType, int32_t>> outputs;
+      outputs.push_back(Prep::PreprocessPacking(rlwe_, pack_gadget_,
+                                                kPackingSeed, first.hint)
+                            .value());
+      block[0] = Server::CreateCrossColor(Params(kD, 1),
+                                          std::move(first.db_slices),
+                                          std::move(outputs))
                      .value();
-    return servers;
+      blocks.push_back(std::move(block));
+    }
+    return blocks;
   }
 
-  // Answers `query` with stripe servers (stripe 0 first), summing Stage 1.
-  PirResponse<CoeffType> Answer(
-      const std::vector<std::unique_ptr<Server>>& servers, Request& r,
-      const std::vector<CoeffType>& query) {
-    PirRequest<CoeffType> req = r.request;
-    req.first_dimension_query = query;
-    std::vector<CoeffType> b = servers[0]->ComputeStage1(req).value();
-    for (size_t s = 1; s < servers.size(); ++s) {
-      const auto part = servers[s]->ComputeStage1(req).value();
+  // Answers `r` with `block`, summing the stripes' Stage 1 outputs.
+  PirResponse<CoeffType> Answer(const Block& block, Request& r) {
+    std::vector<CoeffType> b = block[0]->ComputeStage1(r.request).value();
+    for (size_t s = 1; s < block.size(); ++s) {
+      const auto part = block[s]->ComputeStage1(r.request).value();
       for (size_t j = 0; j < b.size(); ++j) b[j] += part[j];
     }
-    return servers[0]
-        ->PackFromStage1(req, std::move(b), &r.y_vec_h_fft)
+    return block[0]->PackFromStage1(r.request, std::move(b), &r.y_vec_h_fft)
         .value();
   }
 
-  // Variance (in q1 units squared) of the decryption noise of `resp`.
-  static double NoiseVariance(const PirClient<CoeffType>& client,
-                              const PirResponse<CoeffType>& resp,
-                              const std::vector<CoeffType>& expected) {
-    const auto noise = client.DecryptionNoise(resp, expected).value();
-    double sq = 0;
-    for (int64_t e : noise) sq += double(e) * double(e);
-    return sq / noise.size();
+  // Decrypts every block and (if `check`) checks each color's target row;
+  // returns the decryption noise of the data coefficients.
+  std::vector<int64_t> CheckDecryption(
+      const std::vector<Block>& blocks, Request& r, const std::vector<int>& rows,
+      const std::vector<std::vector<uint16_t>>& raw,
+      const std::vector<int>& targets, size_t d_row, bool check = true) {
+    std::vector<int64_t> noise;
+    const size_t total = rows.size() * d_row;
+    for (size_t b = 0; b < blocks.size(); ++b) {
+      std::vector<int64_t> block_noise;
+      const auto got =
+          r.client->ProcessResponse(Answer(blocks[b], r), &block_noise).value();
+      for (size_t i = 0; i < kD && b * kD + i < total; ++i) {
+        const size_t s = (b * kD + i) / d_row, u = (b * kD + i) % d_row;
+        const size_t row_words = raw[s].size() / rows[s];
+        if (check) {
+          EXPECT_EQ(got[i], raw[s][targets[s] * row_words + u])
+              << "color " << s << " word " << u;
+        }
+        noise.push_back(block_noise[i]);
+      }
+    }
+    return noise;
   }
 
   const RlweParams<CoeffType> rlwe_ =
@@ -355,7 +373,7 @@ TEST(TallTablePlanTest, RowStripesAreBlockAlignedAndCoverAllRows) {
 }
 
 TEST_F(TallTableTest, MultiSampleSelectorRejectsOutOfRangeTargets) {
-  auto r = MakeRequest({4100}, {4099}, 1, false, 40);
+  auto r = MakeRequest({4100}, {4099}, 40);
   auto mask = Prng(Seed(0, 'G'));
   EXPECT_THAT(r.client->CreateMultiSampleSelector(4100, 4100, mask.get()),
               ::rlwe::testing::StatusIs(absl::StatusCode::kInvalidArgument));
@@ -365,158 +383,127 @@ TEST_F(TallTableTest, MultiSampleSelectorRejectsOutOfRangeTargets) {
   EXPECT_EQ(sel.size(), 4100u);
 }
 
-// Mixed tall and grouped short colors on multi-column tables decrypt exactly
-// at every target position, for unsigned and centered databases and 40- and
-// 42-bit selectors.
-TEST_F(TallTableTest, MultiColumnTallColorsDecryptExactly) {
+// Mixed tall and grouped short colors decrypt exactly at their first, last and
+// middle rows, for sub-tile rows (cross-color blocks) and two-column rows, with
+// unsigned or signed entries and 40- or 42-bit selectors.
+TEST_F(TallTableTest, TallColorsDecryptExactly) {
   const std::vector<int> rows = {3000, 700, 300, 4101};
-  constexpr size_t kCols = 2;
-  const auto raw = RandomTables(rows, kCols, 1);
-  const auto [seeds, offsets] = GroupLayout(rows);
-  for (const auto& [centered, bits] :
-       std::vector<std::pair<bool, int>>{{false, 40}, {true, 40}, {true, 42}}) {
-    std::vector<std::vector<std::unique_ptr<Server>>> servers;
-    for (size_t s = 0; s < rows.size(); ++s) {
-      servers.push_back(StripedServers(rows[s], kCols, centered, seeds[s],
-                                       offsets[s], raw[s], 1));
-    }
+  struct Case {
+    size_t d_row;
+    bool centered;
+    int bits;
+  };
+  for (const Case& c : {Case{700, false, 40}, Case{700, true, 40},
+                        Case{700, true, 42}, Case{2 * kD, true, 42}}) {
+    const size_t row_words = c.d_row <= kD ? kD : c.d_row;
+    const auto raw = Tables(rows, row_words, 1);
+    const auto blocks = Blocks(rows, raw, c.d_row, c.centered, 1);
     for (int pos = 0; pos < 3; ++pos) {
       std::vector<int> targets;
       for (int m : rows) targets.push_back(pos == 0 ? 0 : pos == 1 ? m - 1 : m / 2);
-      auto r = MakeRequest(rows, targets, kCols, centered, bits);
+      auto r = MakeRequest(rows, targets, c.bits);
       size_t selector_bytes = 0;
-      for (int m : rows) selector_bytes += (size_t(m) * bits + 7) / 8;
+      for (int m : rows) selector_bytes += (size_t(m) * c.bits + 7) / 8;
       EXPECT_EQ(r.upload_bytes, 53248 + selector_bytes);
-      for (size_t s = 0; s < rows.size(); ++s) {
-        const auto resp = Answer(servers[s], r, r.queries[s]);
-        ASSERT_EQ(resp.ciphertexts.size(), kCols);
-        ASSERT_OK_AND_ASSIGN(auto got, r.client->ProcessResponse(resp));
-        const auto row = raw[s].begin() + size_t(targets[s]) * kCols * kD;
-        EXPECT_TRUE(std::equal(got.begin(), got.end(), row))
-            << "color " << s << " pos " << pos << " centered " << centered
-            << " bits " << bits;
-      }
+      SCOPED_TRACE(::testing::Message() << "d_row " << c.d_row << " centered "
+                                        << c.centered << " bits " << c.bits);
+      CheckDecryption(blocks, r, rows, raw, targets, c.d_row);
     }
   }
 }
 
 // Row-stripe servers summed before packing answer bit-identically to one
-// server over the whole table (S = 1 vs S = 3).
+// server per block, for sub-tile and full-column rows.
 TEST_F(TallTableTest, RowStripesMatchSingleServerBitExactly) {
-  const std::vector<int> rows = {5000};
-  const auto raw = RandomTables(rows, 1, 2);
-  for (bool centered : {false, true}) {
-    auto whole = StripedServers(rows[0], 1, centered, Seed(0, 'G'), 0, raw[0], 1);
-    auto striped =
-        StripedServers(rows[0], 1, centered, Seed(0, 'G'), 0, raw[0], 3);
-    ASSERT_EQ(striped.size(), 3u);
-    for (int target : {0, 2047, 2048, 4999}) {
-      auto r = MakeRequest(rows, {target}, 1, centered, 42);
-      const auto a = Answer(whole, r, r.queries[0]);
-      const auto b = Answer(striped, r, r.queries[0]);
-      EXPECT_EQ(a.ciphertexts[0].b.Coeffs(), b.ciphertexts[0].b.Coeffs());
-      EXPECT_EQ(whole[0]->GetPrepackedAModSwitched(0),
-                striped[0]->GetPrepackedAModSwitched(0));
-      ASSERT_OK_AND_ASSIGN(auto got, r.client->ProcessResponse(b));
-      EXPECT_TRUE(std::equal(got.begin(), got.end(),
-                             raw[0].begin() + size_t(target) * kD));
-    }
-  }
-}
-
-// Cross-color response packing over tall colors: two-stripe blocks answer
-// bit-identically to PreprocessCrossColorBlock, and decrypt exactly.
-TEST_F(TallTableTest, CrossColorTallColorsMatchAcrossStripes) {
-  const std::vector<int> rows = {4100, 2048, 300};
-  constexpr size_t kRowU16 = 700;
-  const auto raw = RandomTables(rows, 1, 3);
-  const auto [seeds, offsets] = GroupLayout(rows);
-  const size_t n_resp = (rows.size() * kRowU16 + kD - 1) / kD;
-  const std::vector<int> targets = {4099, 1000, 0};
-  auto r = MakeRequest(rows, targets, 1, /*centered=*/true, 40);
-  std::vector<CoeffType> recovered(rows.size() * kRowU16);
-  for (size_t blk = 0; blk < n_resp; ++blk) {
-    ASSERT_OK_AND_ASSIGN(auto whole,
-                         Prep::PreprocessCrossColorBlock(
-                             rlwe_, pack_gadget_, rows, raw, seeds, offsets,
-                             kPackingSeed, kRowU16, blk, /*centered_db=*/true));
-    ASSERT_OK_AND_ASSIGN(
-        auto server_whole,
-        Server::CreateCrossColor(Params(kD, 1, true), std::move(whole.db_slices),
-                                 {std::move(whole.pack_output)}));
-    std::vector<Prep::Stage1Stripe> parts;
-    for (size_t s = 0; s < 2; ++s) {
-      ASSERT_OK_AND_ASSIGN(
-          auto part, Prep::PreprocessCrossColorStripe(rlwe_, rows, raw, seeds,
-                                                      offsets, kRowU16, blk, s,
-                                                      2, true));
-      parts.push_back(std::move(part));
-    }
-    for (size_t u = 0; u < kD; ++u)
-      for (size_t j = 0; j < kD; ++j)
-        parts[0].hints[0][u][j] += parts[1].hints[0][u][j];
-    ASSERT_OK_AND_ASSIGN(auto outputs,
-                         Prep::PreprocessPacking(rlwe_, pack_gadget_,
-                                                 kPackingSeed, parts[0].hints));
-    ASSERT_OK_AND_ASSIGN(auto server0, Server::CreateCrossColor(
-                                           Params(kD, 1, true),
-                                           std::move(parts[0].db_slices),
-                                           std::move(outputs)));
-    ASSERT_OK_AND_ASSIGN(auto a, server_whole->ProcessResponse(
-                                     r.request, &r.y_vec_h_fft));
-    ASSERT_OK_AND_ASSIGN(auto b, server0->ComputeStage1(r.request));
-    // Block 1 only holds rows of short colors, so its stripe 1 is empty.
-    EXPECT_EQ(parts[1].db_slices.empty(), blk == 1);
-    if (!parts[1].db_slices.empty()) {
-      ASSERT_OK_AND_ASSIGN(auto server1, Server::CreateCrossColor(
-                                             Params(kD, 1, true),
-                                             std::move(parts[1].db_slices), {}));
-      ASSERT_OK_AND_ASSIGN(auto b1, server1->ComputeStage1(r.request));
-      for (size_t j = 0; j < b.size(); ++j) b[j] += b1[j];
-    }
-    ASSERT_OK_AND_ASSIGN(auto c, server0->PackFromStage1(r.request, b,
-                                                         &r.y_vec_h_fft));
-    EXPECT_EQ(a.ciphertexts[0].b.Coeffs(), c.ciphertexts[0].b.Coeffs());
-    EXPECT_EQ(server_whole->GetPrepackedAModSwitched(0),
-              server0->GetPrepackedAModSwitched(0));
-    ASSERT_OK_AND_ASSIGN(auto blk_plain, r.client->ProcessResponse(c));
-    for (size_t i = blk * kD; i < std::min((blk + 1) * kD, recovered.size());
-         ++i) {
-      recovered[i] = blk_plain[i - blk * kD];
-    }
-  }
-  for (size_t s = 0; s < rows.size(); ++s) {
-    for (size_t u = 0; u < kRowU16; ++u) {
-      ASSERT_EQ(recovered[s * kRowU16 + u], raw[s][targets[s] * kD + u])
-          << "color " << s << " u " << u;
-    }
-  }
-}
-
-// On adversarial all-0xFFFF data at R = 8192, centering cuts the Stage 1
-// noise variance about 4x and 42-bit selectors cut the rest about 16x
-// (variances in q1^2: about 4600 unsigned, 2600 centered, 2000 at 42 bits).
-TEST_F(TallTableTest, CenteredDatabaseAndWideSelectorsCutNoise) {
-  const std::vector<int> rows = {8192};
-  const std::vector<std::vector<uint16_t>> raw = {
-      std::vector<uint16_t>(rows[0] * kD, 0xFFFF)};
-  const std::vector<CoeffType> expected(kD, 0xFFFF);
-  auto Variance = [&](bool centered, int bits) {
-    auto servers =
-        StripedServers(rows[0], 1, centered, Seed(0, 'G'), 0, raw[0], 1);
-    auto r = MakeRequest(rows, {1234}, 1, centered, bits);
-    const auto resp = Answer(servers, r, r.queries[0]);
-    if (centered) {
-      EXPECT_EQ(r.client->ProcessResponse(resp).value(), expected);
-    }
-    return NoiseVariance(*r.client, resp, expected);
+  struct Case {
+    std::vector<int> rows;
+    size_t d_row;
+    std::vector<int> targets;
   };
-  const double unsigned40 = Variance(false, 40);
-  const double centered40 = Variance(true, 40);
-  const double centered42 = Variance(true, 42);
-  EXPECT_GT(unsigned40 - centered40, 1500);
-  EXPECT_GT(centered40 - centered42, 400);
-  EXPECT_LT(centered42, 2300);
+  for (const Case& c : {Case{{4100, 2048, 300}, 700, {4099, 1000, 0}},
+                        Case{{5000}, kD, {2048}}}) {
+    const auto raw = Tables(c.rows, kD, 2);
+    const auto whole = Blocks(c.rows, raw, c.d_row, true, 1);
+    auto r = MakeRequest(c.rows, c.targets, 42);
+    for (size_t num_stripes : {2, 3}) {
+      const auto striped = Blocks(c.rows, raw, c.d_row, true, num_stripes);
+      ASSERT_EQ(striped.size(), whole.size());
+      for (size_t b = 0; b < whole.size(); ++b) {
+        const auto a = Answer(whole[b], r), s = Answer(striped[b], r);
+        EXPECT_EQ(a.ciphertexts[0].b.Coeffs(), s.ciphertexts[0].b.Coeffs());
+        EXPECT_EQ(whole[b][0]->GetPrepackedAModSwitched(0),
+                  striped[b][0]->GetPrepackedAModSwitched(0));
+      }
+      CheckDecryption(striped, r, c.rows, raw, c.targets, c.d_row);
+    }
+  }
+}
+
+// Rows of C whole columns served as C cross-color blocks per color answer
+// bit-identically to the per-color Preprocess + Create servers, tall colors
+// included.
+TEST_F(TallTableTest, WideRowBlocksMatchPerColorServers) {
+  const std::vector<int> rows = {1311, 4100};
+  constexpr size_t kCols = 2;
+  const auto raw = Tables(rows, kCols * kD, 3);
+  const auto [seeds, offsets] = GroupLayout(rows);
+  const auto blocks = Blocks(rows, raw, kCols * kD, false, 1);
+  ASSERT_EQ(blocks.size(), rows.size() * kCols);
+  const std::vector<int> targets = {1310, 4099};
+  auto r = MakeRequest(rows, targets, 40, kCols);
+  for (size_t s = 0; s < rows.size(); ++s) {
+    auto params = Params(rows[s], kCols);
+    ASSERT_OK_AND_ASSIGN(auto prep, Prep::Create(&params, seeds[s]));
+    ASSERT_OK_AND_ASSIGN(auto data,
+                         prep->Preprocess(raw[s], kPackingSeed, offsets[s]));
+    ASSERT_OK_AND_ASSIGN(auto server, Server::Create(params, std::move(data)));
+    PirRequest<CoeffType> req = r.request;
+    req.first_dimension_query = r.queries[s];
+    ASSERT_OK_AND_ASSIGN(auto resp, server->ProcessResponse(req, &r.y_vec_h_fft));
+    for (size_t k = 0; k < kCols; ++k) {
+      const auto blk = Answer(blocks[s * kCols + k], r);
+      EXPECT_EQ(resp.ciphertexts[k].a.Coeffs(), blk.ciphertexts[0].a.Coeffs());
+      EXPECT_EQ(resp.ciphertexts[k].b.Coeffs(), blk.ciphertexts[0].b.Coeffs());
+    }
+    ASSERT_OK_AND_ASSIGN(auto got, r.client->ProcessResponse(resp));
+    EXPECT_TRUE(std::equal(got.begin(), got.end(),
+                           raw[s].begin() + targets[s] * kCols * kD));
+  }
+}
+
+// At R = 16384 with uniform entries, signed entries cut the Stage 1 noise
+// variance 4x and 42-bit selectors cut the remainder about 16x (expected
+// variances in q1^2: about 3700 unsigned, 2400 signed, 1950 signed at 42
+// bits). Most of the unsigned excess is the 2^15 * sum_r (selector error)
+// offset shared by a response's coefficients, hence 64 fresh secrets. Unsigned
+// 40-bit selectors are not decryption-safe here (about 2^-17 per coefficient),
+// so only their noise is measured. Constant worst-case words still decrypt
+// exactly with signed entries.
+TEST_F(TallTableTest, SignedEntriesAndWideSelectorsCutNoise) {
+  const std::vector<int> rows = {16384};
+  auto Variance = [&](bool centered, int bits, int fill, int queries) {
+    const auto raw = Tables(rows, kD, 4, fill);
+    const auto blocks = Blocks(rows, raw, kD, centered, 1);
+    double sq = 0;
+    size_t n = 0;
+    for (int i = 0; i < queries; ++i) {
+      const int target = i * 2477 % rows[0];
+      auto r = MakeRequest(rows, {target}, bits, 1, /*client_seed=*/100 + i);
+      for (int64_t e :
+           CheckDecryption(blocks, r, rows, raw, {target}, kD, centered)) {
+        sq += double(e) * double(e);
+        ++n;
+      }
+    }
+    return sq / n;
+  };
+  const double unsigned40 = Variance(false, 40, -1, 64);
+  const double signed40 = Variance(true, 40, -1, 64);
+  const double signed42 = Variance(true, 42, -1, 64);
+  EXPECT_GT(unsigned40 - signed40, 600);
+  EXPECT_GT(signed40 - signed42, 250);
+  EXPECT_LT(signed42, 2150);
+  for (int fill : {0x0000, 0x8000, 0xFFFF}) Variance(true, 42, fill, 2);
 }
 
 }  // namespace

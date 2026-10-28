@@ -31,8 +31,7 @@ absl::StatusOr<PirParams<CoeffType>> PirParams<CoeffType>::Create(
     const RlweParams<CoeffType>& rlwe_params, const CoeffType plaintext_modulus,
     const GadgetParams& pack_gadget_params,
     const GadgetParams& poly_eval_gadget_params, const int num_entries,
-    const int interpolation_degree, const int entry_size_multiple,
-    const bool centered_db) {
+    const int interpolation_degree, const int entry_size_multiple) {
   if (num_entries <= 0) {
     return absl::InvalidArgumentError("num_entries must be strictly positive.");
   }
@@ -62,18 +61,10 @@ absl::StatusOr<PirParams<CoeffType>> PirParams<CoeffType>::Create(
                      2 * rlwe_params.Degree(), ")."));
   }
 
-  if (centered_db &&
-      (interpolation_degree != 1 ||
-       !absl::has_single_bit(static_cast<uint64_t>(plaintext_modulus)) ||
-       rlwe_params.Modulus() % plaintext_modulus != 0)) {
-    return absl::InvalidArgumentError(
-        "centered_db requires t=1 and a power-of-two p dividing q.");
-  }
-
   return PirParams<CoeffType>(rlwe_params, plaintext_modulus,
                               pack_gadget_params, poly_eval_gadget_params,
                               num_entries, interpolation_degree,
-                              entry_size_multiple, centered_db);
+                              entry_size_multiple);
 }
 
 template class PirParams<uint32_t>;

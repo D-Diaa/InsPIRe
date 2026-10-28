@@ -472,7 +472,8 @@ template <typename CoeffType, typename MultiplyBySecret>
 absl::StatusOr<std::vector<CoeffType>> DecryptAfterModulusSwitchImpl(
     const RlweParams<CoeffType>& params, const CoeffType plaintext_modulus,
     const RlweCiphertext<CoeffType>& ciphertext,
-    MultiplyBySecret&& multiply_by_secret) {
+    MultiplyBySecret&& multiply_by_secret,
+    std::vector<int64_t>* noise = nullptr) {
   const int d = params.Degree();
   if (plaintext_modulus <= 0) {
     return absl::InvalidArgumentError("Plaintext modulus must be positive.");
@@ -504,8 +505,19 @@ absl::StatusOr<std::vector<CoeffType>> DecryptAfterModulusSwitchImpl(
       const CoeffType noisy_val =
           (as_coeffs[i] + (b_coeffs[i] << b_shift)) & q1_mask;
       m_coeffs[i] = ((noisy_val + half) >> m_shift) & p_mask;
+      if (noise != nullptr) {
+        const CoeffType err = (noisy_val - (m_coeffs[i] << m_shift)) & q1_mask;
+        noise->push_back(err > q1_mask / 2 ? static_cast<int64_t>(err) -
+                                                 static_cast<int64_t>(q1_mask) -
+                                                 1
+                                           : static_cast<int64_t>(err));
+      }
     }
     return m_coeffs;
+  }
+  if (noise != nullptr) {
+    return absl::InvalidArgumentError(
+        "Decryption noise needs a power-of-two plaintext modulus.");
   }
 
   // mod by q1
@@ -540,14 +552,15 @@ absl::StatusOr<std::vector<CoeffType>> DecryptAfterModulusSwitch(
     const RlweParams<CoeffType>& params, const CoeffType plaintext_modulus,
     const RlweCiphertext<CoeffType>& ciphertext,
     const FftPolynomial& secret_key_fft,
-    FftContext& ctx) {
+    FftContext& ctx, std::vector<int64_t>* noise) {
   // a * s is reduced mod q1, so only the low log2(q1) bits of a contribute.
   return DecryptAfterModulusSwitchImpl(
       params, plaintext_modulus, ciphertext,
       [&](const Polynomial<CoeffType>& a) {
         return a.MultFft(secret_key_fft, ctx,
                          params.LogModulus1AfterSwitch());
-      });
+      },
+      noise);
 }
 
 template <typename CoeffType>
@@ -793,11 +806,13 @@ DecryptAfterModulusSwitch<uint64_t>(const RlweParams<uint64_t>&, uint64_t,
 template absl::StatusOr<std::vector<uint32_t>>
 DecryptAfterModulusSwitch<uint32_t>(const RlweParams<uint32_t>&, uint32_t,
                                     const RlweCiphertext<uint32_t>&,
-                                    const FftPolynomial&, FftContext&);
+                                    const FftPolynomial&, FftContext&,
+                                    std::vector<int64_t>*);
 template absl::StatusOr<std::vector<uint64_t>>
 DecryptAfterModulusSwitch<uint64_t>(const RlweParams<uint64_t>&, uint64_t,
                                     const RlweCiphertext<uint64_t>&,
-                                    const FftPolynomial&, FftContext&);
+                                    const FftPolynomial&, FftContext&,
+                                    std::vector<int64_t>*);
 
 template absl::StatusOr<std::vector<RlweCiphertext<uint32_t>>>
 EncryptGadgetCiphertextFromRlweSamples<uint32_t>(

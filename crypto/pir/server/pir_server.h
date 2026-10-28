@@ -49,19 +49,11 @@ class PirServer {
          PirPreprocessedData<DbDataType, CoeffType, MatCoeffType>
              preprocessed_data);
 
-  // Creates a t=1 server holding only the Stage 1 database `db_matrices` (one
-  // per column) of selector rows [row0, row0 + cols) of a taller table: it
-  // answers ComputeStage1 only, and its outputs are summed mod 2^64 with the
-  // other row stripes' before PackFromStage1 on the server owning row 0.
-  static absl::StatusOr<
-      std::unique_ptr<PirServer<DbDataType, CoeffType, MatCoeffType>>>
-  CreateStage1Only(const PirParams<CoeffType>& params,
-                   std::vector<Matrix<DbDataType>> db_matrices, size_t row0);
-
   // Creates a t=1 PirServer instance that packs LWE outputs concatenated
   // across multiple color slices `db_slices` into `pack_outputs.size()` RLWE
   // response ciphertexts. With empty `pack_outputs` the server answers
-  // ComputeStage1 only (one row stripe of the slices' colors).
+  // ComputeStage1 only: a row stripe whose output is summed mod 2^64 into the
+  // packing server's before PackFromStage1.
   static absl::StatusOr<
       std::unique_ptr<PirServer<DbDataType, CoeffType, MatCoeffType>>>
   CreateCrossColor(
@@ -132,7 +124,7 @@ class PirServer {
       std::vector<std::string> a_mod_switched_t1_packed,
       std::vector<Polynomial<CoeffType>> second_dim_query_a,
       std::unique_ptr<FftContext> fft_ctx,
-      std::vector<CrossColorDbSlice<DbDataType>> db_slices, size_t row0)
+      std::vector<CrossColorDbSlice<DbDataType>> db_slices = {})
       : params_(params),
         combined_db_matrix_(std::move(combined_db_matrix)),
         combined_pack_matrix_(std::move(combined_pack_matrix)),
@@ -143,7 +135,6 @@ class PirServer {
         second_dim_query_a_(std::move(second_dim_query_a)),
         fft_ctx_(std::move(fft_ctx)),
         db_slices_(std::move(db_slices)),
-        row0_(row0),
         db_mult_time_(absl::ZeroDuration()),
         packing_time_(absl::ZeroDuration()),
         poly_eval_time_(absl::ZeroDuration()) {}
@@ -157,14 +148,14 @@ class PirServer {
           std::vector<PreprocessMatrixPackOutput<CoeffType, MatCoeffType>>>
           preprocessed_outputs,
       std::vector<Polynomial<CoeffType>> second_dim_query_a,
-      std::vector<CrossColorDbSlice<DbDataType>> db_slices = {},
-      size_t row0 = 0);
+      std::vector<CrossColorDbSlice<DbDataType>> db_slices = {});
 
   // Stage 1 product of `mat` with selector entries [row0, row0 + mat.Cols())
-  // of `query` (clipped and zero-padded), correct modulo q.
+  // of `query` (clipped and zero-padded), correct modulo q; `centered`
+  // entries are signed (see CrossColorDbSlice).
   absl::StatusOr<std::vector<CoeffType>> MultiplyStripe(
       const Matrix<DbDataType>& mat, const std::vector<CoeffType>& query,
-      size_t row0) const;
+      size_t row0, bool centered) const;
 
   // Forward FFTs of every preprocessed t_vec_h, indexed like
   // `preprocessed_outputs`, computed once so that ProcessResponse does not
@@ -196,8 +187,6 @@ class PirServer {
   const std::vector<Polynomial<CoeffType>> second_dim_query_a_;
   std::unique_ptr<FftContext> fft_ctx_;
   const std::vector<CrossColorDbSlice<DbDataType>> db_slices_;
-  // First selector row contracted by combined_db_matrix_ (row stripes).
-  const size_t row0_;
 
   mutable absl::Duration pack_matrix_time_ = absl::ZeroDuration();
   mutable absl::Duration finalize_time_ = absl::ZeroDuration();

@@ -234,12 +234,14 @@ absl::StatusOr<std::vector<CoeffType>> DecryptAfterModulusSwitch(
 
 // Same, with the ternary secret key held in the FFT domain (see
 // GenerateRlweSamples); the result is bit-identical to the NTT overloads'.
+// If `noise` is given (power-of-two p only), appends each coefficient's signed
+// decryption error in units of q1, relative to the decrypted message.
 template <typename CoeffType>
 absl::StatusOr<std::vector<CoeffType>> DecryptAfterModulusSwitch(
     const RlweParams<CoeffType>& params, CoeffType plaintext_modulus,
     const RlweCiphertext<CoeffType>& ciphertext,
     const FftPolynomial& secret_key_fft,
-    FftContext& ctx);
+    FftContext& ctx, std::vector<int64_t>* noise = nullptr);
 
 // Encrypts a gadget ciphertext based on a set of independent RLWE samples.
 //

@@ -58,10 +58,7 @@ PirServer<DbDataType, CoeffType, MatCoeffType>::Create(
     return absl::InvalidArgumentError("db_matrices size mismatch.");
   }
   const int db_cols = preprocessed_data.db_matrices[0].Cols();
-  // Either the whole table, or (t=1) its first row stripe of a multiple of d
-  // rows, the other stripes' ComputeStage1 outputs being summed in by the
-  // caller before PackFromStage1.
-  if (db_cols < r && (t != 1 || db_cols % d != 0)) {
+  if (db_cols < r) {
     return absl::InvalidArgumentError(
         "DB matrix must have at least N/t columns.");
   }
@@ -116,28 +113,6 @@ PirServer<DbDataType, CoeffType, MatCoeffType>::Create(
                               std::move(combined_pack_matrix),
                               std::move(preprocessed_data.preprocessed_outputs),
                               std::move(preprocessed_data.second_dim_a));
-}
-
-template <typename DbDataType, typename CoeffType, typename MatCoeffType>
-absl::StatusOr<std::unique_ptr<PirServer<DbDataType, CoeffType, MatCoeffType>>>
-PirServer<DbDataType, CoeffType, MatCoeffType>::CreateStage1Only(
-    const PirParams<CoeffType>& params,
-    std::vector<Matrix<DbDataType>> db_matrices, size_t row0) {
-  const int d = params.RlweParameters().Degree();
-  if (params.InterpolationDegree() != 1 ||
-      db_matrices.size() != params.EntrySizeMultiple() ||
-      row0 >= static_cast<size_t>(params.NumEntries())) {
-    return absl::InvalidArgumentError("Invalid Stage 1 stripe server.");
-  }
-  for (const auto& m : db_matrices) {
-    if (m.Rows() != d || m.Cols() != db_matrices[0].Cols()) {
-      return absl::InvalidArgumentError("Invalid Stage 1 stripe matrices.");
-    }
-  }
-  ASSIGN_OR_RETURN(auto combined_db_matrix,
-                   Matrix<DbDataType>::VerticalConcatenate(db_matrices));
-  return CreateFromComponents(params, std::move(combined_db_matrix),
-                              Matrix<MatCoeffType>(), {}, {}, {}, row0);
 }
 
 template <typename DbDataType, typename CoeffType, typename MatCoeffType>
@@ -202,7 +177,7 @@ PirServer<DbDataType, CoeffType, MatCoeffType>::CreateFromComponents(
         std::vector<PreprocessMatrixPackOutput<CoeffType, MatCoeffType>>>
         preprocessed_outputs,
     std::vector<Polynomial<CoeffType>> second_dim_query_a,
-    std::vector<CrossColorDbSlice<DbDataType>> db_slices, size_t row0) {
+    std::vector<CrossColorDbSlice<DbDataType>> db_slices) {
   const int d = params.RlweParameters().Degree();
   ASSIGN_OR_RETURN(
       auto fft_ctx,
@@ -232,7 +207,7 @@ PirServer<DbDataType, CoeffType, MatCoeffType>::CreateFromComponents(
       std::move(preprocessed_outputs), std::move(t_vec_h_ffts),
       std::move(a_mod_switched_t1), std::move(a_mod_switched_t1_packed),
       std::move(second_dim_query_a), std::move(fft_ctx),
-      std::move(db_slices), row0));
+      std::move(db_slices)));
 }
 
 template <typename DbDataType, typename CoeffType, typename MatCoeffType>
@@ -296,7 +271,7 @@ template <typename DbDataType, typename CoeffType, typename MatCoeffType>
 absl::StatusOr<std::vector<CoeffType>>
 PirServer<DbDataType, CoeffType, MatCoeffType>::MultiplyStripe(
     const Matrix<DbDataType>& mat, const std::vector<CoeffType>& query,
-    size_t row0) const {
+    size_t row0, bool centered) const {
   const size_t cols = static_cast<size_t>(mat.Cols());
   std::vector<CoeffType> padded;
   const std::vector<CoeffType>* q = &query;
@@ -309,11 +284,11 @@ PirServer<DbDataType, CoeffType, MatCoeffType>::MultiplyStripe(
   if constexpr (std::is_same_v<DbDataType, uint16_t> &&
                 std::is_same_v<CoeffType, uint64_t>) {
     if (mat.IsCondensed()) {
-      return mat.MultiplyUint16(*q, params_.CenteredDb(),
+      return mat.MultiplyUint16(*q, centered,
                                 params_.RlweParameters().LogModulus());
     }
   }
-  if (params_.CenteredDb()) {
+  if (centered) {
     return absl::FailedPreconditionError(
         "centered_db needs a condensed uint16_t database.");
   }
@@ -333,16 +308,15 @@ PirServer<DbDataType, CoeffType, MatCoeffType>::ComputeStage1(
   if (db_slices_.empty()) {
     const size_t db_cols = combined_db_matrix_.Cols();
     const size_t q_size = request.first_dimension_query.size();
-    const size_t rows = params_.InterpolatedRows();
-    // A server covering the whole table must cover the whole selector.
-    if (q_size < rows || (row0_ == 0 && db_cols >= rows && q_size > db_cols)) {
+    if (q_size < static_cast<size_t>(params_.InterpolatedRows()) ||
+        q_size > db_cols) {
       return absl::InvalidArgumentError(
           absl::StrCat("First dimension query size (", q_size,
                        ") is invalid for DB columns (", db_cols, ")."));
     }
     ASSIGN_OR_RETURN(b_prime_all,
                      MultiplyStripe(combined_db_matrix_,
-                                    request.first_dimension_query, row0_));
+                                    request.first_dimension_query, 0, false));
   } else {
     if (request.color_queries == nullptr) {
       return absl::InvalidArgumentError(
@@ -360,7 +334,8 @@ PirServer<DbDataType, CoeffType, MatCoeffType>::ComputeStage1(
             "Invalid color query length for cross-color DB slice.");
       }
       ASSIGN_OR_RETURN(std::vector<CoeffType> part,
-                       MultiplyStripe(sl.db_submatrix, q_vec, sl.row0));
+                       MultiplyStripe(sl.db_submatrix, q_vec, sl.row0,
+                                      sl.centered));
       std::copy(part.begin(), part.end(), b_prime_all.begin() + sl.coeff0);
     }
   }

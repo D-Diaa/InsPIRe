@@ -52,7 +52,8 @@ struct PirPreprocessedData {
 // One contiguous Stage 1 database slice (`rows` output coefficients of color
 // `color`, placed at response coefficients [coeff0, coeff0 + rows)) owned by a
 // cross-color response worker. It contracts the color's selector entries
-// [row0, row0 + padded_cols) (clipped to the selector length).
+// [row0, row0 + padded_cols) (clipped to the selector length). A `centered`
+// uint16_t slice holds signed int16_t entries (no unsigned bias in Stage 1).
 template <typename DbValueType>
 struct CrossColorDbSlice {
   size_t color = 0;
@@ -61,6 +62,7 @@ struct CrossColorDbSlice {
   Matrix<DbValueType> db_submatrix;
   size_t row0 = 0;
   size_t coeff0 = 0;
+  bool centered = false;
 };
 
 template <typename DbValueType, typename CoeffType, typename MatCoeffType>
