@@ -16,6 +16,7 @@
 #define CRYPTO_PIR_PIR_PARAMS_H_
 
 #include <algorithm>
+#include <cstddef>
 #include <cstdint>
 #include <utility>
 #include <vector>
@@ -286,6 +287,72 @@ inline absl::StatusOr<std::vector<SelectorGroupPlan>> BuildSelectorGroupPlans(
   }
   if (!current.slices.empty()) flush();
   return groups;
+}
+
+// Selector bits per physical row by default: 40-bit (5 B) selectors stay
+// noise-safe to about 10k rows with signed entries, 42-bit ones (same 3-digit
+// Stage 1 kernel) to about 168k.
+inline int AutoSelectorBits(size_t max_rows) { return max_rows > 8192 ? 42 : 40; }
+
+// LWE outputs a response block spends on a row of `row_u16` words: rows of at
+// most d / 2 words share blocks across colors, wider rows take whole blocks.
+inline size_t PackedRowWords(size_t row_u16, size_t d = 2048) {
+  return row_u16 <= d / 2 ? row_u16 : (row_u16 + d - 1) / d * d;
+}
+
+// Plaintext row bundling: `bundle` consecutive logical rows of `row_u16` words
+// form one physical PIR row of bundle * row_u16 words, the trailing partial
+// bundle zero-padded. The client selects physical row target / bundle and keeps
+// its words [(target % bundle) * row_u16, +row_u16). Logical rows are
+// `src_stride` words apart, physical rows `dst_stride`.
+inline std::vector<uint16_t> BundleRows(const std::vector<uint16_t>& logical,
+                                        size_t rows, size_t src_stride,
+                                        size_t row_u16, size_t bundle,
+                                        size_t dst_stride) {
+  std::vector<uint16_t> phys((rows + bundle - 1) / bundle * dst_stride, 0);
+  for (size_t r = 0; r < rows; ++r) {
+    std::copy_n(logical.begin() + r * src_stride, row_u16,
+                phys.begin() + r / bundle * dst_stride + r % bundle * row_u16);
+  }
+  return phys;
+}
+
+// Exact wire bytes of one batch request (four 52-bit packing key polynomials,
+// one selector word per physical row, one 11,008-byte response per block) over
+// colors of `rows` logical rows of `row_u16` words bundled by `bundle`, with
+// `selector_bits` (0: AutoSelectorBits of the tallest physical color).
+inline size_t BundledWireBytes(const std::vector<int>& rows, size_t row_u16,
+                               size_t bundle, int selector_bits,
+                               size_t* responses = nullptr) {
+  constexpr size_t kD = 2048, kKeyBytes = 4 * (kD * 52 / 8);
+  constexpr size_t kResponseBytes = (kD * 25 + kD * 18) / 8;
+  size_t max_phys = 0;
+  for (int r : rows) max_phys = std::max<size_t>(max_phys, (r + bundle - 1) / bundle);
+  const size_t bits = selector_bits ? selector_bits : AutoSelectorBits(max_phys);
+  size_t upload = kKeyBytes;
+  for (int r : rows) upload += ((r + bundle - 1) / bundle * bits + 7) / 8;
+  const size_t n_resp =
+      (rows.size() * PackedRowWords(bundle * row_u16, kD) + kD - 1) / kD;
+  if (responses != nullptr) *responses = n_resp;
+  return upload + n_resp * kResponseBytes;
+}
+
+// The bundle factor in [1, 64] minimizing BundledWireBytes, ties broken toward
+// fewer responses and then smaller bundles; 1 when no color exceeds 2048 rows.
+inline size_t ChooseBundleFactor(const std::vector<int>& rows, size_t row_u16,
+                                 int selector_bits = 0) {
+  const size_t max_rows = *std::max_element(rows.begin(), rows.end());
+  if (max_rows <= 2048) return 1;
+  size_t best = 1, best_bytes = SIZE_MAX, best_resp = SIZE_MAX;
+  for (size_t bundle = 1; bundle <= std::min<size_t>(64, max_rows); ++bundle) {
+    size_t resp;
+    const size_t bytes =
+        BundledWireBytes(rows, row_u16, bundle, selector_bits, &resp);
+    if (bytes < best_bytes || (bytes == best_bytes && resp < best_resp)) {
+      best = bundle, best_bytes = bytes, best_resp = resp;
+    }
+  }
+  return best;
 }
 
 // Computes the signed negacyclic rotation X^{-offset} * group_mask(X) mod

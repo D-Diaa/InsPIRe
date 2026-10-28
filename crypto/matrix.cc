@@ -300,15 +300,17 @@ absl::StatusOr<std::vector<uint64_t>> CondensedMultiply(
 // _mm256_madd_epi16(m', d_k) pairwise product lies in [-2^29, +2^29 - 16384],
 // so 4 consecutive vectors (64 columns) can be accumulated in int32_t without
 // overflow before widening to int64_t.
+// Entries of `vec` past its end, up to `cols`, are zero.
 template <int kNumDigits, int kShift>
 HWY_INLINE void PackQueryDigitsUint16(absl::Span<const uint64_t> vec,
+                                      size_t cols,
                                       int16_t* HWY_RESTRICT y_packed) {
-  const size_t num_vecs = vec.size() / 16;
+  const size_t num_vecs = cols / 16;
   for (size_t v_idx = 0; v_idx < num_vecs; ++v_idx) {
     int16_t* HWY_RESTRICT out = y_packed + v_idx * kNumDigits * 16;
-    const uint64_t* HWY_RESTRICT in = vec.data() + v_idx * 16;
-    for (int lane = 0; lane < 16; ++lane) {
-      uint64_t v = in[lane] >> kShift;
+    for (size_t lane = 0; lane < 16; ++lane) {
+      const size_t j = v_idx * 16 + lane;
+      uint64_t v = j < vec.size() ? vec[j] >> kShift : 0;
       HWY_UNROLL(kNumDigits)
       for (int d = 0; d < kNumDigits; ++d) {
         const uint64_t r = v & 0x3FFFULL;
@@ -423,14 +425,15 @@ HWY_INLINE void RunCondensedMultiplyUint16(const uint64_t* data, int rows,
                                            absl::Span<const uint64_t> vec,
                                            uint64_t y_bias,
                                            uint64_t* HWY_RESTRICT result) {
+  const size_t cols = static_cast<size_t>(condensed_cols) * 4;
   alignas(32) int16_t y_stack[2048 * kNumDigits];
   std::vector<int16_t> y_heap;
   int16_t* y_packed = y_stack;
-  if (vec.size() > 2048) {
-    y_heap.resize(vec.size() * kNumDigits);
+  if (cols > 2048) {
+    y_heap.resize(cols * kNumDigits);
     y_packed = y_heap.data();
   }
-  PackQueryDigitsUint16<kNumDigits, kShift>(vec, y_packed);
+  PackQueryDigitsUint16<kNumDigits, kShift>(vec, cols, y_packed);
 
   for (int i = 0; i < rows; ++i) {
     const uint64_t* m_row = &data[static_cast<size_t>(i) * condensed_cols];
@@ -452,7 +455,7 @@ absl::StatusOr<std::vector<uint64_t>> CondensedMultiplyUint16(
     return absl::InvalidArgumentError(
         "Original columns must be a multiple of 4 * Lanes.");
   }
-  if (vec.size() != static_cast<size_t>(original_cols)) {
+  if (vec.size() > static_cast<size_t>(original_cols)) {
     return absl::InvalidArgumentError("Vector size mismatch.");
   }
   const int rows = condensed_matrix.Rows();
@@ -461,7 +464,7 @@ absl::StatusOr<std::vector<uint64_t>> CondensedMultiplyUint16(
 
   uint64_t or_all = 0;
   uint64_t y_sum = 0;
-  for (int j = 0; j < original_cols; ++j) {
+  for (size_t j = 0; j < vec.size(); ++j) {
     or_all |= vec[j];
     y_sum += vec[j];
   }

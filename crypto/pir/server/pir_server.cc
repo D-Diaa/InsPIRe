@@ -39,6 +39,7 @@
 #include "absl/strings/str_cat.h"
 #include "absl/time/clock.h"
 #include "absl/time/time.h"
+#include "absl/types/span.h"
 
 namespace private_membership {
 namespace rlwe {
@@ -273,18 +274,13 @@ PirServer<DbDataType, CoeffType, MatCoeffType>::MultiplyStripe(
     const Matrix<DbDataType>& mat, const std::vector<CoeffType>& query,
     size_t row0, bool centered) const {
   const size_t cols = static_cast<size_t>(mat.Cols());
-  std::vector<CoeffType> padded;
-  const std::vector<CoeffType>* q = &query;
-  if (row0 != 0 || query.size() != cols) {
-    padded.assign(cols, 0);
-    const size_t n = std::min(cols, query.size() - row0);
-    std::copy_n(query.begin() + row0, n, padded.begin());
-    q = &padded;
-  }
+  const size_t n = std::min(cols, query.size() - row0);
   if constexpr (std::is_same_v<DbDataType, uint16_t> &&
                 std::is_same_v<CoeffType, uint64_t>) {
     if (mat.IsCondensed()) {
-      return mat.MultiplyUint16(*q, centered,
+      // The kernel zero-pads the selector stripe itself: no copy.
+      return mat.MultiplyUint16(absl::MakeConstSpan(query).subspan(row0, n),
+                                centered,
                                 params_.RlweParameters().LogModulus());
     }
   }
@@ -292,7 +288,12 @@ PirServer<DbDataType, CoeffType, MatCoeffType>::MultiplyStripe(
     return absl::FailedPreconditionError(
         "centered_db needs a condensed uint16_t database.");
   }
-  return mat.template Multiply<CoeffType>(*q);
+  if (row0 == 0 && query.size() == cols) {
+    return mat.template Multiply<CoeffType>(query);
+  }
+  std::vector<CoeffType> padded(cols, 0);
+  std::copy_n(query.begin() + row0, n, padded.begin());
+  return mat.template Multiply<CoeffType>(padded);
 }
 
 template <typename DbDataType, typename CoeffType, typename MatCoeffType>

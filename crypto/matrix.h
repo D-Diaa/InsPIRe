@@ -92,7 +92,8 @@ class Matrix {
   // results only modulo 2^result_bits and, if `centered`, multiplying every
   // entry m as m - 2^15 (no 2^15 * sum(vec) bias). result_bits <= 52 lets
   // query scalars that are multiples of 2^10 below 2^52 (42-bit selectors)
-  // use the 3-digit kernel.
+  // use the 3-digit kernel. `vec` may be shorter than the columns (the rest
+  // is zero), so callers need not copy it into a padded buffer.
   absl::StatusOr<std::vector<uint64_t>> MultiplyUint16(
       absl::Span<const uint64_t> vec, bool centered, int result_bits) const;
 

@@ -372,6 +372,32 @@ TEST(TallTablePlanTest, RowStripesAreBlockAlignedAndCoverAllRows) {
   EXPECT_EQ(RowStripe(700, kD, 2, 3), Range(700, 700));
 }
 
+// The discrete wire-optimal bundle avoids partial-tile cliffs: at P = 64,
+// M = 8192, 1024-word rows, bundling 2 rows fills one block per color while 3
+// spill into two (2,068,480 vs 2,336,192 bytes).
+TEST(TallTablePlanTest, ChooseBundleFactorMinimizesExactWireBytes) {
+  const std::vector<int> rows(64, 8192);
+  EXPECT_EQ(BundledWireBytes(rows, 1024, 1, 0), 3026944u);
+  EXPECT_EQ(BundledWireBytes(rows, 1024, 2, 0), 2068480u);
+  EXPECT_EQ(BundledWireBytes(rows, 1024, 3, 0), 2336192u);
+  EXPECT_EQ(ChooseBundleFactor(rows, 1024), 2u);
+  EXPECT_EQ(ChooseBundleFactor(std::vector<int>(64, 2048), 1024), 1u);
+  // A 42-bit override is priced at 42 bits per selector word.
+  EXPECT_EQ(BundledWireBytes({8192}, 1024, 1, 42), 53248u + 43008u + 5504u * 2);
+}
+
+TEST(TallTablePlanTest, BundleRowsPlacesLogicalRowsAndZeroPadsTail) {
+  // 5 logical rows of 3 words (stride 4) into bundles of 2 (stride 8).
+  std::vector<uint16_t> logical(5 * 4);
+  for (size_t i = 0; i < logical.size(); ++i) logical[i] = i + 1;
+  const auto phys = BundleRows(logical, 5, 4, 3, 2, 8);
+  ASSERT_EQ(phys.size(), 3u * 8);
+  const std::vector<uint16_t> expected = {1,  2,  3,  5,  6,  7,  0, 0,
+                                          9,  10, 11, 13, 14, 15, 0, 0,
+                                          17, 18, 19, 0,  0,  0,  0, 0};
+  EXPECT_EQ(phys, expected);
+}
+
 TEST_F(TallTableTest, MultiSampleSelectorRejectsOutOfRangeTargets) {
   auto r = MakeRequest({4100}, {4099}, 40);
   auto mask = Prng(Seed(0, 'G'));
@@ -477,8 +503,8 @@ TEST_F(TallTableTest, WideRowBlocksMatchPerColorServers) {
 // bits). Most of the unsigned excess is the 2^15 * sum_r (selector error)
 // offset shared by a response's coefficients, hence 64 fresh secrets. Unsigned
 // 40-bit selectors are not decryption-safe here (about 2^-17 per coefficient),
-// so only their noise is measured. Constant worst-case words still decrypt
-// exactly with signed entries.
+// so only their noise is measured. Constant words decrypt exactly with signed
+// entries and 42-bit selectors, within the noise bound.
 TEST_F(TallTableTest, SignedEntriesAndWideSelectorsCutNoise) {
   const std::vector<int> rows = {16384};
   auto Variance = [&](bool centered, int bits, int fill, int queries) {
@@ -503,7 +529,49 @@ TEST_F(TallTableTest, SignedEntriesAndWideSelectorsCutNoise) {
   EXPECT_GT(unsigned40 - signed40, 600);
   EXPECT_GT(signed40 - signed42, 250);
   EXPECT_LT(signed42, 2150);
-  for (int fill : {0x0000, 0x8000, 0xFFFF}) Variance(true, 42, fill, 2);
+  // Constant words share their Stage 1 noise across a response; 0x8000 is the
+  // signed worst case (about 85 q1^2 here), 0x0001 and 0xFFFF add almost none.
+  for (int fill : {0x0000, 0x0001, 0x8000, 0xFFFF}) {
+    EXPECT_LT(Variance(true, 42, fill, 4), 2800) << "fill " << fill;
+  }
+}
+
+// Colors of up to 262,144 short logical rows decrypt exactly unbundled and
+// with the wire-optimal bundle (including a color whose height the bundle does
+// not divide); the client keeps the target's words of the physical row.
+TEST_F(TallTableTest, BundledAndUnbundledTallColorsDecryptExactly) {
+  const std::vector<int> rows = {262144, 70001};
+  constexpr size_t kRowU16 = 64;
+  const auto raw = Tables(rows, kRowU16, 5);
+  const std::vector<int> targets = {262143, 70000};
+  const size_t chosen = ChooseBundleFactor(rows, kRowU16);
+  EXPECT_GT(chosen, 1u);
+  for (size_t bundle : {size_t{1}, chosen}) {
+    std::vector<int> phys_rows, phys_targets;
+    std::vector<std::vector<uint16_t>> phys(rows.size());
+    for (size_t s = 0; s < rows.size(); ++s) {
+      phys[s] = BundleRows(raw[s], rows[s], kRowU16, kRowU16, bundle,
+                           bundle * kRowU16);
+      phys_rows.push_back((rows[s] + bundle - 1) / bundle);
+      phys_targets.push_back(targets[s] / bundle);
+    }
+    const size_t d_row = PackedRowWords(bundle * kRowU16);
+    const size_t max_phys = *std::max_element(phys_rows.begin(), phys_rows.end());
+    const auto blocks = Blocks(phys_rows, phys, d_row, true, 1);
+    auto r = MakeRequest(phys_rows, phys_targets, AutoSelectorBits(max_phys));
+    for (size_t b = 0; b < blocks.size(); ++b) {
+      const auto got = r.client->ProcessResponse(Answer(blocks[b], r)).value();
+      for (size_t s = 0; s < rows.size(); ++s) {
+        // The logical row's words within the decrypted physical row.
+        const size_t first = s * d_row + targets[s] % bundle * kRowU16;
+        for (size_t u = 0; u < kRowU16; ++u) {
+          if (first + u < b * kD || first + u >= (b + 1) * kD) continue;
+          EXPECT_EQ(got[first + u - b * kD], raw[s][targets[s] * kRowU16 + u])
+              << "bundle " << bundle << " color " << s << " word " << u;
+        }
+      }
+    }
+  }
 }
 
 }  // namespace

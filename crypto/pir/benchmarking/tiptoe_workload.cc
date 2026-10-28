@@ -263,6 +263,9 @@ ABSL_FLAG(size_t, synthetic_q, 4,
 ABSL_FLAG(std::string, synthetic_fill, "random",
           "Synthetic payload: random, or a constant 16-bit word such as 0xffff.");
 ABSL_FLAG(uint64_t, seed, 1, "Synthetic payload and target seed.");
+ABSL_FLAG(size_t, bundle_rows, 0,
+          "Logical rows per physical PIR row: 0 for the wire-optimal "
+          "ChooseBundleFactor (1 when no color exceeds 2048 rows).");
 ABSL_FLAG(int, selector_bits, 0,
           "Selector bits per row: 40, 42, or 0 for 42 iff max R > 8192.");
 ABSL_FLAG(std::string, centered_db, "auto",
@@ -369,13 +372,28 @@ int Run(int argc, char** argv) {
     Check(input.peek() == std::char_traits<char>::eof(),
           "Trailing workload data");
   }
-  const size_t max_rows = *std::max_element(rows.begin(), rows.end());
-  // 40-bit selectors stay noise-safe to about R = 10k with signed entries;
-  // 42-bit ones (same 3-digit kernel) to about R = 168k.
+  if (!synthetic) row_u16 = ResolveRowU16(workload_path, c, rows, raw);
   int selector_bits = absl::GetFlag(FLAGS_selector_bits);
   Check(selector_bits == 0 || selector_bits == 40 || selector_bits == 42,
         "--selector_bits must be 0, 40 or 42");
-  if (selector_bits == 0) selector_bits = max_rows > 8192 ? 42 : 40;
+  // Plaintext row bundling (see BundleRows): physical row b of a color holds
+  // its logical rows [b * bundle, (b + 1) * bundle), and the client keeps the
+  // target's row_u16 words of the decrypted physical row.
+  size_t bundle = absl::GetFlag(FLAGS_bundle_rows);
+  if (bundle == 0) bundle = pm::ChooseBundleFactor(rows, row_u16, selector_bits);
+  if (bundle > 1) {
+    const size_t phys_c = (bundle * row_u16 + 2047) / 2048;
+    for (size_t slot = 0; slot < p; ++slot) {
+      raw[slot] = pm::BundleRows(raw[slot], rows[slot], c * 2048, row_u16,
+                                 bundle, phys_c * 2048);
+      rows[slot] = static_cast<int>((rows[slot] + bundle - 1) / bundle);
+    }
+    for (size_t& t : targets) t /= bundle;
+    c = phys_c;
+    row_u16 *= bundle;
+  }
+  const size_t max_rows = *std::max_element(rows.begin(), rows.end());
+  if (selector_bits == 0) selector_bits = pm::AutoSelectorBits(max_rows);
   const int selector_shift = 52 - selector_bits;
   const std::string centered_flag = absl::GetFlag(FLAGS_centered_db);
   Check(centered_flag == "auto" || centered_flag == "0" || centered_flag == "1",
@@ -400,8 +418,7 @@ int Run(int argc, char** argv) {
   // Every response is one RLWE ciphertext packing 2048 consecutive LWE outputs
   // of the colors' concatenated rows: sub-tile rows of d_row <= 1024 words
   // share blocks across colors, wider rows take C whole blocks per color.
-  if (!synthetic) row_u16 = ResolveRowU16(workload_path, c, rows, raw);
-  const size_t d_row = (c == 1 && row_u16 <= 1024) ? row_u16 : c * 2048;
+  const size_t d_row = c == 1 ? pm::PackedRowWords(row_u16) : c * 2048;
   const size_t n_resp = (p * d_row + 2047) / 2048;
   // Task (g, s) covers block group g x row stripe s, both balanced contiguous
   // splits, and runs on worker w = g * S + s. Stripes split every color's
@@ -500,7 +517,7 @@ int Run(int argc, char** argv) {
             << offline_ms << ",\"online_cpu\":" << online_cpu
             << ",\"offline_threads\":" << offline_threads << ",\"P\":" << p
             << ",\"Q\":" << q << ",\"C\":" << c << ",\"d_row\":" << d_row
-            << ",\"responses\":" << n_resp
+            << ",\"responses\":" << n_resp << ",\"bundle_rows\":" << bundle
             << ",\"selector_bits\":" << selector_bits
             << ",\"centered_db\":" << (centered ? "true" : "false")
             << ",\"synthetic\":" << (synthetic ? "true" : "false")
