@@ -20,6 +20,7 @@
 
 #include "absl/status/status.h"
 #include "absl/status/statusor.h"
+#include "absl/types/span.h"
 
 namespace private_membership {
 namespace rlwe {
@@ -86,6 +87,14 @@ class Matrix {
   template <typename OutputType, typename VecType>
   absl::StatusOr<std::vector<OutputType>> Multiply(
       const std::vector<VecType>& vec) const;
+
+  // Condensed uint16_t matrices only: like Multiply<uint64_t>, but returning
+  // results only modulo 2^result_bits and, if `centered`, multiplying every
+  // entry m as m - 2^15 (no 2^15 * sum(vec) bias). result_bits <= 52 lets
+  // query scalars that are multiples of 2^10 below 2^52 (42-bit selectors)
+  // use the 3-digit kernel.
+  absl::StatusOr<std::vector<uint64_t>> MultiplyUint16(
+      absl::Span<const uint64_t> vec, bool centered, int result_bits) const;
 
   // Returns the number of rows in the matrix.
   int Rows() const { return rows_; }

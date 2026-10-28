@@ -71,3 +71,24 @@ cc_test(
         "@com_google_googletest//:gtest_main",
     ],
 )
+
+cc_test(
+    name = "pir_tall_table_test",
+    size = "large",
+    srcs = ["pir_tall_table_test.cc"],
+    deps = [
+        ":pir_params",
+        "//crypto:encryption",
+        "//crypto:lwes_to_rlwe",
+        "//crypto:polynomial",
+        "//crypto:polynomial_fft",
+        "//crypto/pir/client:pir_client",
+        "//crypto/pir/server:pir_server",
+        "//crypto/pir/server:preprocessing_server",
+        "@com_github_google_shell_encryption//shell_encryption/prng:chacha_prng",
+        "@com_github_google_shell_encryption//shell_encryption/testing:matchers",
+        "@com_github_google_shell_encryption//shell_encryption/testing:status_testing",
+        "@com_google_absl//absl/status",
+        "@com_google_googletest//:gtest_main",
+    ],
+)

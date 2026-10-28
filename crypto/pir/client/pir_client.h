@@ -86,13 +86,28 @@ class PirClient {
     return CreateFirstDimensionQuery(index, mask_prng);
   }
 
+  // Encrypts a one-hot selector of any length `rows` >= 1 with its 1 at
+  // `index`, over ceil(rows / d) RLWE samples drawn from `mask_prng` under this
+  // request's secret, and returns its first `rows` "b" coefficients.
+  absl::StatusOr<std::vector<CoeffType>> CreateMultiSampleSelector(
+      int rows, int index, ::rlwe::SecurePrng* mask_prng) const;
+
   // Encrypts a multi-hot selector polynomial for a group of colors occupying
   // disjoint intervals [slices[k].offset, slices[k].offset + slices[k].rows)
-  // under a single degree-d RLWE sample drawn from `mask_prng`.
+  // under a single degree-d RLWE sample drawn from `mask_prng`. A single color
+  // taller than d (see BuildSelectorGroupPlans) is encrypted by
+  // CreateMultiSampleSelector.
   absl::StatusOr<std::vector<CoeffType>> CreateGroupedSelector(
       const std::vector<SelectorSliceSpec>& slices,
       const std::vector<int>& target_indices,
       ::rlwe::SecurePrng* mask_prng) const;
+
+  // Returns the signed decryption error of every coefficient of `response`, in
+  // units of q1, against the `expected` plaintext (entry_size_multiple * d
+  // values). For empirical noise measurement; needs a power-of-two p.
+  absl::StatusOr<std::vector<int64_t>> DecryptionNoise(
+      const PirResponse<CoeffType>& response,
+      const std::vector<CoeffType>& expected) const;
 
   // Creates the key used for packing..
   absl::StatusOr<std::vector<Polynomial<CoeffType>>> CreatePackingKey(::rlwe::SecurePrng* mask_prng = nullptr) const;
@@ -102,6 +117,12 @@ class PirClient {
   // database items.
   absl::StatusOr<std::vector<CoeffType>> CreateFirstDimensionQuery(
       int index, ::rlwe::SecurePrng* mask_prng = nullptr) const;
+
+  // Encrypts the one-hot vector e_index of length `rows` over
+  // ceil(rows / d) RLWE samples with masks drawn from `mask_prng`, returning
+  // the first `rows` "b" coefficients.
+  absl::StatusOr<std::vector<CoeffType>> EncryptOneHot(
+      int rows, int index, ::rlwe::SecurePrng& mask_prng) const;
 
   absl::StatusOr<std::vector<CoeffType>> CreateFirstDimensionQueryForVector(
       const std::vector<CoeffType>& vec) const;

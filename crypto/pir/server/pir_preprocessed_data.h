@@ -49,14 +49,18 @@ struct PirPreprocessedData {
   std::vector<Polynomial<CoeffType>> second_dim_a;
 };
 
-// One contiguous Stage 1 database slice (rows [u0, u1) of color `color`)
-// owned by a cross-color response worker.
+// One contiguous Stage 1 database slice (`rows` output coefficients of color
+// `color`, placed at response coefficients [coeff0, coeff0 + rows)) owned by a
+// cross-color response worker. It contracts the color's selector entries
+// [row0, row0 + padded_cols) (clipped to the selector length).
 template <typename DbValueType>
 struct CrossColorDbSlice {
   size_t color = 0;
   int padded_cols = 0;
   int rows = 0;
   Matrix<DbValueType> db_submatrix;
+  size_t row0 = 0;
+  size_t coeff0 = 0;
 };
 
 template <typename DbValueType, typename CoeffType, typename MatCoeffType>

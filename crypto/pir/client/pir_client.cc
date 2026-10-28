@@ -14,6 +14,7 @@
 
 #include "crypto/pir/client/pir_client.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <memory>
 #include <utility>
@@ -128,42 +129,54 @@ PirClient<CoeffType>::CreateFirstDimensionQueryForVector(
 }
 
 template <typename CoeffType>
-absl::StatusOr<std::vector<CoeffType>>
-PirClient<CoeffType>::CreateFirstDimensionQuery(const int index, ::rlwe::SecurePrng* mask_prng) const {
+absl::StatusOr<std::vector<CoeffType>> PirClient<CoeffType>::EncryptOneHot(
+    const int rows, const int index, ::rlwe::SecurePrng& mask_prng) const {
+  if (rows <= 0 || index < 0 || index >= rows) {
+    return absl::InvalidArgumentError("Selector index out of bounds.");
+  }
   const auto& rlwe_params = params_.RlweParameters();
   const int d = rlwe_params.Degree();
-  const int t = params_.InterpolationDegree();
-
-  const int entries_per_row = t;
-  const int row_index = index / entries_per_row;
-  const int i = row_index / d;
-  const int j = row_index % d;
-
-  const int r = params_.InterpolatedRows();
-  const int num_samples = params_.NumFirstDimSamples();
-  ASSIGN_OR_RETURN(auto a_first, SampleAComponents(rlwe_params, num_samples,
-                                                   *(mask_prng == nullptr ? a_component_prng_.get() : mask_prng)));
+  const int num_samples = (rows + d - 1) / d;
+  ASSIGN_OR_RETURN(auto a_first,
+                   SampleAComponents(rlwe_params, num_samples, mask_prng));
   ASSIGN_OR_RETURN(auto rlwe_samples,
                    GenerateRlweSamples(rlwe_params, secret_key_fft_, a_first,
                                        *prng_, *fft_ctx_));
 
   std::vector<CoeffType> query;
-  query.reserve(r);
-
+  query.reserve(rows);
   for (int idx = 0; idx < num_samples; ++idx) {
     std::vector<CoeffType> message(d, 0);
-    if (idx == i) {
-      message[j] = 1;
+    if (idx == index / d) {
+      message[index % d] = 1;
     }
     ASSIGN_OR_RETURN(
         auto ct, EncryptFromRlweSample(rlwe_params, params_.PlaintextModulus(),
                                        rlwe_samples[idx], message));
-    const int count = std::min(d, r - idx * d);
+    const int count = std::min(d, rows - idx * d);
     query.insert(query.end(), ct.b.Coeffs().begin(),
                  ct.b.Coeffs().begin() + count);
   }
-
   return query;
+}
+
+template <typename CoeffType>
+absl::StatusOr<std::vector<CoeffType>>
+PirClient<CoeffType>::CreateFirstDimensionQuery(
+    const int index, ::rlwe::SecurePrng* mask_prng) const {
+  return EncryptOneHot(
+      params_.InterpolatedRows(), index / params_.InterpolationDegree(),
+      mask_prng == nullptr ? *a_component_prng_ : *mask_prng);
+}
+
+template <typename CoeffType>
+absl::StatusOr<std::vector<CoeffType>>
+PirClient<CoeffType>::CreateMultiSampleSelector(
+    const int rows, const int index, ::rlwe::SecurePrng* mask_prng) const {
+  if (params_.InterpolationDegree() != 1 || mask_prng == nullptr) {
+    return absl::InvalidArgumentError("Invalid t=1 multi-sample selector.");
+  }
+  return EncryptOneHot(rows, index, *mask_prng);
 }
 
 template <typename CoeffType>
@@ -178,6 +191,10 @@ PirClient<CoeffType>::CreateGroupedSelector(
   }
   const auto& rlwe_params = params_.RlweParameters();
   const size_t d = static_cast<size_t>(rlwe_params.Degree());
+  if (slices.size() == 1 && slices[0].offset == 0 && slices[0].rows > d) {
+    return CreateMultiSampleSelector(static_cast<int>(slices[0].rows),
+                                     target_indices[0], mask_prng);
+  }
   std::vector<CoeffType> message(d, 0);
   for (size_t k = 0; k < slices.size(); ++k) {
     const auto& s = slices[k];
@@ -314,7 +331,46 @@ absl::StatusOr<std::vector<CoeffType>> PirClient<CoeffType>::ProcessResponse(
     decrypted_message.insert(decrypted_message.end(), shard_decrypted.begin(),
                              shard_decrypted.end());
   }
+  if (params_.CenteredDb()) {
+    const CoeffType p = params_.PlaintextModulus();
+    for (CoeffType& m : decrypted_message) m = (m + kCenteredDbOffset) % p;
+  }
   return decrypted_message;
+}
+
+template <typename CoeffType>
+absl::StatusOr<std::vector<int64_t>> PirClient<CoeffType>::DecryptionNoise(
+    const PirResponse<CoeffType>& response,
+    const std::vector<CoeffType>& expected) const {
+  const auto& rlwe_params = params_.RlweParameters();
+  const size_t d = rlwe_params.Degree();
+  const CoeffType p = params_.PlaintextModulus();
+  if (!absl::has_single_bit(static_cast<uint64_t>(p)) ||
+      expected.size() != response.ciphertexts.size() * d) {
+    return absl::InvalidArgumentError("Invalid DecryptionNoise arguments.");
+  }
+  const int log_q1 = rlwe_params.LogModulus1AfterSwitch();
+  const int b_shift = log_q1 - rlwe_params.LogModulus2AfterSwitch();
+  const int m_shift = log_q1 - (absl::bit_width(static_cast<uint64_t>(p)) - 1);
+  const uint64_t q1_mask = (uint64_t{1} << log_q1) - 1;
+  const CoeffType offset = params_.CenteredDb() ? kCenteredDbOffset % p : 0;
+  std::vector<int64_t> noise;
+  noise.reserve(expected.size());
+  for (size_t k = 0; k < response.ciphertexts.size(); ++k) {
+    const auto& ct = response.ciphertexts[k];
+    ASSIGN_OR_RETURN(auto as, ct.a.MultFft(secret_key_fft_, *fft_ctx_, log_q1));
+    for (size_t i = 0; i < d; ++i) {
+      const uint64_t m = (expected[k * d + i] + p - offset) % p;
+      const uint64_t err = (static_cast<uint64_t>(as.Coeffs()[i]) +
+                            (static_cast<uint64_t>(ct.b.Coeffs()[i]) << b_shift) -
+                            (m << m_shift)) &
+                           q1_mask;
+      noise.push_back(err > q1_mask / 2 ? static_cast<int64_t>(err) -
+                                              static_cast<int64_t>(q1_mask) - 1
+                                        : static_cast<int64_t>(err));
+    }
+  }
+  return noise;
 }
 
 template class PirClient<uint32_t>;

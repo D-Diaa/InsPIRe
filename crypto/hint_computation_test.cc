@@ -14,6 +14,7 @@
 
 #include "crypto/hint_computation.h"
 
+#include <algorithm>
 #include <cstdint>
 #include <utility>
 #include <vector>
@@ -207,22 +208,31 @@ TYPED_TEST(MulMatNegacyclicTest, ComputeHintMatrixRandomMatrix) {
           a_components.push_back(std::move(a_component));
         }
 
-        ASSERT_OK_AND_ASSIGN(auto database, Matrix<S>::Create(database_data));
+        // A database narrower than d * n is implicitly zero-padded.
+        for (int trim : {0, d - 1}) {
+          std::vector<std::vector<S>> narrow(rows);
+          for (int i = 0; i < rows; ++i) {
+            std::fill(database_data[i].end() - trim, database_data[i].end(), 0);
+            narrow[i].assign(database_data[i].begin(),
+                             database_data[i].end() - trim);
+          }
+          ASSERT_OK_AND_ASSIGN(auto database, Matrix<S>::Create(narrow));
 
-        std::vector<std::vector<T>> expected_data =
-            NaiveComputeHintMatrix(database_data, a_components_data);
+          std::vector<std::vector<T>> expected_data =
+              NaiveComputeHintMatrix(database_data, a_components_data);
 
-        ASSERT_OK_AND_ASSIGN(
-            auto res, (ComputeHintMatrix<T>(database, a_components, *ctx)));
+          ASSERT_OK_AND_ASSIGN(
+              auto res, (ComputeHintMatrix<T>(database, a_components, *ctx)));
 
-        const std::vector<T>& result_data = res.Data();
+          const std::vector<T>& result_data = res.Data();
 
-        ASSERT_EQ(res.Rows(), rows);
-        ASSERT_EQ(res.Cols(), d);
+          ASSERT_EQ(res.Rows(), rows);
+          ASSERT_EQ(res.Cols(), d);
 
-        for (int i = 0; i < rows; ++i) {
-          for (int j = 0; j < d; ++j) {
-            EXPECT_EQ(result_data[i * d + j], expected_data[i][j]);
+          for (int i = 0; i < rows; ++i) {
+            for (int j = 0; j < d; ++j) {
+              EXPECT_EQ(result_data[i * d + j], expected_data[i][j]);
+            }
           }
         }
       }
@@ -256,15 +266,15 @@ TYPED_TEST(MulMatNegacyclicTest, ComputeHintMatrixInvalidParameters) {
                                              "a_components cannot be empty."));
 
   // Test mismatched dimensions
-  std::vector<std::vector<S>> db_data_mismatch(2, std::vector<S>(3, 0));
+  std::vector<std::vector<S>> db_data_mismatch(2, std::vector<S>(d + 1, 0));
   ASSERT_OK_AND_ASSIGN(auto db_mismatch, Matrix<S>::Create(db_data_mismatch));
   auto res_mismatch = ComputeHintMatrix<T>(db_mismatch, a_components, *ctx);
   EXPECT_THAT(
       res_mismatch.status(),
       StatusIs(
           absl::StatusCode::kInvalidArgument,
-          "Database columns must match d * n where d is the polynomial length "
-          "and n is the number of polynomials."));
+          "Database columns must be in (d * (n - 1), d * n] where d is the "
+          "polynomial length and n is the number of polynomials."));
 }
 
 }  // namespace

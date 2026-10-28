@@ -67,4 +67,7 @@ message PirParams {
   DbValueType db_value_type = 8;
   CoeffType coeff_type = 9;
   MatCoeffType mat_coeff_type = 10;
+
+  // Whether Stage 1 contracts centered database entries (see PirParams).
+  bool centered_db = 11;
 }

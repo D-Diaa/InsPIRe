@@ -90,10 +90,10 @@ absl::StatusOr<Matrix<OutputType>> ComputeHintMatrix(
   const size_t d = a_components[0].Len();
   const size_t rows = database.Rows();
   const size_t cols = database.Cols();
-  if (cols != d * n) {
+  if (cols > d * n || cols + d <= d * n) {
     return absl::InvalidArgumentError(
-        "Database columns must match d * n where d is the polynomial length "
-        "and n is the number of polynomials.");
+        "Database columns must be in (d * (n - 1), d * n] where d is the "
+        "polynomial length and n is the number of polynomials.");
   }
 
   const int chunk_bits = 20;
@@ -135,9 +135,11 @@ absl::StatusOr<Matrix<OutputType>> ComputeHintMatrix(
 
       for (size_t b = 0; b < batch_size; ++b) {
         size_t k = batch_start + b;
-        std::vector<OutputType> block_coeffs(d);
-        size_t block_offset = row_offset + k * d;
-        for (size_t j = 0; j < d; ++j) {
+        // The last block is implicitly zero-padded to d columns.
+        std::vector<OutputType> block_coeffs(d, 0);
+        const size_t block_cols = std::min(d, cols - k * d);
+        const size_t block_offset = row_offset + k * d;
+        for (size_t j = 0; j < block_cols; ++j) {
           block_coeffs[j] = static_cast<OutputType>(mat_data[block_offset + j]);
         }
         ASSIGN_OR_RETURN(

@@ -325,6 +325,42 @@ TEST(CondensedMultiplyHighwayU16U64Test,
   }
 }
 
+// MultiplyUint16 with 42-bit selectors (3 digits, exact modulo 2^52) and
+// centered entries m - 2^15, across 64-column int32 flush boundaries.
+TEST(CondensedMultiplyHighwayU16U64Test, CenteredAnd42BitSelectorsModQ) {
+  std::mt19937_64 rng(4242);
+  constexpr uint64_t kMask52 = (uint64_t{1} << 52) - 1;
+  for (int cols : {32, 64, 96, 4096, 8224}) {
+    const int rows = 5;
+    std::vector<std::vector<uint16_t>> matrix_data(rows,
+                                                   std::vector<uint16_t>(cols));
+    for (auto& row : matrix_data)
+      for (auto& m : row) m = static_cast<uint16_t>(rng());
+    matrix_data[0].assign(cols, 0xFFFF);
+    matrix_data[1].assign(cols, 0);
+    std::vector<uint64_t> vec(cols);
+    for (auto& y : vec) y = (rng() & ((uint64_t{1} << 42) - 1)) << 10;
+    vec[0] = kMask52 & ~uint64_t{0x3FF};
+    ASSERT_OK_AND_ASSIGN(auto condensed,
+                         Matrix<uint16_t>::CreateCondensed(matrix_data));
+    for (bool centered : {false, true}) {
+      ASSERT_OK_AND_ASSIGN(auto result,
+                           condensed.MultiplyUint16(vec, centered, 52));
+      for (int i = 0; i < rows; ++i) {
+        uint64_t expected = 0;
+        for (int j = 0; j < cols; ++j) {
+          const int64_t m = matrix_data[i][j] - (centered ? 0x8000 : 0);
+          expected += static_cast<uint64_t>(m) * vec[j];
+        }
+        EXPECT_EQ(result[i] & kMask52, expected & kMask52)
+            << "row " << i << " cols " << cols << " centered " << centered;
+      }
+    }
+  }
+  ASSERT_OK_AND_ASSIGN(auto plain, Matrix<uint16_t>::Create(1, 32));
+  EXPECT_FALSE(plain.MultiplyUint16(std::vector<uint64_t>(32), false, 52).ok());
+}
+
 TEST(CondensedMultiplyHighwayU8U64Test, Correctness) {
   const int rows = 2;
   const int cols = 64;

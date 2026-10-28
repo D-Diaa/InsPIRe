@@ -48,7 +48,9 @@ absl::StatusOr<Matrix<OutputType>> MulMatNegacyclic(const Matrix<S>& mat,
 // Computes the hint matrix given a `database` matrix and the set of
 // "a components" of the query RLWE ciphertexts.
 //
-// Let `database` have dimension m by d * n, and `a_components` have length n.
+// Let `database` have dimension m by d * n, and `a_components` have length n
+// (a database with fewer than d * n, but more than d * (n - 1), columns is
+// implicitly zero-padded to d * n).
 // Each element of `a_components` is a polynomial of degree d.
 //
 // Interpret `database` as the following block matrix:

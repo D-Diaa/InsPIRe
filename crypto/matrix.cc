@@ -439,10 +439,11 @@ HWY_INLINE void RunCondensedMultiplyUint16(const uint64_t* data, int rows,
   }
 }
 
-template <>
-absl::StatusOr<std::vector<uint64_t>> CondensedMultiply<uint16_t>(
+// Centered (no 2^15 bias) and mod-2^result_bits variant of
+// CondensedMultiply<uint16_t>; see Matrix::MultiplyUint16.
+absl::StatusOr<std::vector<uint64_t>> CondensedMultiplyUint16(
     const Matrix<uint16_t>& condensed_matrix, absl::Span<const uint64_t> vec,
-    int original_cols) {
+    int original_cols, bool centered, int result_bits) {
   namespace hn = hwy::HWY_NAMESPACE;
   const hn::ScalableTag<uint64_t> d;
   const size_t N = hn::Lanes(d);
@@ -464,12 +465,18 @@ absl::StatusOr<std::vector<uint64_t>> CondensedMultiply<uint16_t>(
     or_all |= vec[j];
     y_sum += vec[j];
   }
-  const uint64_t y_bias = y_sum << 15;
+  const uint64_t y_bias = centered ? 0 : y_sum << 15;
 
   std::vector<uint64_t> result(rows, 0);
   if (((or_all & 0xFFFULL) == 0) && ((or_all >> 52) == 0)) {
     // 40-bit modulus-switched selector in bits [12, 52): 3 signed 14-bit digits.
     RunCondensedMultiplyUint16<3, 12>(data.data(), rows, condensed_cols, vec,
+                                      y_bias, result.data());
+  } else if (result_bits <= 52 && ((or_all & 0x3FFULL) == 0) &&
+             ((or_all >> 52) == 0)) {
+    // 42-bit selector in bits [10, 52): 3 signed 14-bit digits; the top digit's
+    // dropped carry has weight 2^52, so results are exact modulo 2^52.
+    RunCondensedMultiplyUint16<3, 10>(data.data(), rows, condensed_cols, vec,
                                       y_bias, result.data());
   } else if ((or_all >> 55) == 0) {
     // Up to 55-bit query (including 52-bit RLWE modulus): 4 signed 14-bit digits.
@@ -481,6 +488,14 @@ absl::StatusOr<std::vector<uint64_t>> CondensedMultiply<uint16_t>(
                                      y_bias, result.data());
   }
   return result;
+}
+
+template <>
+absl::StatusOr<std::vector<uint64_t>> CondensedMultiply<uint16_t>(
+    const Matrix<uint16_t>& condensed_matrix, absl::Span<const uint64_t> vec,
+    int original_cols) {
+  return CondensedMultiplyUint16(condensed_matrix, vec, original_cols,
+                                 /*centered=*/false, /*result_bits=*/64);
 }
 
 // z[i] = sum_j m[i][j] * y[j] mod 2^64 for an int32 matrix and a uint64 vector.
@@ -704,6 +719,19 @@ absl::StatusOr<std::vector<uint64_t>> Matrix<CoeffType>::CondensedMultiply(
 
   return ::private_membership::rlwe::v2::CondensedMultiply<CoeffType>(
       *this, vec, original_cols_);
+}
+
+template <typename CoeffType>
+absl::StatusOr<std::vector<uint64_t>> Matrix<CoeffType>::MultiplyUint16(
+    absl::Span<const uint64_t> vec, bool centered, int result_bits) const {
+  if constexpr (std::is_same_v<CoeffType, uint16_t>) {
+    if (is_condensed_) {
+      return CondensedMultiplyUint16(*this, vec, original_cols_, centered,
+                                     result_bits);
+    }
+  }
+  return absl::FailedPreconditionError(
+      "MultiplyUint16 requires a condensed uint16_t matrix.");
 }
 
 template <typename CoeffType>
