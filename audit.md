@@ -1,6 +1,6 @@
-# ReInsPIRe Correctness, Noise, and Security Audit (Gen 1, Gen 2, Gen 3 & Sub-Tile Packing)
+# ReInsPIRe Correctness, Noise, and Security Audit (Gen 1, Gen 2, Gen 3 & Gen 4)
 
-This document audits all optimizations introduced in **Gen 1** (`codex/reinspire`: `I5`, `I3a`, `I3b`, `I4`), **Gen 2** (`combined`: `I1`, `I2`, `I3`, `I4`), **Gen 3** (`S3`, `S4`, `S5a`), **Whole-Colour Grouped Selector Encryption**, and **Sub-Tile Cross-Colour LWE Response Packing** for algebraic correctness, IEEE-754 floating-point exactness, RLWE noise impact, and cryptographic security.
+This document audits all optimizations introduced in **Gen 1** (`codex/reinspire`: `I5`, `I3a`, `I3b`, `I4`), **Gen 2** (`combined`: `I1`, `I2`, `I3`, `I4`), **Gen 3** (`S3`, `S4`, `S5a`), **Whole-Colour Grouped Selector Encryption**, **Sub-Tile Cross-Colour LWE Response Packing**, and **Gen 4 Tall-Table (`M > 2048`) Retrieval** (`R1` multi-sample $t=1$, `R1a/R1b` centered `int16` contraction & `40/42`-bit selectors, `R2` plaintext row bundling, and 2D Stage 1 row-stripe parallelism) for algebraic correctness, IEEE-754 floating-point exactness, RLWE noise impact, and cryptographic security.
 
 ## 1. Summary Verdict
 
@@ -19,6 +19,8 @@ This document audits all optimizations introduced in **Gen 1** (`codex/reinspire
 | **Gen 3 `S5a`** | Bit-sliced `popcount` binomial/ternary samplers + `FastChaChaPrng` | **Yes** (`FastChaChaPrng` bit-identical stream) | **Zero** (exact $\text{Binomial}(80, 0.5)-40$) | **Zero** (identical ChaCha20 keystream & distributions) |
 | **Grouped Selectors** | Client `CreateGroupedSelector` + offline `RotateGroupMaskForInterval` | **Yes** (rotated-mask == interval extraction) | **Zero** (no cross-colour contamination) | $P \to G_{\text{sel}}$ RLWE samples; standard RLWE IND-CPA |
 | **Cross-Colour Response Packing** | Server `PreprocessCrossColorBlock`, `CreateCrossColor` | **Yes** (exact LWE slot correspondence) | **Zero** (per-slot noise distribution invariant) | Download $P \to N_{\text{resp}}$ blocks; CRS packing keys unchanged |
+| **Gen 4 `R1` + `R1a/R1b`** | Multi-sample $t=1$ selectors + centered `int16` DB + `40/42`-bit `<3, 10>` selectors | **Yes** (`R1a` exact mod $2^{16}$; `M <= 2048` bit-identical) | **`4×` lower** DB variance + **`16×` lower** rounding variance above $8{,}192$ rows (`5.40–5.93σ` to $256$) | $\lceil R_i / 2048 \rceil$ CRS samples under 1 secret; IND-CPA preserved |
+| **Gen 4 `R2` + Row Stripes** | Wire-optimal plaintext row bundling (`ChooseBundleFactor`) + 2D `(block_groups × stripes)` Stage 1 | **Yes** (`T=1 == T=32` `download_fnv64` bit-identical) | **Reduces** physical height $R_i \to \lceil R_i / B_{\text{row}} \rceil$ | **4.58×–7.99×** less total wire; public deterministic layout |
 
 Across all **30 benchmarked workloads × 40 measured queries = 1,200 queries per binary** (`3,600` ReInsPIRe queries total), every query verified **0 decryption errors** and identical wire byte counts.
 
@@ -105,3 +107,37 @@ Across all **30 benchmarked workloads × 40 measured queries = 1,200 queries per
   - In `MatrixPack`, each output coefficient $k \in [0, d)$ accumulates its own Stage 1 LWE noise $e_{\text{stage1}, k}$ plus the key-switching noise from the $d$ LWE-to-RLWE automorphisms (whose distribution depends only on the gadget parameters $\ell_{\text{pack}} = 2, B_{\text{pack}} = 2^{19}$ and the shared ternary key $s(X)$, not on which colour produced LWE slot $k$). Thus the per-coefficient decryption noise variance in each of the $N_{\text{resp}}$ cross-colour response ciphertexts is **identically distributed** to that of per-colour response ciphertexts.
 - **Cryptographic Security**:
   - Cross-colour response packing is a purely server-side offline/online reorganization of public database rows and public CRS hint polynomials; the client's uploaded message (packing key bundle + selector slices) is unchanged.
+
+---
+
+## 7. Gen 4 Tall-Table (`M > 2048`) Retrieval, Centering, Row Bundling & Stripe Parallelism
+
+### 7.1 Centered Signed `int16` Contraction (`centered_db`, `R1a`) & `42`-Bit `vpmaddwd` Overflow Safety (`R1b`)
+- **Algebraic Equivalence Modulo $p = 2^{16}$**:
+  - Let $D_{r,u} \in [0, 2^{16})$ be an unsigned database word and define the centered signed entry
+    $$D^{\text{c}}_{r,u} = (D_{r,u} \oplus 2^{15}) - 2^{15} \in [-2^{15}, 2^{15}-1].$$
+    Whether bit 15 of $D_{r,u}$ is $0$ ($D^{\text{c}}_{r,u} = D_{r,u}$) or $1$ ($D^{\text{c}}_{r,u} = D_{r,u} - 2^{16}$), we have $D^{\text{c}}_{r,u} \equiv D_{r,u} \pmod{2^{16}}$.
+  - For selector encryption $y_r = \Delta \mathbf{1}[r = r^*] - \langle \mathbf{a}_r, \mathbf{s} \rangle + e_r + \delta_r \pmod{q}$ with $\Delta = q / p = 2^{36}$, the message contribution at $r = r^*$ satisfies $\Delta D^{\text{c}}_{r^*,u} \equiv \Delta D_{r^*,u} \pmod{2^{52}}$ because $2^{36} \cdot 2^{16} = 2^{52} = q$.
+  - On the server, passing $D \oplus \text{0x8000}$ to `Matrix<uint16_t>::Condense` stores $(D \oplus 2^{15}) - 2^{15} = D^{\text{c}}$ directly in the condensed `int16_t` lanes. `MultiplyStripe` (`centered = true`) skips the online $+2^{15}\sum_r v_r$ bias restoration, while `PreprocessCrossColorStripe` subtracts $2^{15}\sum_{r} \mathbf{a}_r \pmod{2^{52}}$ from the offline LWE hint, so $\langle \mathbf{h}^{\text{c}}_u, \mathbf{s} \rangle + b'^{\text{c}}_u = \Delta D_{r^*,u} + \sum_r D^{\text{c}}_{r,u}(e_r + \delta_r) \pmod{2^{52}}$ holds identically.
+- **`vpmaddwd` 32-Bit Signed Accumulator Bound at `42`-Bit Selectors (`<3, 10>`)**:
+  - At `selector_bits = 42` (`shift = 10`), centered query coefficients satisfy $v_r / 2^{10} \in [-2^{41}, 2^{41}]$, which decomposes **without remainder** into three balanced signed 14-bit digits $d_0, d_1, d_2 \in [-8192, 8192]$ ($8192 \cdot (1 + 2^{14} + 2^{28}) > 2^{41}$).
+  - Each 16-lane AVX2 `_mm256_madd_epi16` inner chunk sums at most $1024$ row-pairs $(2k, 2k+1)$ (`kMaxChunkCols = 2048` in `crypto/matrix.cc`), so the worst-case 32-bit signed lane magnitude is $1024 \times 2 \times 32768 \times 8192 = 2^{39} / 2^9 = 2^{30} < 2^{31} - 1$ (**zero `int32` overflow**).
+
+### 7.2 Tall-Table Decryption Noise Budget & Adversarial Payload Verification
+- **Closed-Form Variance at Single-Rounding Scale $q_1 = 2^{25}$ (Decoding Half-Width $= \frac{1}{2} \cdot \frac{2^{25}}{2^{16}} = 256\text{ LSB}_{q_1}$)**:
+  - With centered entries $|D^{\text{c}}_{r,u}| \le 2^{15}$ ($\mathbb{E}[(D^{\text{c}})^2] = 2^{30}/3$ on uniform data, $\le 2^{30}$ on adversarial constant `0x8000` / `0xFFFF`), physical height $M_{\text{phys}} = \lceil R_i / B_{\text{row}} \rceil$, fresh binomial variance $\sigma_e^2 = 40$, and selector rounding variance $\sigma_{\delta}^2 = 2^{2(52 - b_{\text{sel}})} / 12$:
+    $$\sigma_{q_1}^2 = \sigma_{\text{pack}, q_1}^2 + \sigma_{\text{ms}, q_1}^2 + M_{\text{phys}} \cdot \mathbb{E}[(D^{\text{c}})^2] \cdot (\sigma_e^2 + \sigma_{\delta}^2) \cdot 2^{-54}.$$
+  - At $M_{\text{phys}} \le 8{,}192$ with $b_{\text{sel}} = 40$ ($\sigma_\delta^2 = 2^{24}/12 \approx 1.40 \times 10^6$), Stage 1 adds $\le 207\text{ LSB}_{q_1}^2$ on uniform data ($\le 621\text{ LSB}_{q_1}^2$ on all-`0x8000`), keeping $\sigma_{q_1} \le 46\text{--}50$.
+  - Above $M_{\text{phys}} = 8{,}192$, `AutoSelectorBits` switches to $b_{\text{sel}} = 42$ ($\sigma_\delta^2 = 2^{20}/12 \approx 8.74 \times 10^4$, **$16\times$ smaller**), keeping $\sigma_{q_1}$ below `54` even unbundled (`B_row = 1`) at $R_i = 131{,}072$!
+- **Empirical Audit Across Adversarial Fills (`PirTallTableTest` & Stage-2 Verifier Audit)**:
+  - Tested across $R_i \in \{4{,}096, 8{,}192, 16{,}384, 32{,}768, 65{,}536, 131{,}072\}$ and five payload fills (`random`, `0x0000`, `0x8000`, `0xFFFF`, `0x0001`):
+    - **Default wire-optimal mode (`--bundle_rows=0`)**: $\sigma_{q_1} \in [43.35, 47.45]$, `max_abs_q1 <= 176 < 256`, **`5.40–5.91σ` margin** (`0` errors across all $30$ configurations; `0x0000` has exact `0` Stage 1 noise because $(0 \oplus \text{0x8000}) - 32768 = 0$, whereas `0x8000` maps to $-32768$ and serves as the worst-case constant-norm stress fill).
+    - **Forced unbundled stress mode (`--bundle_rows=1`)**: $\sigma_{q_1} \in [43.13, 53.89]$, `max_abs_q1 <= 207 < 256`, **`4.75–5.94σ` margin** even at unbundled $R_i = 131{,}072$ on worst-case `0x8000` fill.
+
+### 7.3 `M <= 2048` Baseline Invariance & Multi-Thread Row-Stripe Bit-Identity
+- **Strict `M <= 2048` Invariance**: When $\max_i R_i \le 2048$, `ChooseBundleFactor` returns `1`, `AutoSelectorBits` returns `40`, and `--centered_db=auto` resolves to `false`, preserving **100% identical** upload bytes, download bytes, and online/offline execution across all 10 `M <= 2048` regression geometries.
+- **Bit-Identical Row-Stripe Reduction (`T = 1` vs `T = 32`)**: `RowStripe` (`crypto/pir/pir_params.h:113-120`) partitions `ceil(R_i / 2048)` blocks at multiples of $d = 2048$ (`kMaxChunkCols`), so every stripe performs identical `vpmaddwd` chunk reductions and sums modulo $2^{64}$ before a single `PackFromStage1` on `stripe == 0`. Verified `download_fnv64(T=1) == download_fnv64(T=32)` across 9 sub-tile, multi-tile, bundled, unbundled, and non-divisible (`3 × 10001`) geometries.
+
+### 7.4 Cryptographic Security (IND-CPA)
+- **Multi-Sample Tall Selectors (`R1`)**: A colour of physical height $M_{\text{phys}} > d$ encrypts $\lceil M_{\text{phys}} / d \rceil$ independent standard RLWE samples $\{(a_{i,k}, b_{i,k})\}$ under distinct CRS seeds (`GroupSelectorSeed` stream) and independent binomial error polynomials $e_{i,k}(X)$ under the single per-query secret $s(X)$, then truncates the final sample to $M_{\text{phys}} \bmod d$ coefficients. Joint pseudorandomness reduces directly to standard RLWE with $\sum_g \text{num\_samples}_g$ samples.
+- **Query-Independent Bundling & Striping (`R2`)**: `ChooseBundleFactor`, `AutoSelectorBits`, `PackedRowWords`, and `RowStripe` depend solely on public table dimensions $(R_0, \dots, R_{P-1}, w_{16}, T)$ and never inspect client targets. Sub-row extraction `[(r^* % bundle) * w_16, +w_16)` happens strictly on the client after decryption.
