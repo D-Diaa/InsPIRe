@@ -72,11 +72,10 @@ std::string GroupSelectorSeed(uint64_t group) {
 size_t ResolveRowU16(const std::string& workload_path, size_t c,
                      const std::vector<int>& rows,
                      const std::vector<std::vector<uint16_t>>& raw) {
-  if (c != 1) return c * 2048;
   const char* env = std::getenv("PIR_ROW_U16");
   if (env && *env) {
     const size_t v = std::stoul(env);
-    Check(v > 0 && v <= 2048, "Invalid PIR_ROW_U16");
+    Check(v > 0 && v <= c * 2048, "Invalid PIR_ROW_U16");
     return v;
   }
   const size_t slash = workload_path.find_last_of('/');
@@ -92,14 +91,15 @@ size_t ResolveRowU16(const std::string& workload_path, size_t c,
       const uint64_t msub = hdr[1], nbits = hdr[2], h = hdr[9];
       const size_t row_bytes = static_cast<size_t>((h * msub * nbits + 7) / 8);
       const size_t row_u16 = (row_bytes + 1) / 2;
-      if (row_u16 > 0 && row_u16 <= 2048) return row_u16;
+      if (row_u16 > 0 && row_u16 <= c * 2048) return row_u16;
     }
   }
   size_t max_u16 = 0;
   for (size_t s = 0; s < raw.size(); ++s) {
     for (int r = 0; r < rows[s]; ++r) {
-      const uint16_t* row_ptr = raw[s].data() + static_cast<size_t>(r) * 2048;
-      for (size_t u = 2048; u > max_u16; --u) {
+      const uint16_t* row_ptr =
+          raw[s].data() + static_cast<size_t>(r) * c * 2048;
+      for (size_t u = c * 2048; u > max_u16; --u) {
         if (row_ptr[u - 1] != 0) {
           max_u16 = u;
           break;
@@ -107,7 +107,7 @@ size_t ResolveRowU16(const std::string& workload_path, size_t c,
       }
     }
   }
-  return max_u16 > 0 ? max_u16 : 2048;
+  return max_u16 > 0 ? max_u16 : c * 2048;
 }
 // Lock-free single-threaded ChaCha20 PRNG producing the exact same byte stream
 // as ::rlwe::ChaChaPrng without per-call mutex locking or byte-by-byte loops.
@@ -263,9 +263,10 @@ ABSL_FLAG(size_t, synthetic_q, 4,
 ABSL_FLAG(std::string, synthetic_fill, "random",
           "Synthetic payload: random, or a constant 16-bit word such as 0xffff.");
 ABSL_FLAG(uint64_t, seed, 1, "Synthetic payload and target seed.");
-ABSL_FLAG(size_t, bundle_rows, 0,
-          "Logical rows per physical PIR row: 0 for the wire-optimal "
-          "ChooseBundleFactor (1 when no color exceeds 2048 rows).");
+ABSL_FLAG(size_t, bundle_rows, 1,
+          "Logical rows per physical PIR row: 1 (default, compute-optimal "
+          "unbundled), >= 2 for explicit row bundling, or 0 for wire-optimal "
+          "ChooseBundleFactor.");
 ABSL_FLAG(int, selector_bits, 0,
           "Selector bits per row: 40, 42, or 0 for 42 iff max R > 8192.");
 ABSL_FLAG(std::string, centered_db, "auto",
@@ -416,9 +417,8 @@ int Run(int argc, char** argv) {
     }
   }
   // Every response is one RLWE ciphertext packing 2048 consecutive LWE outputs
-  // of the colors' concatenated rows: sub-tile rows of d_row <= 1024 words
-  // share blocks across colors, wider rows take C whole blocks per color.
-  const size_t d_row = c == 1 ? pm::PackedRowWords(row_u16) : c * 2048;
+  // of the colors' concatenated d_row-word rows across all row widths.
+  const size_t d_row = pm::PackedRowWords(row_u16);
   const size_t n_resp = (p * d_row + 2047) / 2048;
   // Task (g, s) covers block group g x row stripe s, both balanced contiguous
   // splits, and runs on worker w = g * S + s. Stripes split every color's
@@ -736,7 +736,7 @@ int Run(int argc, char** argv) {
     const auto verify_begin = Clock::now();
     for (size_t slot = 0; slot < p; ++slot) {
       Check(recovered[slot].size() == c * 2048, "Invalid response length");
-      for (size_t i = 0; i < c * 2048; ++i)
+      for (size_t i = 0; i < d_row; ++i)
         Check(recovered[slot][i] ==
                   raw[slot][targets[qi * p + slot] * c * 2048 + i],
               "Decryption mismatch");

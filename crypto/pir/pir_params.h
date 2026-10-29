@@ -294,10 +294,11 @@ inline absl::StatusOr<std::vector<SelectorGroupPlan>> BuildSelectorGroupPlans(
 // Stage 1 kernel) to about 168k.
 inline int AutoSelectorBits(size_t max_rows) { return max_rows > 8192 ? 42 : 40; }
 
-// LWE outputs a response block spends on a row of `row_u16` words: rows of at
-// most d / 2 words share blocks across colors, wider rows take whole blocks.
-inline size_t PackedRowWords(size_t row_u16, size_t d = 2048) {
-  return row_u16 <= d / 2 ? row_u16 : (row_u16 + d - 1) / d * d;
+// LWE outputs a response block spends on a row of `row_u16` words: all row
+// widths share d-word response blocks continuously across colors, so a batch of
+// P colors takes n_resp = ceil(P * d_row / d) response ciphertexts.
+inline size_t PackedRowWords(size_t row_u16, size_t /*d*/ = 2048) {
+  return row_u16;
 }
 
 // Plaintext row bundling: `bundle` consecutive logical rows of `row_u16` words

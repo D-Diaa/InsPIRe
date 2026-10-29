@@ -17,8 +17,10 @@
 // entries, 42-bit selectors and row-stripe Stage 1 servers.
 
 #include <algorithm>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <future>
 #include <memory>
 #include <string>
 #include <utility>
@@ -161,37 +163,44 @@ class TallTableTest : public ::testing::Test {
                             const std::vector<std::vector<uint16_t>>& raw,
                             size_t d_row, bool centered, size_t num_stripes) {
     const auto [seeds, offsets] = GroupLayout(rows);
-    std::vector<Block> blocks;
-    for (size_t b = 0; b * kD < rows.size() * d_row; ++b) {
-      Block block(1);
-      Prep::CrossColorStripe first;
-      for (size_t s = 0; s < num_stripes; ++s) {
-        auto part = Prep::PreprocessCrossColorStripe(rlwe_, rows, raw, seeds,
-                                                     offsets, d_row, b, s,
-                                                     num_stripes, centered)
-                        .value();
-        if (s == 0) {
-          first = std::move(part);
-          continue;
+    const size_t n_blocks = (rows.size() * d_row + kD - 1) / kD;
+    std::vector<std::future<Block>> jobs;
+    jobs.reserve(n_blocks);
+    for (size_t b = 0; b < n_blocks; ++b) {
+      jobs.push_back(std::async(std::launch::async, [&, b] {
+        Block block(1);
+        Prep::CrossColorStripe first;
+        for (size_t s = 0; s < num_stripes; ++s) {
+          auto part = Prep::PreprocessCrossColorStripe(rlwe_, rows, raw, seeds,
+                                                       offsets, d_row, b, s,
+                                                       num_stripes, centered)
+                          .value();
+          if (s == 0) {
+            first = std::move(part);
+            continue;
+          }
+          for (size_t u = 0; u < kD; ++u)
+            for (size_t j = 0; j < kD; ++j) first.hint[u][j] += part.hint[u][j];
+          if (!part.db_slices.empty()) {
+            block.push_back(Server::CreateCrossColor(
+                                Params(kD, 1), std::move(part.db_slices), {})
+                                .value());
+          }
         }
-        for (size_t u = 0; u < kD; ++u)
-          for (size_t j = 0; j < kD; ++j) first.hint[u][j] += part.hint[u][j];
-        if (!part.db_slices.empty()) {
-          block.push_back(Server::CreateCrossColor(Params(kD, 1),
-                                                   std::move(part.db_slices), {})
+        std::vector<PreprocessMatrixPackOutput<CoeffType, int32_t>> outputs;
+        outputs.push_back(Prep::PreprocessPacking(rlwe_, pack_gadget_,
+                                                  kPackingSeed, first.hint)
                               .value());
-        }
-      }
-      std::vector<PreprocessMatrixPackOutput<CoeffType, int32_t>> outputs;
-      outputs.push_back(Prep::PreprocessPacking(rlwe_, pack_gadget_,
-                                                kPackingSeed, first.hint)
-                            .value());
-      block[0] = Server::CreateCrossColor(Params(kD, 1),
-                                          std::move(first.db_slices),
-                                          std::move(outputs))
-                     .value();
-      blocks.push_back(std::move(block));
+        block[0] = Server::CreateCrossColor(Params(kD, 1),
+                                            std::move(first.db_slices),
+                                            std::move(outputs))
+                       .value();
+        return block;
+      }));
     }
+    std::vector<Block> blocks;
+    blocks.reserve(n_blocks);
+    for (auto& job : jobs) blocks.push_back(job.get());
     return blocks;
   }
 
@@ -372,16 +381,40 @@ TEST(TallTablePlanTest, RowStripesAreBlockAlignedAndCoverAllRows) {
   EXPECT_EQ(RowStripe(700, kD, 2, 3), Range(700, 700));
 }
 
-// The discrete wire-optimal bundle avoids partial-tile cliffs: at P = 64,
-// M = 8192, 1024-word rows, bundling 2 rows fills one block per color while 3
-// spill into two (2,068,480 vs 2,336,192 bytes).
+// With continuous cross-color packing across all row widths, PackedRowWords is
+// always row_u16 and n_resp = ceil(P * bundle * row_u16 / 2048): at P = 64,
+// M = 8192, 1024-word rows, bundle = 3 uses 96 blocks (1,983,936 B) vs 64
+// blocks at bundle = 2 (2,068,480 B) and 32 blocks at bundle = 1 (3,026,944 B).
 TEST(TallTablePlanTest, ChooseBundleFactorMinimizesExactWireBytes) {
+  for (size_t w : {size_t{1}, size_t{1024}, size_t{1025}, size_t{1536},
+                   size_t{1552}, size_t{2048}, size_t{2064}, size_t{3072}}) {
+    EXPECT_EQ(PackedRowWords(w), w);
+  }
   const std::vector<int> rows(64, 8192);
-  EXPECT_EQ(BundledWireBytes(rows, 1024, 1, 0), 3026944u);
-  EXPECT_EQ(BundledWireBytes(rows, 1024, 2, 0), 2068480u);
-  EXPECT_EQ(BundledWireBytes(rows, 1024, 3, 0), 2336192u);
-  EXPECT_EQ(ChooseBundleFactor(rows, 1024), 2u);
-  EXPECT_EQ(ChooseBundleFactor(std::vector<int>(64, 2048), 1024), 1u);
+  size_t resp = 0;
+  EXPECT_EQ(BundledWireBytes(rows, 1024, 1, 0, &resp), 3026944u);
+  EXPECT_EQ(resp, 32u);
+  EXPECT_EQ(BundledWireBytes(rows, 1024, 2, 0, &resp), 2068480u);
+  EXPECT_EQ(resp, 64u);
+  EXPECT_EQ(BundledWireBytes(rows, 1024, 3, 0, &resp), 1983936u);
+  EXPECT_EQ(resp, 96u);
+  EXPECT_EQ(BundledWireBytes(rows, 1024, 4, 0, &resp), 2117632u);
+  EXPECT_EQ(resp, 128u);
+  EXPECT_EQ(ChooseBundleFactor(rows, 1024), 3u);
+  for (size_t w : {size_t{1024}, size_t{1552}, size_t{2064}}) {
+    EXPECT_EQ(ChooseBundleFactor(std::vector<int>(64, 2048), w), 1u);
+  }
+  // Sub-full-tile (1024 < w < 2048) and multi-tile (w > 2048) continuous counts.
+  EXPECT_EQ(BundledWireBytes(std::vector<int>(166, 2048), 1552, 1, 0, &resp),
+            53248u + 166u * 10240u + 126u * 11008u);
+  EXPECT_EQ(resp, 126u);
+  EXPECT_EQ(BundledWireBytes(std::vector<int>(128, 2048), 2064, 1, 0, &resp),
+            53248u + 128u * 10240u + 129u * 11008u);
+  EXPECT_EQ(resp, 129u);
+  EXPECT_EQ(BundledWireBytes(std::vector<int>(8, 8192), 2064, 2, 0, &resp),
+            404224u);
+  EXPECT_EQ(resp, 17u);
+  EXPECT_EQ(ChooseBundleFactor(std::vector<int>(8, 8192), 2064), 2u);
   // A 42-bit override is priced at 42 bits per selector word.
   EXPECT_EQ(BundledWireBytes({8192}, 1024, 1, 42), 53248u + 43008u + 5504u * 2);
 }
@@ -568,6 +601,256 @@ TEST_F(TallTableTest, BundledAndUnbundledTallColorsDecryptExactly) {
           if (first + u < b * kD || first + u >= (b + 1) * kD) continue;
           EXPECT_EQ(got[first + u - b * kD], raw[s][targets[s] * kRowU16 + u])
               << "bundle " << bundle << " color " << s << " word " << u;
+        }
+      }
+    }
+  }
+}
+
+// Rows in (1024, 2048) words share 2048-word response blocks continuously
+// across colors (n_resp = ceil(P * d_row / 2048) < P), straddling block
+// boundaries for both M <= 2048 and tall M > 2048 with multi-stripe bit
+// identity and unchanged RLWE decryption noise.
+TEST_F(TallTableTest, ContinuousCrossColorSubFullTileRowsDecryptExactly) {
+  // d_row = 1536 (3,072 B), P = 8 short/grouped colors -> 6 response blocks.
+  {
+    const std::vector<int> rows = {512, 1024, 2048, 300, 700, 1500, 64, 2048};
+    constexpr size_t kDRow = 1536;
+    const auto raw = Tables(rows, kD, /*seed=*/11);
+    const auto blocks = Blocks(rows, raw, kDRow, /*centered=*/false, 1);
+    ASSERT_EQ(blocks.size(), 6u);
+    for (int pos = 0; pos < 3; ++pos) {
+      std::vector<int> targets;
+      for (int m : rows) {
+        targets.push_back(pos == 0 ? 0 : pos == 1 ? m - 1 : m / 2);
+      }
+      auto r = MakeRequest(rows, targets, 40);
+      EXPECT_EQ(r.upload_bytes + blocks.size() * 11008u,
+                BundledWireBytes(rows, kDRow, 1, 40));
+      CheckDecryption(blocks, r, rows, raw, targets, kDRow);
+    }
+  }
+  // d_row = 1552 (3,104 B), P = 5 mixed/tall colors -> 4 response blocks,
+  // with non-zero trailing words in [1552, 2048) of raw[s], multi-stripe
+  // bit-identity, and noise verification across 16 fresh client secrets.
+  {
+    const std::vector<int> rows = {4096, 1300, 700, 8192, 2048};
+    constexpr size_t kDRow = 1552;
+    const auto raw = Tables(rows, kD, /*seed=*/12);
+    const auto whole = Blocks(rows, raw, kDRow, /*centered=*/true, 1);
+    const auto striped = Blocks(rows, raw, kDRow, /*centered=*/true, 4);
+    ASSERT_EQ(whole.size(), 4u);
+    ASSERT_EQ(striped.size(), whole.size());
+    for (int pos = 0; pos < 3; ++pos) {
+      std::vector<int> targets;
+      for (int m : rows) {
+        targets.push_back(pos == 0 ? 0 : pos == 1 ? m - 1 : m / 2);
+      }
+      auto r = MakeRequest(rows, targets, 40, 1, /*client_seed=*/20 + pos);
+      if (pos == 0) {
+        for (size_t b = 0; b < whole.size(); ++b) {
+          const auto a = Answer(whole[b], r), s = Answer(striped[b], r);
+          EXPECT_EQ(a.ciphertexts[0].a.Coeffs(), s.ciphertexts[0].a.Coeffs());
+          EXPECT_EQ(a.ciphertexts[0].b.Coeffs(), s.ciphertexts[0].b.Coeffs());
+          EXPECT_EQ(whole[b][0]->GetPrepackedAModSwitched(0),
+                    striped[b][0]->GetPrepackedAModSwitched(0));
+        }
+      }
+      CheckDecryption(striped, r, rows, raw, targets, kDRow);
+    }
+    double sq = 0, max_abs = 0;
+    size_t count = 0;
+    for (int q = 0; q < 16; ++q) {
+      std::vector<int> targets;
+      for (size_t s = 0; s < rows.size(); ++s) {
+        targets.push_back((q * 997 + int(s) * 131) % rows[s]);
+      }
+      auto r = MakeRequest(rows, targets, 40, 1, /*client_seed=*/200 + q);
+      for (int64_t e : CheckDecryption(whole, r, rows, raw, targets, kDRow)) {
+        sq += double(e) * double(e);
+        max_abs = std::max(max_abs, std::abs(double(e)));
+        ++count;
+      }
+    }
+    EXPECT_LT(sq / count, 2150);
+    EXPECT_LT(max_abs, 256);
+  }
+}
+
+// Multi-tile rows (d_row > 2048) pack continuously across colors into
+// n_resp = ceil(P * d_row / 2048) < P * c response blocks, splitting single
+// colors across multiple blocks for both M <= 2048 and tall M > 2048.
+TEST_F(TallTableTest, ContinuousCrossColorMultiTileRowsDecryptExactly) {
+  // d_row = 2064 (4,128 B, c = 2), P = 5 -> 6 blocks (< 10 = P * c).
+  for (bool tall : {false, true}) {
+    const std::vector<int> rows = tall
+                                      ? std::vector<int>{4096, 8192, 1500, 500, 4096}
+                                      : std::vector<int>{2048, 512, 1024, 333, 2048};
+    constexpr size_t kDRow = 2064;
+    const auto raw = Tables(rows, 2 * kD, /*seed=*/tall ? 14 : 13);
+    const auto whole = Blocks(rows, raw, kDRow, /*centered=*/tall, 1);
+    ASSERT_EQ(whole.size(), 6u);
+    ASSERT_LT(whole.size(), rows.size() * 2u);
+    for (int pos = 0; pos < 3; ++pos) {
+      std::vector<int> targets;
+      for (int m : rows) {
+        targets.push_back(pos == 0 ? 0 : pos == 1 ? m - 1 : m / 2);
+      }
+      auto r = MakeRequest(rows, targets, 40, 1, /*client_seed=*/30 + pos);
+      EXPECT_EQ(r.upload_bytes + whole.size() * 11008u,
+                BundledWireBytes(rows, kDRow, 1, 40));
+      CheckDecryption(whole, r, rows, raw, targets, kDRow);
+    }
+    if (tall) {
+      const auto striped = Blocks(rows, raw, kDRow, /*centered=*/true, 3);
+      ASSERT_EQ(striped.size(), whole.size());
+      const std::vector<int> targets = {4095, 8191, 0, 250, 2048};
+      auto r = MakeRequest(rows, targets, 40, 1, /*client_seed=*/40);
+      for (size_t b = 0; b < whole.size(); ++b) {
+        const auto a = Answer(whole[b], r), s = Answer(striped[b], r);
+        EXPECT_EQ(a.ciphertexts[0].a.Coeffs(), s.ciphertexts[0].a.Coeffs());
+        EXPECT_EQ(a.ciphertexts[0].b.Coeffs(), s.ciphertexts[0].b.Coeffs());
+      }
+      CheckDecryption(striped, r, rows, raw, targets, kDRow);
+
+      double sq = 0, max_abs = 0;
+      size_t count = 0;
+      for (int q = 0; q < 16; ++q) {
+        std::vector<int> q_targets;
+        for (size_t s = 0; s < rows.size(); ++s) {
+          q_targets.push_back((q * 1237 + int(s) * 257) % rows[s]);
+        }
+        auto qr = MakeRequest(rows, q_targets, 40, 1, /*client_seed=*/300 + q);
+        for (int64_t e :
+             CheckDecryption(whole, qr, rows, raw, q_targets, kDRow)) {
+          sq += double(e) * double(e);
+          max_abs = std::max(max_abs, std::abs(double(e)));
+          ++count;
+        }
+      }
+      EXPECT_LT(sq / count, 2150);
+      EXPECT_LT(max_abs, 256);
+    }
+  }
+  // d_row = 3072 (6,144 B, c = 2), P = 4 -> 6 blocks (< 8 = P * c).
+  {
+    const std::vector<int> rows = {4096, 2048, 8192, 1000};
+    constexpr size_t kDRow = 3072;
+    const auto raw = Tables(rows, 2 * kD, /*seed=*/15);
+    const auto whole = Blocks(rows, raw, kDRow, /*centered=*/true, 1);
+    const auto striped = Blocks(rows, raw, kDRow, /*centered=*/true, 2);
+    ASSERT_EQ(whole.size(), 6u);
+    ASSERT_EQ(striped.size(), 6u);
+    for (int pos = 0; pos < 3; ++pos) {
+      std::vector<int> targets;
+      for (int m : rows) {
+        targets.push_back(pos == 0 ? 0 : pos == 1 ? m - 1 : m / 2);
+      }
+      auto r = MakeRequest(rows, targets, 40, 1, /*client_seed=*/50 + pos);
+      if (pos == 0) {
+        for (size_t b = 0; b < whole.size(); ++b) {
+          const auto a = Answer(whole[b], r), s = Answer(striped[b], r);
+          EXPECT_EQ(a.ciphertexts[0].b.Coeffs(), s.ciphertexts[0].b.Coeffs());
+        }
+      }
+      CheckDecryption(striped, r, rows, raw, targets, kDRow);
+    }
+  }
+}
+
+// Bundling 1 (compute-optimal default), 0 (wire-optimal ChooseBundleFactor),
+// and explicit 2 works across M <= 2048 and tall M = 4096, 8192 for sub-tile
+// (1024 -> bundle 3), sub-full-tile (1552), and multi-tile orig_c > 1 (2064,
+// where bundle = 2 yields phys_c = 3 and d_row = 4128 -> 9 blocks < 12), with
+// multi-stripe bit-identity.
+TEST_F(TallTableTest, BundledContinuousCrossColorDecryptsAcrossModesAndStripes) {
+  struct Config {
+    std::vector<int> rows;
+    size_t orig_row_u16;
+    size_t bundle_flag;      // 1 = default, 0 = ChooseBundleFactor, 2 = explicit
+    size_t expected_bundle;  // Resolved bundle factor
+  };
+  const std::vector<Config> configs = {
+      {{2048, 1500, 1024, 2048}, 1552, 0, 1},
+      {{2048, 1500, 1024, 2048}, 2064, 2, 2},
+      {{8192, 8192, 8192, 8192}, 1024, 0, 3},
+      {{8192, 4096, 8192, 4097}, 1552, 1, 1},
+      {{8192, 4096, 8192, 4097}, 1552, 0, 2},
+      {{8192, 4096, 8192, 4096}, 2064, 1, 1},
+      {{8192, 4096, 8192, 4096}, 2064, 2, 2},
+  };
+  EXPECT_EQ(ChooseBundleFactor({2048, 1500, 1024, 2048}, 2064), 1u);
+  EXPECT_EQ(ChooseBundleFactor({8192, 4096, 8192, 4096}, 2064), 2u);
+  for (size_t cfg_idx = 0; cfg_idx < configs.size(); ++cfg_idx) {
+    const auto& cfg = configs[cfg_idx];
+    const size_t orig_c = (cfg.orig_row_u16 + kD - 1) / kD;
+    const size_t src_stride = orig_c * kD;
+    const auto logical = Tables(cfg.rows, src_stride, /*seed=*/60 + cfg_idx);
+    const size_t bundle =
+        cfg.bundle_flag == 0 ? ChooseBundleFactor(cfg.rows, cfg.orig_row_u16)
+                             : cfg.bundle_flag;
+    ASSERT_EQ(bundle, cfg.expected_bundle);
+    const size_t phys_c = (bundle * cfg.orig_row_u16 + kD - 1) / kD;
+    const size_t dst_stride = phys_c * kD;
+    std::vector<int> phys_rows(cfg.rows.size());
+    std::vector<std::vector<uint16_t>> phys(cfg.rows.size());
+    for (size_t s = 0; s < cfg.rows.size(); ++s) {
+      if (bundle > 1) {
+        phys[s] = BundleRows(logical[s], cfg.rows[s], src_stride,
+                             cfg.orig_row_u16, bundle, dst_stride);
+        phys_rows[s] = (cfg.rows[s] + int(bundle) - 1) / int(bundle);
+      } else {
+        phys[s] = logical[s];
+        phys_rows[s] = cfg.rows[s];
+      }
+    }
+    const size_t d_row = PackedRowWords(bundle * cfg.orig_row_u16);
+    const size_t max_phys =
+        *std::max_element(phys_rows.begin(), phys_rows.end());
+    const bool centered = max_phys > kD;
+    const int bits = AutoSelectorBits(max_phys);
+    const auto whole = Blocks(phys_rows, phys, d_row, centered, 1);
+    size_t expected_resp = 0;
+    const size_t expected_wire = BundledWireBytes(
+        cfg.rows, cfg.orig_row_u16, bundle, bits, &expected_resp);
+    ASSERT_EQ(whole.size(), expected_resp);
+
+    const bool check_stripes = max_phys > kD && bundle == 2;
+    const auto striped =
+        check_stripes ? Blocks(phys_rows, phys, d_row, centered, 2)
+                      : std::vector<Block>{};
+
+    for (int pos = 0; pos < 2; ++pos) {
+      std::vector<int> targets, phys_targets;
+      for (size_t s = 0; s < cfg.rows.size(); ++s) {
+        const int t = pos == 0 ? int(s % bundle)
+                               : cfg.rows[s] - 1 - int(s % bundle);
+        targets.push_back(t);
+        phys_targets.push_back(t / int(bundle));
+      }
+      auto r = MakeRequest(phys_rows, phys_targets, bits, 1,
+                           /*client_seed=*/80 + cfg_idx * 2 + pos);
+      EXPECT_EQ(r.upload_bytes + whole.size() * 11008u, expected_wire);
+      if (check_stripes && pos == 0) {
+        for (size_t b = 0; b < whole.size(); ++b) {
+          const auto a = Answer(whole[b], r), st = Answer(striped[b], r);
+          EXPECT_EQ(a.ciphertexts[0].b.Coeffs(), st.ciphertexts[0].b.Coeffs());
+        }
+      }
+      const auto& active = check_stripes ? striped : whole;
+      for (size_t b = 0; b < active.size(); ++b) {
+        const auto got =
+            r.client->ProcessResponse(Answer(active[b], r)).value();
+        for (size_t s = 0; s < cfg.rows.size(); ++s) {
+          const size_t first =
+              s * d_row + (targets[s] % bundle) * cfg.orig_row_u16;
+          for (size_t u = 0; u < cfg.orig_row_u16; ++u) {
+            if (first + u < b * kD || first + u >= (b + 1) * kD) continue;
+            EXPECT_EQ(got[first + u - b * kD],
+                      logical[s][targets[s] * src_stride + u])
+                << "cfg " << cfg_idx << " bundle " << bundle << " color " << s
+                << " word " << u;
+          }
         }
       }
     }
