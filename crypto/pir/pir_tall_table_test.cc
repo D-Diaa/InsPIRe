@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// Tiptoe-parameter (d=2048, q=2^52, q1=2^25, q2=2^18, p=2^16, t=1) tests of
+// Palette-parameter (d=2048, q=2^52, q1=2^25, q2=2^18, p=2^16, t=1) tests of
 // color tables taller than d: multi-sample selectors, signed (centered)
 // entries, 42-bit selectors and row-stripe Stage 1 servers.
 

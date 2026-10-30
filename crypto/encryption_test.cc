@@ -902,8 +902,8 @@ TYPED_TEST(EncryptionTest, GenerateRlweSamplesFftMatchesNtt) {
   }
 }
 
-// Tiptoe parameters: d = 2048, q = 2^52, q1 = 2^29, q2 = 2^18, p = 2^16.
-absl::StatusOr<RlweParams<uint64_t>> TiptoeRlweParams() {
+// Palette parameters: d = 2048, q = 2^52, q1 = 2^29, q2 = 2^18, p = 2^16.
+absl::StatusOr<RlweParams<uint64_t>> PaletteRlweParams() {
   return RlweParams<uint64_t>::Create(2048, uint64_t{1} << 52,
                                       uint64_t{1} << 29, uint64_t{1} << 18,
                                       40);
@@ -911,11 +911,11 @@ absl::StatusOr<RlweParams<uint64_t>> TiptoeRlweParams() {
 
 // Decryption through the FFT key must match the NTT key on random
 // modulus-switched ciphertexts and on the extreme a = q1 - 1, s = -1.
-TEST(EncryptionFftTest, DecryptAfterModulusSwitchFftMatchesNttAtTiptoeParams) {
+TEST(EncryptionFftTest, DecryptAfterModulusSwitchFftMatchesNttAtPaletteParams) {
   const int log_d = 11;
   const int d = 1 << log_d;
   const uint64_t p = 65536;
-  ASSERT_OK_AND_ASSIGN(auto params, TiptoeRlweParams());
+  ASSERT_OK_AND_ASSIGN(auto params, PaletteRlweParams());
   ASSERT_OK_AND_ASSIGN(auto ctx, Context::CreateForTernary(log_d));
   ASSERT_OK_AND_ASSIGN(auto fft_ctx, FftContext::Create(log_d));
   std::mt19937_64 gen(5);
@@ -947,13 +947,13 @@ TEST(EncryptionFftTest, DecryptAfterModulusSwitchFftMatchesNttAtTiptoeParams) {
   }
 }
 
-// End to end through the FFT path at the Tiptoe parameters: encrypt from FFT
-// samples, modulus switch as the server does, decrypt with the FFT key.
-TEST(EncryptionFftTest, EncryptModulusSwitchDecryptFftAtTiptoeParams) {
+// End to end through the FFT path at the Palette parameters: encrypt from
+// FFT samples, modulus switch as the server does, decrypt with the FFT key.
+TEST(EncryptionFftTest, EncryptModulusSwitchDecryptFftAtPaletteParams) {
   const int log_d = 11;
   const int d = 1 << log_d;
   const uint64_t p = 65536;
-  ASSERT_OK_AND_ASSIGN(auto params, TiptoeRlweParams());
+  ASSERT_OK_AND_ASSIGN(auto params, PaletteRlweParams());
   ASSERT_OK_AND_ASSIGN(auto seed,
                        ::rlwe::SingleThreadChaChaPrng::GenerateSeed());
   ASSERT_OK_AND_ASSIGN(auto prng, ::rlwe::SingleThreadChaChaPrng::Create(seed));
@@ -1042,10 +1042,10 @@ TEST(EncryptionFftTest,
 }
 
 TEST(EncryptionFftTest,
-     CenteredBinomialAndTernaryDistributionAtTiptoeParams) {
+     CenteredBinomialAndTernaryDistributionAtPaletteParams) {
   const int log_d = 11;
   const int d = 1 << log_d;
-  ASSERT_OK_AND_ASSIGN(auto params, TiptoeRlweParams());
+  ASSERT_OK_AND_ASSIGN(auto params, PaletteRlweParams());
   const uint64_t q = params.Modulus();
   const uint64_t q_mask = q - 1;
   ASSERT_OK_AND_ASSIGN(auto seed,

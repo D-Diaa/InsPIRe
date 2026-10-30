@@ -95,8 +95,8 @@ cc_binary(
 )
 
 cc_binary(
-    name = "tiptoe_workload",
-    srcs = ["tiptoe_workload.cc"],
+    name = "palette_workload",
+    srcs = ["palette_workload.cc"],
     deps = [
         "@highway//:hwy",
         "//crypto:encryption",

@@ -631,7 +631,7 @@ TYPED_TEST(LwestoRlweTest,
 }
 
 TEST(LwestoRlweNegacyclicTest,
-     FinalizeMatrixPackMatchesExactNttAtTiptoeParams) {
+     FinalizeMatrixPackMatchesExactNttAtPaletteParams) {
   constexpr int kLogD = 11;
   constexpr int kD = 1 << kLogD;  // 2048
   constexpr int kLogQ = 52;

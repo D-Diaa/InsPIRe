@@ -663,7 +663,7 @@ void ExpectChunkedFftMatchesDirect(int log_degree, int num_polys, int u_bits,
 
 TEST(PolynomialTest, InnerProductFftOnChunkedFftMatchesDirect) {
   std::mt19937_64 gen(2026);
-  // The packing shape of the Tiptoe workload: d = 2048, two signed 19-bit
+  // The packing shape of the Palette workload: d = 2048, two signed 19-bit
   // gadget digit polynomials against 52-bit key polynomials, 20-bit chunks.
   ExpectChunkedFftMatchesDirect<uint64_t>(/*log_degree=*/11, /*num_polys=*/2,
                                           /*u_bits=*/19, /*v_bits=*/52,

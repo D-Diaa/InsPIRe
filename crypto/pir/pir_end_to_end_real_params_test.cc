@@ -235,8 +235,8 @@ int NextPow2(int m) {
 }
 
 TEST_F(PirEndToEndTest,
-       TiptoeNonPowerOfTwoDownloadIsBitIdenticalToPaddedAndThreaded) {
-  // Exact Tiptoe adapter parameters (d=2048, q=2^52, q1=2^25, q2=2^18, t=1).
+       PaletteNonPowerOfTwoDownloadIsBitIdenticalToPaddedAndThreaded) {
+  // Exact Palette parameters (d=2048, q=2^52, q1=2^25, q2=2^18, t=1).
   ASSERT_OK_AND_ASSIGN(
       auto rlwe_params,
       RlweParams<CoeffType>::Create(2048, 1ULL << 52, 1ULL << 25, 1ULL << 18,
